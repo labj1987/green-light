@@ -1,5 +1,42 @@
 # Changelog
 
+## 2.7.4 — 2026-09-21
+
+Security
+- The privileged install script now copies the `.run` file into a root-only
+  directory and verifies a caller-supplied SHA256 against that copy before
+  running anything, and refuses symlinks and files owned by other users or
+  writable by group/others (closes a swap-the-file-for-root-exec window).
+- Polkit `allow_active` is `auth_admin` instead of `auth_admin_keep`, so the
+  authorization is no longer cached for other processes.
+- A checksum fetch failure (or a version with no published checksum) no
+  longer silently skips verification; you must explicitly choose to use the
+  unverified download, and discarding it is the default.
+- Fixed a crash (RefCell double borrow) when typing in the search box with a
+  version selected.
+
+Robustness
+- Install script runs under `set -euo pipefail`; modprobe.d and initramfs
+  failures now fail the install instead of reporting success.
+- Distro-package cleanup only purges driver packages (no more `libcuda*` /
+  `libcudnn*`) and no longer falls back to `dpkg --purge --force-all`.
+- Truncated downloads are detected and retried; HTTP 4xx is no longer
+  retried.
+- Local `.run` files with extra suffixes (e.g. `-vulkan`) show "Unknown"
+  instead of being mislabeled; the Downloads folder comes from
+  `glib::user_special_dir`.
+- Build: `apt-get update` runs before installing zsync, `appimagetool` is
+  pinned to 1.9.1 with a SHA256 check, and AppRun installs system components
+  through a dedicated `greenlight-setup` helper with its own polkit action
+  and checked exit status.
+
+Other
+- Added CI (build, test, clippy, shellcheck) on every push/PR; appdata
+  release list completed and auto-extended from `Cargo.toml`; removed unused
+  `serde`/`serde_json`; added unit tests.
+- Display name is now "Green Light"; credits use "Linnard Alex Brown Jr.";
+  the About dialog shows the AGPL license, website and issue tracker.
+
 ## 2.7.3 — 2026-09-17
 
 - Fixes the distro-package cleanup step purging `nvidia-container-toolkit`
