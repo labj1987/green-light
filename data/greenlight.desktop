@@ -1,7 +1,7 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=GreenLight
+Name=Green Light
 Comment=Install NVIDIA drivers from official .run files
 Exec=greenlight
 Icon=greenlight

@@ -103,7 +103,7 @@ pub fn build_ui(app: &Application) {
     // ── Window ───────────────────────────────────────────────────────────────
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("GreenLight")
+        .title("Green Light")
         .default_width(760)
         .default_height(640)
         .build();
@@ -1051,7 +1051,7 @@ pub fn build_ui(app: &Application) {
             };
 
             let dialog = AboutDialog::builder()
-                .application_name("GreenLight")
+                .application_name("Green Light")
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments(format!(

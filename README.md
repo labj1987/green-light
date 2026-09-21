@@ -1,4 +1,4 @@
-# GreenLight
+# Green Light
 
 A Linux desktop app for installing NVIDIA drivers from the official `.run` files. Written in Rust with GTK4 and libadwaita. (Formerly known as NVI / NVIDIA Driver Installer.)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-appimage.sh — build the GreenLight AppImage.
+# build-appimage.sh — build the Green Light AppImage.
 # Run from the repo root on Ubuntu (CI uses ubuntu-latest). Run as root in CI.
 set -euo pipefail
 
@@ -125,12 +125,12 @@ if [[ $needs_install -eq 1 ]]; then
 
     if [[ $rc -ne 0 ]]; then
         if [[ $rc -eq 126 || $rc -eq 127 ]]; then
-            echo "GreenLight: authorization was cancelled; system components were not updated." >&2
+            echo "Green Light: authorization was cancelled; system components were not updated." >&2
         else
-            echo "GreenLight: installing system components failed (exit $rc)." >&2
+            echo "Green Light: installing system components failed (exit $rc)." >&2
         fi
         if [[ ! -f "$DST_SCRIPT" ]]; then
-            echo "GreenLight: the install feature will not work until setup succeeds — relaunch to retry." >&2
+            echo "Green Light: the install feature will not work until setup succeeds — relaunch to retry." >&2
         fi
     fi
 fi

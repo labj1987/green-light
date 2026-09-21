@@ -4,7 +4,7 @@
   "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 
 <policyconfig>
-  <vendor>GreenLight</vendor>
+  <vendor>Green Light</vendor>
   <vendor_url>https://github.com/labj1987/GreenLight</vendor_url>
 
   <action id="io.github.labj1987.GreenLight.install">
@@ -21,8 +21,8 @@
   </action>
 
   <action id="io.github.labj1987.GreenLight.setup">
-    <description>Update GreenLight's system components</description>
-    <message>Authentication is required to install or update GreenLight's system components (install helper and polkit policy).</message>
+    <description>Update Green Light's system components</description>
+    <message>Authentication is required to install or update Green Light's system components (install helper and polkit policy).</message>
     <icon_name>application-x-executable</icon_name>
     <defaults>
       <allow_any>auth_admin</allow_any>

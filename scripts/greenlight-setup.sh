@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # greenlight-setup — runs as root via pkexec (polkit action
 # io.github.labj1987.GreenLight.setup once installed). Installs or updates
-# GreenLight's privileged install script and polkit policy at their fixed
+# Green Light's privileged install script and polkit policy at their fixed
 # system paths.
 #
 # Usage: greenlight-setup <stage-dir>
