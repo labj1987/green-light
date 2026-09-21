@@ -1054,6 +1054,11 @@ pub fn build_ui(app: &Application) {
                 .application_name("Green Light")
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
+                // GTK's Agpl30 is "AGPL version 3 or later" (Agpl30Only is the
+                // strict variant), matching AGPL-3.0-or-later in Cargo.toml.
+                .license_type(gtk4::License::Agpl30)
+                .website("https://github.com/labj1987/GreenLight")
+                .issue_url("https://github.com/labj1987/GreenLight/issues")
                 .comments(format!(
                     "GTK4 + Rust GUI for installing NVIDIA drivers from official .run files.\n\nGPU: {}\nDriver: {}\nKernel: {}",
                     gpu, driver, kernel
