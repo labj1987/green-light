@@ -666,8 +666,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "greenlight"
-version = "2.7.4"
+name = "green-light"
+version = "2.7.5"
 dependencies = [
  "anyhow",
  "futures-util",

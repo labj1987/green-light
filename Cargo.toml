@@ -1,13 +1,13 @@
 [package]
-name = "greenlight"
-version = "2.7.4"
+name = "green-light"
+version = "2.7.5"
 edition = "2021"
 description = "Green Light — GTK4 GUI for installing NVIDIA drivers on Linux"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"
 
 [[bin]]
-name = "greenlight"
+name = "green-light"
 path = "src/main.rs"
 
 [dependencies]

@@ -5,7 +5,7 @@
 
 <policyconfig>
   <vendor>Green Light</vendor>
-  <vendor_url>https://github.com/labj1987/GreenLight</vendor_url>
+  <vendor_url>https://github.com/labj1987/green-light</vendor_url>
 
   <action id="io.github.labj1987.GreenLight.install">
     <description>Install NVIDIA driver</description>
@@ -16,7 +16,7 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/greenlight/privileged-install.sh</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/green-light/privileged-install.sh</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 
@@ -29,7 +29,7 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/greenlight/greenlight-setup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/green-light/green-light-setup</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

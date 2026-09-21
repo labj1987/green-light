@@ -33,7 +33,7 @@ where
     // a total timeout would kill a slow-but-healthy multi-hundred-MB
     // download; read_timeout only fires when the stream actually stalls.
     let client = reqwest::Client::builder()
-        .user_agent(concat!("greenlight/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("green-light/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(60))
         .build()?;

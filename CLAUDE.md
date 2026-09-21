@@ -1,4 +1,4 @@
-# GreenLight (formerly NVI / NVIDIA Driver Installer)
+# Green Light (formerly NVI / NVIDIA Driver Installer)
 
 GTK4 + libadwaita GUI, written in Rust, for browsing and installing
 official NVIDIA `.run` drivers from download.nvidia.com. Distributed as
@@ -11,6 +11,15 @@ Install model is repo-style: the new driver goes to disk while the
 current one keeps running (`--allow-installation-with-running-driver`),
 and the switch happens at the next reboot — no session teardown, no
 black screens.
+
+## Naming convention
+
+Display name is "Green Light". The binary, crate, repo, AppImage filename,
+`.desktop` and icon filenames, helper and installed paths use hyphenated
+lowercase `green-light`. The application ID `io.github.labj1987.GreenLight`
+and the polkit action ids stay PascalCase and must NOT be renamed (changing
+them breaks existing installs' policy/settings). Legacy `greenlight` appears
+only in back-compat notes.
 
 ## Module layout (`src/`)
 
@@ -38,7 +47,7 @@ doc claimed otherwise; the script itself never has):
 3. Assembles the AppDir (binary, privileged script, polkit policy,
    appdata, desktop file, icon, generated `AppRun`).
 4. Downloads `appimagetool` (continuous build) and packs the AppDir into
-   `greenlight-$VERSION-x86_64.AppImage`, with `UPDATE_INFORMATION` set
+   `green-light-$VERSION-x86_64.AppImage`, with `UPDATE_INFORMATION` set
    for `gh-releases-zsync` delta updates.
 5. Runs `zsyncmake` directly on the built AppImage to produce the
    `.zsync` sidecar (see gotcha below).

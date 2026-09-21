@@ -14,20 +14,20 @@
       secure boot, and disk space.
     </p>
   </description>
-  <launchable type="desktop-id">greenlight.desktop</launchable>
-  <url type="homepage">https://github.com/labj1987/GreenLight</url>
+  <launchable type="desktop-id">green-light.desktop</launchable>
+  <url type="homepage">https://github.com/labj1987/green-light</url>
   <screenshots>
     <screenshot type="default">
-      <image>https://raw.githubusercontent.com/labj1987/GreenLight/main/screenshots/system.png</image>
+      <image>https://raw.githubusercontent.com/labj1987/green-light/main/screenshots/system.png</image>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/labj1987/GreenLight/main/screenshots/browse.png</image>
+      <image>https://raw.githubusercontent.com/labj1987/green-light/main/screenshots/browse.png</image>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/labj1987/GreenLight/main/screenshots/configure.png</image>
+      <image>https://raw.githubusercontent.com/labj1987/green-light/main/screenshots/configure.png</image>
     </screenshot>
     <screenshot>
-      <image>https://raw.githubusercontent.com/labj1987/GreenLight/main/screenshots/about.png</image>
+      <image>https://raw.githubusercontent.com/labj1987/green-light/main/screenshots/about.png</image>
     </screenshot>
   </screenshots>
   <developer id="io.github.labj1987">

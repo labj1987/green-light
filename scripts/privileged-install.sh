@@ -30,9 +30,9 @@
 # report success. Steps that are allowed to fail are handled explicitly.
 set -euo pipefail
 
-LOGFILE="/var/log/greenlight.log"
+LOGFILE="/var/log/green-light.log"
 log() {
-    local msg="[greenlight] $*"
+    local msg="[green-light] $*"
     echo "$msg"
     echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE" 2>/dev/null || true
 }
@@ -95,7 +95,7 @@ log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS hold=$HOLD_PKG pkg_mgr=$PKG_MGR)"
 # ── Step 0: Copy into a root-only directory and verify the copy ───────
 # /var/tmp rather than /tmp: the installer self-extracts and executes, and
 # /tmp is often mounted noexec.
-PRIV_DIR="$(mktemp -d /var/tmp/greenlight-install.XXXXXX)"
+PRIV_DIR="$(mktemp -d /var/tmp/green-light-install.XXXXXX)"
 chmod 700 "$PRIV_DIR"
 trap 'rm -rf "$PRIV_DIR"' EXIT
 RUN_FILE="$PRIV_DIR/installer.run"
@@ -161,7 +161,7 @@ if [[ "$PKG_MGR" == "apt" ]]; then
     # display driver (the driver's own libcuda is in libnvidia-compute-*).
     mapfile -t PKGS < <(dpkg -l 'nvidia-*' 'libnvidia-*' \
                  'xserver-xorg-video-nvidia*' 2>/dev/null \
-        | awk '/^ii/{print $2}' | grep -v '^greenlight' \
+        | awk '/^ii/{print $2}' | grep -v '^green-light' \
         | grep -vE '^(nvidia-container-toolkit|libnvidia-container)' || true)
     if [[ ${#PKGS[@]} -gt 0 ]]; then
         log "  purging: ${PKGS[*]}"

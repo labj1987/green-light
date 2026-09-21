@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.7.5 — 2026-09-21
+
+Naming
+- Display name is "Green Light"; the binary, crate, repo (now
+  `labj1987/green-light`), AppImage (`green-light-VERSION-x86_64.AppImage`),
+  `.desktop`/icon files, helper (`green-light-setup`) and installed paths
+  (`/usr/lib/green-light/`, `/var/log/green-light.log`) are hyphenated
+  lowercase. The application ID and polkit action ids are unchanged.
+- Upgrading from an older install: the first launch asks for your password
+  once to install the helper at its new path. The old `/usr/lib/greenlight/`
+  directory is left behind and can be deleted by hand. Older AppImages'
+  built-in delta update looks for `greenlight-*` assets, so download this
+  release manually once.
+
 ## 2.7.4 — 2026-09-21
 
 Security

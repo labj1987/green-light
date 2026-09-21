@@ -24,5 +24,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          files: greenlight-*-x86_64.AppImage*
+          files: green-light-*-x86_64.AppImage*
           generate_release_notes: true

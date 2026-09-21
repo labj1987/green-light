@@ -3,7 +3,7 @@
 # Run from the repo root on Ubuntu (CI uses ubuntu-latest). Run as root in CI.
 set -euo pipefail
 
-APP="greenlight"
+APP="green-light"
 # Single source of truth: the version in Cargo.toml
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
@@ -52,11 +52,11 @@ chmod 755 "$APPDIR/usr/lib/$APP/privileged-install.sh"
 # once installed root-owned, it can verify whatever AppRun stages for it.
 SCRIPT_SHA="$(sha256sum scripts/privileged-install.sh | cut -d' ' -f1)"
 POLICY_SHA="$(sha256sum data/io.github.labj1987.GreenLight.policy | cut -d' ' -f1)"
-HELPER_TEXT="$(<scripts/greenlight-setup.sh)"
+HELPER_TEXT="$(<scripts/green-light-setup.sh)"
 HELPER_TEXT="${HELPER_TEXT//@SCRIPT_SHA256@/$SCRIPT_SHA}"
 HELPER_TEXT="${HELPER_TEXT//@POLICY_SHA256@/$POLICY_SHA}"
-printf '%s\n' "$HELPER_TEXT" > "$APPDIR/usr/lib/$APP/greenlight-setup"
-chmod 755 "$APPDIR/usr/lib/$APP/greenlight-setup"
+printf '%s\n' "$HELPER_TEXT" > "$APPDIR/usr/lib/$APP/green-light-setup"
+chmod 755 "$APPDIR/usr/lib/$APP/green-light-setup"
 cp data/$APP.desktop                        "$APPDIR/usr/share/applications/"
 cp data/$APP-256.png                        "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APP.png"
 cp data/io.github.labj1987.GreenLight.policy       "$APPDIR/usr/share/polkit-1/actions/"
@@ -81,7 +81,7 @@ cp data/$APP-256.png "$APPDIR/$APP.png"
 # ── AppRun ────────────────────────────────────────────────────────────
 # On first launch the privileged script and polkit policy must exist at
 # fixed system paths (polkit refuses relative/user paths), so AppRun
-# installs them via the dedicated greenlight-setup helper when missing or
+# installs them via the dedicated green-light-setup helper when missing or
 # outdated, then execs the app. Once the helper is installed, updates use
 # its own polkit action (a specific prompt); the very first run — or the
 # first run after upgrading from a release without the helper — has no such
@@ -90,13 +90,13 @@ cp data/$APP-256.png "$APPDIR/$APP.png"
 cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
-APP="greenlight"
+APP="green-light"
 
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
-SRC_HELPER="$HERE/usr/lib/$APP/greenlight-setup"
+SRC_HELPER="$HERE/usr/lib/$APP/green-light-setup"
 SRC_POLICY="$HERE/usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy"
 DST_SCRIPT="/usr/lib/$APP/privileged-install.sh"
-DST_HELPER="/usr/lib/$APP/greenlight-setup"
+DST_HELPER="/usr/lib/$APP/green-light-setup"
 DST_POLICY="/usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy"
 SETUP_ACTION="io.github.labj1987.GreenLight.setup"
 
@@ -112,14 +112,14 @@ if [[ $needs_install -eq 1 ]]; then
     STAGE="$(mktemp -d)"
     cp "$SRC_SCRIPT" "$STAGE/privileged-install.sh"
     cp "$SRC_POLICY" "$STAGE/policy"
-    cp "$SRC_HELPER" "$STAGE/greenlight-setup"
-    chmod 755 "$STAGE/greenlight-setup"
+    cp "$SRC_HELPER" "$STAGE/green-light-setup"
+    chmod 755 "$STAGE/green-light-setup"
 
     rc=0
     if [[ -x "$DST_HELPER" ]] && pkaction --action-id "$SETUP_ACTION" >/dev/null 2>&1; then
         pkexec "$DST_HELPER" "$STAGE" || rc=$?
     else
-        pkexec "$STAGE/greenlight-setup" "$STAGE" || rc=$?
+        pkexec "$STAGE/green-light-setup" "$STAGE" || rc=$?
     fi
     rm -rf "$STAGE"
 
@@ -158,7 +158,7 @@ chmod +x "$TOOL"
 echo "==> Packing AppImage"
 OUT="$APP-$VERSION-$ARCH.AppImage"
 
-UPDATE_INFORMATION="gh-releases-zsync|labj1987|GreenLight|latest|greenlight-*-x86_64.AppImage.zsync"
+UPDATE_INFORMATION="gh-releases-zsync|labj1987|green-light|latest|green-light-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
     -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 

@@ -43,11 +43,11 @@ Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver b
 Download the AppImage from [Releases](../../releases):
 
 ```bash
-chmod +x greenlight-*-x86_64.AppImage
-./greenlight-*-x86_64.AppImage
+chmod +x green-light-*-x86_64.AppImage
+./green-light-*-x86_64.AppImage
 ```
 
-The first launch asks for your password once so it can place the install helper at `/usr/lib/greenlight/` and register its polkit policy. After that it starts like any other app. If you later download a newer AppImage, it detects the change and refreshes those files on its own.
+The first launch asks for your password once so it can place the install helper at `/usr/lib/green-light/` and register its polkit policy. After that it starts like any other app. If you later download a newer AppImage, it detects the change and refreshes those files on its own.
 
 ## Using it
 
@@ -80,7 +80,7 @@ Reboot afterward to switch drivers, same as the GUI flow.
 
 Two files tell you everything:
 
-- `/var/log/greenlight.log` is written by this app's install script, step by step
+- `/var/log/green-light.log` is written by this app's install script, step by step
 - `/var/log/nvidia-installer.log` is NVIDIA's own installer log
 
 If an install fails, the reason is in one of those. The most common cause is missing kernel headers for a brand new kernel, which resolves once your distro publishes them.
@@ -96,6 +96,8 @@ sudo nvidia-uninstall
 To remove this app, delete the AppImage and optionally the helper files it installed:
 
 ```bash
+sudo rm -rf /usr/lib/green-light
+# installs from before v2.7.5 used the old, unhyphenated directory:
 sudo rm -rf /usr/lib/greenlight
 sudo rm /usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy
 ```

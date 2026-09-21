@@ -82,7 +82,7 @@ const NVIDIA_BASE: &str = "https://download.nvidia.com/XFree86/Linux-x86_64/";
 
 pub async fn fetch_versions() -> Result<Vec<DriverVersion>> {
     let client = reqwest::Client::builder()
-        .user_agent(concat!("greenlight/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("green-light/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(30))
         .build()?;
@@ -124,7 +124,7 @@ pub async fn fetch_versions() -> Result<Vec<DriverVersion>> {
 /// Fetch the SHA256 checksum for a given version's .run file.
 pub async fn fetch_checksum(version: &DriverVersion) -> Result<Option<String>> {
     let client = reqwest::Client::builder()
-        .user_agent(concat!("greenlight/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("green-light/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(15))
         .read_timeout(std::time::Duration::from_secs(15))
         .build()?;
