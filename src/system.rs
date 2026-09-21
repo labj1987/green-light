@@ -140,7 +140,7 @@ fn parse_dkms_status(text: &str) -> Vec<DkmsEntry> {
 
         // The spec fields are separated by '/' (new) or ', ' (old).
         let fields: Vec<&str> = spec
-            .split(|c: char| c == '/' || c == ',')
+            .split(['/', ','])
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
