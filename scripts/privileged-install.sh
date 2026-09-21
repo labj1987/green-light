@@ -14,7 +14,17 @@
 # distros (Fedora, RHEL, Nobara). Package manager is detected once at
 # startup and every package-related step below branches on it.
 #
-# Usage: privileged-install.sh <path-to.run> [--dkms] [--hold] [--no-x-check]
+# Usage: privileged-install.sh <path-to.run> <sha256-of-run-file> [--dkms] [--hold] [--no-x-check]
+#
+# SECURITY MODEL
+# --------------
+# The .run file normally lives in a user-writable directory, so it could be
+# swapped between the app's checks and this script running it as root. To
+# close that window the script (1) refuses files that are symlinks, owned
+# by anyone but root or the invoking user, or writable by group/others,
+# (2) copies the file into a root-only private directory, (3) verifies the
+# SHA256 passed in by the caller against that PRIVATE COPY, and (4) runs
+# everything (integrity check + install) from the copy, never the original.
 
 set -uo pipefail
 
@@ -25,15 +35,35 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE" 2>/dev/null || true
 }
 
-RUN_FILE="${1:-}"
+ORIG_RUN_FILE="${1:-}"
+EXPECT_SHA256="${2:-}"
 USE_DKMS=0
 HOLD_PKG=0
 
-[[ -z "$RUN_FILE" ]] && { log "ERROR: No .run file specified"; exit 1; }
-[[ -f "$RUN_FILE" ]] || { log "ERROR: File not found: $RUN_FILE"; exit 1; }
-[[ "$RUN_FILE" =~ ^/.*\.run$ ]] || { log "ERROR: Invalid run file path: $RUN_FILE"; exit 1; }
+if [[ -z "$ORIG_RUN_FILE" ]]; then log "ERROR: No .run file specified"; exit 1; fi
+if [[ ! "$ORIG_RUN_FILE" =~ ^/.*\.run$ ]]; then log "ERROR: Invalid run file path: $ORIG_RUN_FILE"; exit 1; fi
+if [[ -L "$ORIG_RUN_FILE" ]]; then log "ERROR: Refusing symlink: $ORIG_RUN_FILE"; exit 1; fi
+if [[ ! -f "$ORIG_RUN_FILE" ]]; then log "ERROR: File not found: $ORIG_RUN_FILE"; exit 1; fi
+if [[ ! "$EXPECT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    log "ERROR: A 64-character SHA256 of the run file is required as the second argument"
+    exit 1
+fi
+EXPECT_SHA256="${EXPECT_SHA256,,}"
 
-shift
+# Ownership / permission check on the original file.
+FILE_UID="$(stat -c '%u' "$ORIG_RUN_FILE")"
+FILE_MODE="$(stat -c '%a' "$ORIG_RUN_FILE")"
+CALLER_UID="${PKEXEC_UID:-${SUDO_UID:-0}}"
+if [[ "$FILE_UID" != "0" && "$FILE_UID" != "$CALLER_UID" ]]; then
+    log "ERROR: $ORIG_RUN_FILE is owned by uid $FILE_UID, not root or the invoking user ($CALLER_UID)"
+    exit 1
+fi
+if (( (8#$FILE_MODE) & 8#022 )); then
+    log "ERROR: $ORIG_RUN_FILE is writable by group/others (mode $FILE_MODE) — refusing"
+    exit 1
+fi
+
+shift 2
 for arg in "$@"; do
     case "$arg" in
         --dkms)       USE_DKMS=1 ;;
@@ -56,10 +86,29 @@ else
 fi
 
 log "==== NVIDIA driver install started ===="
-log "Run file: $RUN_FILE (dkms=$USE_DKMS hold=$HOLD_PKG pkg_mgr=$PKG_MGR)"
+log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS hold=$HOLD_PKG pkg_mgr=$PKG_MGR)"
+
+# ── Step 0: Copy into a root-only directory and verify the copy ───────
+# /var/tmp rather than /tmp: the installer self-extracts and executes, and
+# /tmp is often mounted noexec.
+PRIV_DIR="$(mktemp -d /var/tmp/greenlight-install.XXXXXX)"
+chmod 700 "$PRIV_DIR"
+trap 'rm -rf "$PRIV_DIR"' EXIT
+RUN_FILE="$PRIV_DIR/installer.run"
+log "Copying installer to private directory…"
+if ! cp --no-preserve=mode,ownership -- "$ORIG_RUN_FILE" "$RUN_FILE"; then
+    log "ERROR: Could not copy the installer (disk full?). No changes made."
+    exit 1
+fi
+chmod 700 "$RUN_FILE"
+ACTUAL_SHA256="$(sha256sum "$RUN_FILE" | cut -d' ' -f1)"
+if [[ "$ACTUAL_SHA256" != "$EXPECT_SHA256" ]]; then
+    log "ERROR: SHA256 mismatch on the private copy (expected $EXPECT_SHA256, got $ACTUAL_SHA256). No changes made."
+    exit 1
+fi
+log "SHA256 verified on private copy"
 
 # ── Step 1: Verify archive integrity before touching anything ────────
-chmod +x "$RUN_FILE"
 log "Verifying installer archive integrity…"
 if ! "$RUN_FILE" --check >>"$LOGFILE" 2>&1; then
     log "ERROR: Installer failed its integrity self-check. No changes made."

@@ -645,9 +645,14 @@ pub fn build_ui(app: &Application) {
         let list_box = list_box.clone();
         let state = state.clone();
         search_entry.connect_search_changed(move |entry| {
-            let s = state.borrow();
-            let installed = s.sysinfo.installed_driver.clone();
-            populate_list(&list_box, &s.versions, &entry.text(), installed.as_deref());
+            // Clone what we need and drop the borrow BEFORE populate_list:
+            // rebuilding the list can remove the selected row, which fires
+            // row-selected(None) and borrow_mut()s the state.
+            let (versions, installed) = {
+                let s = state.borrow();
+                (s.versions.clone(), s.sysinfo.installed_driver.clone())
+            };
+            populate_list(&list_box, &versions, &entry.text(), installed.as_deref());
         });
     }
 
@@ -662,6 +667,7 @@ pub fn build_ui(app: &Application) {
         let stack = stack.clone();
         let toast_overlay = toast_overlay.clone();
         let cancel_dl_btn = cancel_dl_btn.clone();
+        let window = window.clone();
 
         download_btn.connect_clicked(move |btn| {
             let ver = { state.borrow().selected_version.clone() };
@@ -749,19 +755,25 @@ pub fn build_ui(app: &Application) {
             let toast_overlay = toast_overlay.clone();
             let cancel_dl_btn = cancel_dl_btn.clone();
             let cancel_flag2 = cancel_flag.clone();
+            let window = window.clone();
 
             spawn_async(
                 async move {
-                    let checksum = fetch_checksum(&ver).await.unwrap_or(None);
+                    // Keep fetch errors distinct from "no checksum published":
+                    // neither may silently turn into an unverified install.
+                    let (checksum, checksum_err) = match fetch_checksum(&ver).await {
+                        Ok(c) => (c, None),
+                        Err(e) => (None, Some(format!("{:#}", e))),
+                    };
                     let tx = prog_tx;
                     let result = download_run_file(
                         &url, &dest_dir, &filename,
                         move |dl, total| { let _ = tx.send((dl, total)); },
                         cancel_flag2,
                     ).await;
-                    (checksum, result)
+                    (checksum, checksum_err, result)
                 },
-                move |(checksum, result)| {
+                move |(checksum, checksum_err, result)| {
                     btn.set_sensitive(true);
                     cancel_dl_btn.set_visible(false);
                     state.borrow_mut().download_cancel = None;
@@ -823,13 +835,51 @@ pub fn build_ui(app: &Application) {
                                     },
                                 );
                             } else {
-                                log_fn("No checksum available — skipping verification".to_string());
-                                progress.set_text(Some("Complete (no checksum)"));
-                                let path_str = path.to_string_lossy().to_string();
-                                { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
-                                update_config_tab();
-                                stack.set_visible_child_name("configure");
-                                toast_overlay.add_toast(Toast::new("Download complete"));
+                                let reason = match &checksum_err {
+                                    Some(e) => {
+                                        log_fn(format!("Could not fetch the SHA256 checksum: {}", e));
+                                        format!("The SHA256 checksum could not be fetched ({}).", e)
+                                    }
+                                    None => {
+                                        log_fn("NVIDIA publishes no SHA256 checksum for this version".to_string());
+                                        "NVIDIA does not publish a SHA256 checksum for this version.".to_string()
+                                    }
+                                };
+                                progress.set_text(Some("Downloaded — not verified"));
+                                let dialog = libadwaita::AlertDialog::new(
+                                    Some("Install without verification?"),
+                                    Some(&format!(
+                                        "{}\n\nThe download cannot be verified against NVIDIA's published hash. \
+                                         Only continue if you trust the network you downloaded it over.",
+                                        reason
+                                    )),
+                                );
+                                dialog.add_responses(&[("cancel", "Discard Download"), ("use", "Use Unverified")]);
+                                dialog.set_response_appearance("use", libadwaita::ResponseAppearance::Destructive);
+                                dialog.set_default_response(Some("cancel"));
+                                dialog.set_close_response("cancel");
+                                let state = state.clone();
+                                let log_fn = log_fn.clone();
+                                let progress = progress.clone();
+                                let update_config_tab = update_config_tab.clone();
+                                let stack = stack.clone();
+                                let toast_overlay = toast_overlay.clone();
+                                dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+                                    if response == "use" {
+                                        log_fn("User chose to continue WITHOUT checksum verification".to_string());
+                                        progress.set_text(Some("Complete (unverified)"));
+                                        let path_str = path.to_string_lossy().to_string();
+                                        { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
+                                        update_config_tab();
+                                        stack.set_visible_child_name("configure");
+                                        toast_overlay.add_toast(Toast::new("Download complete (unverified)"));
+                                    } else {
+                                        let _ = std::fs::remove_file(&path);
+                                        log_fn(format!("Discarded unverified download: {}", path.display()));
+                                        progress.set_text(Some("Discarded (not verified)"));
+                                        toast_overlay.add_toast(Toast::new("Unverified download discarded"));
+                                    }
+                                });
                             }
                         }
                     }
@@ -919,6 +969,7 @@ pub fn build_ui(app: &Application) {
                 use_dkms: s.use_dkms,
                 hold_packages: s.hold_packages,
                 run_file: run_file.clone(),
+                sha256: s.expected_checksum.clone(),
             };
             drop(s);
 
