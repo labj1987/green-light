@@ -55,8 +55,13 @@ where
             Err(e) => { last_err = e.into(); continue; }
         };
 
-        if !resp.status().is_success() {
-            last_err = anyhow::anyhow!("HTTP {}", resp.status());
+        let status = resp.status();
+        if status.is_client_error() {
+            // 4xx (404, 403, ...) won't fix itself on retry — fail immediately.
+            bail!("Server refused the download: HTTP {}", status);
+        }
+        if !status.is_success() {
+            last_err = anyhow::anyhow!("HTTP {}", status);
             continue;
         }
 
@@ -90,7 +95,16 @@ where
 
         if !failed {
             file.flush().await?;
-            return Ok(dest);
+            // A server that closes the stream early ends the loop cleanly
+            // with a truncated file; catch it here rather than relying on a
+            // checksum happening to exist.
+            match total {
+                Some(t) if downloaded != t => {
+                    last_err = anyhow::anyhow!(
+                        "Download truncated: received {} of {} bytes", downloaded, t);
+                }
+                _ => return Ok(dest),
+            }
         }
 
         let _ = tokio::fs::remove_file(&dest).await;

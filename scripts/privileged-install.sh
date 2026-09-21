@@ -26,7 +26,9 @@
 # SHA256 passed in by the caller against that PRIVATE COPY, and (4) runs
 # everything (integrity check + install) from the copy, never the original.
 
-set -uo pipefail
+# -e: any unhandled failure aborts, so a partially-applied config can't
+# report success. Steps that are allowed to fail are handled explicitly.
+set -euo pipefail
 
 LOGFILE="/var/log/greenlight.log"
 log() {
@@ -34,6 +36,8 @@ log() {
     echo "$msg"
     echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE" 2>/dev/null || true
 }
+
+trap 'log "ERROR: step failed near line $LINENO (exit $?) — install aborted"' ERR
 
 ORIG_RUN_FILE="${1:-}"
 EXPECT_SHA256="${2:-}"
@@ -152,19 +156,25 @@ fi
 log "Removing distro-managed NVIDIA packages (if any)…"
 if [[ "$PKG_MGR" == "apt" ]]; then
     apt-mark unhold 'nvidia*' 'libnvidia*' 'xserver-xorg-video-nvidia*' 2>/dev/null || true
-    PKGS=$(dpkg -l 'nvidia-*' 'libnvidia-*' 'libcuda*' 'libcudnn*' \
+    # Driver packages only. libcuda*/libcudnn* are deliberately NOT matched:
+    # they can belong to a user-installed CUDA toolkit unrelated to the
+    # display driver (the driver's own libcuda is in libnvidia-compute-*).
+    mapfile -t PKGS < <(dpkg -l 'nvidia-*' 'libnvidia-*' \
                  'xserver-xorg-video-nvidia*' 2>/dev/null \
         | awk '/^ii/{print $2}' | grep -v '^greenlight' \
         | grep -vE '^(nvidia-container-toolkit|libnvidia-container)' || true)
-    if [[ -n "$PKGS" ]]; then
-        log "  purging: $PKGS"
-        if ! apt-get purge -y $PKGS >>"$LOGFILE" 2>&1; then
-            log "WARNING: apt-get purge hit a dependency conflict — retrying with dpkg --force-all"
-            dpkg --purge --force-all $PKGS >>"$LOGFILE" 2>&1 \
-                || log "WARNING: some distro NVIDIA packages could not be removed — check $LOGFILE"
+    if [[ ${#PKGS[@]} -gt 0 ]]; then
+        log "  purging: ${PKGS[*]}"
+        # No dpkg --force-all fallback: it can leave dpkg in a broken
+        # dependency state. Fail cleanly instead — nothing has been
+        # installed yet and the running driver is untouched.
+        if ! apt-get purge -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
+            log "ERROR: apt-get purge of the distro NVIDIA packages failed. No driver changes made."
+            log "       Resolve the dependency conflict (see $LOGFILE) and retry."
+            exit 1
         fi
     fi
-    update-alternatives --remove-all nvidia 2>/dev/null || true
+    update-alternatives --remove-all nvidia 2>/dev/null || true   # absent alternative is fine
     update-alternatives --remove-all nvidia-ld.so.conf 2>/dev/null || true
 
     # The .run installer refuses to proceed if this marker is present,
@@ -181,11 +191,14 @@ else
         dnf versionlock delete 'nvidia*' 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' \
             'kmod-nvidia*' 2>/dev/null || true
     fi
-    PKGS=$(rpm -qa 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' 'kmod-nvidia*' \
+    mapfile -t PKGS < <(rpm -qa 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' 'kmod-nvidia*' \
         'nvidia-driver*' 'nvidia-settings*' 2>/dev/null || true)
-    if [[ -n "$PKGS" ]]; then
-        log "  removing: $PKGS"
-        dnf remove -y $PKGS >>"$LOGFILE" 2>&1 || true
+    if [[ ${#PKGS[@]} -gt 0 ]]; then
+        log "  removing: ${PKGS[*]}"
+        if ! dnf remove -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
+            log "ERROR: dnf remove of the distro NVIDIA packages failed. No driver changes made."
+            exit 1
+        fi
     fi
 fi
 
@@ -209,10 +222,10 @@ INSTALLER_ARGS=(
     --allow-installation-with-running-driver
     --log-file-name=/var/log/nvidia-installer.log
 )
-[[ $USE_DKMS -eq 1 ]] && INSTALLER_ARGS+=(--dkms)
+if [[ $USE_DKMS -eq 1 ]]; then INSTALLER_ARGS+=(--dkms); fi
 
-"$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1
-RC=$?
+RC=0
+"$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1 || RC=$?
 if [[ $RC -ne 0 ]]; then
     log "ERROR: NVIDIA installer exited with code $RC"
     log "See /var/log/nvidia-installer.log for details."
@@ -223,9 +236,14 @@ log "NVIDIA installer finished successfully"
 # ── Step 6: Rebuild initramfs so the blacklist applies at boot ────────
 log "Rebuilding initramfs…"
 if [[ "$PKG_MGR" == "apt" ]]; then
-    update-initramfs -u -k "$KVER" >>"$LOGFILE" 2>&1 || true
+    INITRAMFS_CMD=(update-initramfs -u -k "$KVER")
 else
-    dracut --force --kver "$KVER" >>"$LOGFILE" 2>&1 || true
+    INITRAMFS_CMD=(dracut --force --kver "$KVER")
+fi
+if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
+    log "ERROR: initramfs rebuild failed. The driver is installed but the nouveau"
+    log "       blacklist may not apply at boot. Run: ${INITRAMFS_CMD[*]}"
+    exit 1
 fi
 
 # ── Step 7: Optional package hold ──────────────────────────────────────
@@ -235,14 +253,22 @@ if [[ $HOLD_PKG -eq 1 ]]; then
             | awk '/^ii/{print $2}' \
             | grep -vE '^(nvidia-container-toolkit|libnvidia-container)' || true)
         if [[ -n "$HELD" ]]; then
-            apt-mark hold $HELD >>"$LOGFILE" 2>&1 || true
-            log "Held packages: $HELD"
+            # $HELD is newline-separated package names; word-splitting intended.
+            # shellcheck disable=SC2086
+            if apt-mark hold $HELD >>"$LOGFILE" 2>&1; then
+                log "Held packages: $HELD"
+            else
+                log "WARNING: apt-mark hold failed — packages not held"
+            fi
         fi
     else
         if dnf versionlock --help >/dev/null 2>&1; then
-            dnf versionlock add 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' \
-                'kmod-nvidia*' >>"$LOGFILE" 2>&1 || true
-            log "Versionlock applied to nvidia packages"
+            if dnf versionlock add 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' \
+                'kmod-nvidia*' >>"$LOGFILE" 2>&1; then
+                log "Versionlock applied to nvidia packages"
+            else
+                log "WARNING: dnf versionlock add failed — packages not locked"
+            fi
         else
             log "WARNING: --hold requested but dnf versionlock plugin is not"
             log "         installed. Run: dnf install python3-dnf-plugin-versionlock"

@@ -19,4 +19,17 @@
     <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/greenlight/privileged-install.sh</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
+
+  <action id="io.github.labj1987.GreenLight.setup">
+    <description>Update GreenLight's system components</description>
+    <message>Authentication is required to install or update GreenLight's system components (install helper and polkit policy).</message>
+    <icon_name>application-x-executable</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/greenlight/greenlight-setup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
 </policyconfig>

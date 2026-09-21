@@ -1,7 +1,7 @@
 use crate::download::{download_run_file, verify_sha256};
 use crate::install::{run_privileged_install, InstallOptions};
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
-use crate::versions::{fetch_checksum, fetch_versions, DriverVersion};
+use crate::versions::{fetch_checksum, fetch_versions, version_from_filename, DriverVersion};
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -398,11 +398,13 @@ pub fn build_ui(app: &Application) {
                     checksum_row.set_subtitle("No checksum available");
                 }
                 // Version comparison
-                if let Some(ref inst) = s.sysinfo.installed_driver {
-                    // Extract version from filename: NVIDIA-Linux-x86_64-595.84.run
-                    let candidate = fname
-                        .trim_start_matches("NVIDIA-Linux-x86_64-")
-                        .trim_end_matches(".run");
+                let parsed = version_from_filename(&fname);
+                if parsed.is_none() {
+                    // e.g. NVIDIA-Linux-x86_64-595.84-vulkan.run — don't guess.
+                    version_status_row.set_subtitle("Unknown");
+                } else if let (Some(inst), Some(candidate)) =
+                    (s.sysinfo.installed_driver.as_ref(), parsed.as_deref())
+                {
                     match compare_versions(inst, candidate) {
                         VersionRelation::Newer => version_status_row.set_subtitle(
                             &format!("Upgrade: {} → {}", inst, candidate)),
@@ -692,11 +694,15 @@ pub fn build_ui(app: &Application) {
             let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
             state.borrow_mut().download_cancel = Some(cancel_flag.clone());
 
-            let dest_dir = std::path::PathBuf::from(
-                std::env::var("XDG_DOWNLOAD_DIR").unwrap_or_else(|_| {
-                    format!("{}/Downloads", std::env::var("HOME").unwrap_or("/tmp".into()))
-                }),
-            );
+            // XDG_DOWNLOAD_DIR normally lives only in ~/.config/user-dirs.dirs,
+            // not the environment — ask GLib, which reads that file.
+            let dest_dir = glib::user_special_dir(glib::UserDirectory::Downloads)
+                .unwrap_or_else(|| {
+                    std::path::PathBuf::from(
+                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+                    )
+                    .join("Downloads")
+                });
 
             // Progress channel — sent from the Tokio side, drained on the GTK
             // main context. The loop exits when the sender drops at download

@@ -66,6 +66,18 @@ pub struct DriverVersion {
     pub branch: Option<DriverBranch>,
 }
 
+/// Regex fragment for an NVIDIA driver version (e.g. `595.84` or `595.84.01`).
+const VERSION_PATTERN: &str = r"\d+\.\d+(?:\.\d+)?";
+
+/// Extract the driver version from an official installer filename such as
+/// `NVIDIA-Linux-x86_64-595.84.run`. Returns `None` for anything that
+/// doesn't match exactly (e.g. `...-595.84-vulkan.run`), so callers can show
+/// "Unknown" rather than guess.
+pub fn version_from_filename(filename: &str) -> Option<String> {
+    let re = Regex::new(&format!(r"^NVIDIA-Linux-x86_64-({})\.run$", VERSION_PATTERN)).ok()?;
+    re.captures(filename).map(|c| c[1].to_string())
+}
+
 const NVIDIA_BASE: &str = "https://download.nvidia.com/XFree86/Linux-x86_64/";
 
 pub async fn fetch_versions() -> Result<Vec<DriverVersion>> {
@@ -85,7 +97,7 @@ pub async fn fetch_versions() -> Result<Vec<DriverVersion>> {
 
     let document = Html::parse_document(&html);
     let selector = Selector::parse("a[href]").unwrap();
-    let ver_re = Regex::new(r"^(\d+\.\d+(?:\.\d+)?)/?$").unwrap();
+    let ver_re = Regex::new(&format!(r"^({})/?$", VERSION_PATTERN)).unwrap();
 
     let mut versions: Vec<DriverVersion> = document
         .select(&selector)
