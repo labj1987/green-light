@@ -117,7 +117,11 @@ fn get_dkms_status() -> Vec<DkmsEntry> {
         Ok(o) => o,
         Err(_) => return vec![],
     };
-    let text = String::from_utf8_lossy(&out.stdout);
+    parse_dkms_status(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse the text of `dkms status` (see `get_dkms_status` for the formats).
+fn parse_dkms_status(text: &str) -> Vec<DkmsEntry> {
     let mut entries = vec![];
 
     for raw in text.lines() {
@@ -224,5 +228,54 @@ pub fn format_bytes(b: u64) -> String {
         format!("{:.1} MB", b as f64 / 1_048_576.0)
     } else {
         format!("{} KB", b / 1024)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_bytes_units() {
+        assert_eq!(format_bytes(0), "0 KB");
+        assert_eq!(format_bytes(2048), "2 KB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+        assert_eq!(format_bytes(1_572_864), "1.5 MB");
+        assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
+        assert_eq!(format_bytes(5 * 1_073_741_824 / 2), "2.5 GB");
+    }
+
+    #[test]
+    fn dkms_old_format() {
+        let e = parse_dkms_status("nvidia/595.84, 7.0.0-27-generic, x86_64: installed\n");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].module, "nvidia");
+        assert_eq!(e[0].version, "595.84");
+        assert_eq!(e[0].kernel, "7.0.0-27-generic");
+        assert_eq!(e[0].status, "installed");
+    }
+
+    #[test]
+    fn dkms_new_format() {
+        let e = parse_dkms_status("nvidia/595.84/7.0.0-27-generic/x86_64: installed");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].version, "595.84");
+        assert_eq!(e[0].kernel, "7.0.0-27-generic");
+        assert_eq!(e[0].status, "installed");
+    }
+
+    #[test]
+    fn dkms_partial_added_has_dash_kernel() {
+        let e = parse_dkms_status("nvidia/595.84: added");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].kernel, "\u{2014}");
+        assert_eq!(e[0].status, "added");
+    }
+
+    #[test]
+    fn dkms_ignores_other_modules_and_blank_lines() {
+        let e = parse_dkms_status("\nvirtualbox/7.0, 6.8.0, x86_64: installed\n  \nNVIDIA/1.0: added\n");
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].module, "NVIDIA");
     }
 }

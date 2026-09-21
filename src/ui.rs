@@ -1122,3 +1122,28 @@ fn populate_list(
         list_box.append(&row);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compare_newer_same_older() {
+        assert!(compare_versions("595.84", "595.91.07") == VersionRelation::Newer);
+        assert!(compare_versions("595.84", "595.84") == VersionRelation::Same);
+        assert!(compare_versions("595.91.07", "595.84") == VersionRelation::Older);
+        assert!(compare_versions("580.178.04", "595.45.04") == VersionRelation::Newer);
+    }
+
+    #[test]
+    fn compare_numeric_not_lexicographic() {
+        // 595.9 < 595.10 numerically even though "9" > "1" as text.
+        assert!(compare_versions("595.9", "595.10") == VersionRelation::Newer);
+    }
+
+    #[test]
+    fn compare_unknown_on_unparseable() {
+        assert!(compare_versions("", "595.84") == VersionRelation::Unknown);
+        assert!(compare_versions("595.84", "abc") == VersionRelation::Unknown);
+    }
+}

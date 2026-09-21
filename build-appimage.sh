@@ -62,6 +62,18 @@ cp data/$APP-256.png                        "$APPDIR/usr/share/icons/hicolor/256
 cp data/io.github.labj1987.GreenLight.policy       "$APPDIR/usr/share/polkit-1/actions/"
 cp data/io.github.labj1987.GreenLight.appdata.xml  "$APPDIR/usr/share/metainfo/"
 
+# Keep the AppStream <releases> list in step with Cargo.toml: if the source
+# appdata doesn't already list this version, add an entry for it.
+METAINFO="$APPDIR/usr/share/metainfo/io.github.labj1987.GreenLight.appdata.xml"
+if ! grep -q "<release version=\"$VERSION\"" "$METAINFO"; then
+    echo "==> appdata has no <release> for $VERSION; adding one"
+    META_TEXT="$(<"$METAINFO")"
+    NEW_RELEASE="<releases>
+    <release version=\"$VERSION\" date=\"$(date -u +%F)\"/>"
+    META_TEXT="${META_TEXT/<releases>/$NEW_RELEASE}"
+    printf '%s\n' "$META_TEXT" > "$METAINFO"
+fi
+
 # Top-level AppImage requirements
 cp data/$APP.desktop "$APPDIR/"
 cp data/$APP-256.png "$APPDIR/$APP.png"

@@ -184,6 +184,24 @@ mod tests {
         assert_eq!(classify_branch("96.43.23"), None);
     }
 
+    #[test]
+    fn parses_version_from_official_filename() {
+        assert_eq!(
+            version_from_filename("NVIDIA-Linux-x86_64-595.84.run").as_deref(),
+            Some("595.84")
+        );
+        assert_eq!(
+            version_from_filename("NVIDIA-Linux-x86_64-580.178.04.run").as_deref(),
+            Some("580.178.04")
+        );
+    }
+
+    #[test]
+    fn rejects_non_matching_filenames() {
+        assert_eq!(version_from_filename("NVIDIA-Linux-x86_64-595.84-vulkan.run"), None);
+        assert_eq!(version_from_filename("driver.run"), None);
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_fetch_shows_branch_labels() {
