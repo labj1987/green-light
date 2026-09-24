@@ -83,8 +83,7 @@ cp data/$APP-256.png "$APPDIR/$APP.png"
 # fixed system paths (polkit refuses relative/user paths), so AppRun
 # installs them via the dedicated green-light-setup helper when missing or
 # outdated, then execs the app. Once the helper is installed, updates use
-# its own polkit action (a specific prompt); the very first run — or the
-# first run after upgrading from a release without the helper — has no such
+# its own polkit action (a specific prompt); the very first run has no such
 # action yet, so pkexec runs the staged helper directly (its prompt names
 # the program, and the helper verifies everything against baked-in hashes).
 cat > "$APPDIR/AppRun" << 'APPRUN'

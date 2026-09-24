@@ -97,8 +97,6 @@ To remove this app, delete the AppImage and optionally the helper files it insta
 
 ```bash
 sudo rm -rf /usr/lib/green-light
-# installs from before v2.7.5 used the old, unhyphenated directory:
-sudo rm -rf /usr/lib/greenlight
 sudo rm /usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy
 ```
 

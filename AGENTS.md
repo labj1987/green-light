@@ -4,8 +4,7 @@ GTK4 + libadwaita GUI, written in Rust, for browsing and installing
 official NVIDIA `.run` drivers from download.nvidia.com. Distributed as
 a single AppImage — **AppImage-only; no `.deb` packaging should ever be
 reintroduced** (it was deliberately removed, along with the DBus service
-file, when the app moved to the `io.github.labj1987.NVI` application ID —
-since renamed to `io.github.labj1987.GreenLight`).
+file).
 
 Install model is repo-style: the new driver goes to disk while the
 current one keeps running (`--allow-installation-with-running-driver`),
@@ -18,8 +17,7 @@ Display name is "Green Light". The binary, crate, repo, AppImage filename,
 `.desktop` and icon filenames, helper and installed paths use hyphenated
 lowercase `green-light`. The application ID `io.github.labj1987.GreenLight`
 and the polkit action ids stay PascalCase and must NOT be renamed (changing
-them breaks existing installs' policy/settings). Legacy `greenlight` appears
-only in back-compat notes.
+them breaks existing installs' policy/settings).
 
 ## Module layout (`src/`)
 
@@ -52,7 +50,7 @@ the script itself never has):
 5. Runs `zsyncmake` directly on the built AppImage to produce the
    `.zsync` sidecar (see gotcha below).
 
-**Gotcha (fixed in v2.5.6, predates the GreenLight rename):**
+**Gotcha (fixed in v2.5.6):**
 `appimagetool`'s own built-in zsync generation silently no-ops on the
 GitHub Actions runner even when `UPDATE_INFORMATION` is set and
 `zsync`/`zsyncmake` are installed and working. Do not rely on
