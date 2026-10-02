@@ -14,7 +14,10 @@
 # distros (Fedora, RHEL, Nobara). Package manager is detected once at
 # startup and every package-related step below branches on it.
 #
-# Usage: privileged-install.sh <path-to.run> <sha256-of-run-file> [--dkms] [--hold] [--no-x-check]
+# Usage: privileged-install.sh <path-to.run> <sha256-of-run-file> [--dkms] [--hold]
+#        [--no-x-check] [--kernel-module-type=open|proprietary]
+# Without --kernel-module-type the installer picks the flavor from the
+# detected GPUs (open for Turing and newer).
 #
 # SECURITY MODEL
 # --------------
@@ -43,6 +46,7 @@ ORIG_RUN_FILE="${1:-}"
 EXPECT_SHA256="${2:-}"
 USE_DKMS=0
 HOLD_PKG=0
+MODULE_TYPE=""
 
 if [[ -z "$ORIG_RUN_FILE" ]]; then log "ERROR: No .run file specified"; exit 1; fi
 if [[ ! "$ORIG_RUN_FILE" =~ ^/.*\.run$ ]]; then log "ERROR: Invalid run file path: $ORIG_RUN_FILE"; exit 1; fi
@@ -73,6 +77,8 @@ for arg in "$@"; do
         --dkms)       USE_DKMS=1 ;;
         --hold)       HOLD_PKG=1 ;;
         --no-x-check) : ;;   # always passed to the installer now; kept for compatibility
+        --kernel-module-type=open|--kernel-module-type=proprietary)
+            MODULE_TYPE="${arg#--kernel-module-type=}" ;;
         *) log "WARNING: Unknown argument: $arg" ;;
     esac
 done
@@ -90,7 +96,23 @@ else
 fi
 
 log "==== NVIDIA driver install started ===="
-log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS hold=$HOLD_PKG pkg_mgr=$PKG_MGR)"
+log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS hold=$HOLD_PKG module=${MODULE_TYPE:-auto} pkg_mgr=$PKG_MGR)"
+
+# Log the tail of the newest DKMS build log for the nvidia module, so a failed
+# kernel module build is visible in the log and the app without digging.
+log_dkms_build_tail() {
+    local newest="" f
+    for f in /var/lib/dkms/nvidia/*/build/make.log; do
+        [[ -f "$f" ]] || continue
+        if [[ -z "$newest" || "$f" -nt "$newest" ]]; then newest="$f"; fi
+    done
+    if [[ -z "$newest" ]]; then return 0; fi
+    log "Build log: last lines of $newest"
+    tail -n 15 "$newest" 2>/dev/null | while IFS= read -r line; do
+        log "Build log: $line"
+    done
+    return 0
+}
 
 # ── Step 0: Copy into a root-only directory and verify the copy ───────
 # /var/tmp rather than /tmp: the installer self-extracts and executes, and
@@ -223,12 +245,14 @@ INSTALLER_ARGS=(
     --log-file-name=/var/log/nvidia-installer.log
 )
 if [[ $USE_DKMS -eq 1 ]]; then INSTALLER_ARGS+=(--dkms); fi
+if [[ -n "$MODULE_TYPE" ]]; then INSTALLER_ARGS+=("--kernel-module-type=$MODULE_TYPE"); fi
 
 RC=0
 "$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1 || RC=$?
 if [[ $RC -ne 0 ]]; then
     log "ERROR: NVIDIA installer exited with code $RC"
     log "See /var/log/nvidia-installer.log for details."
+    log_dkms_build_tail
     exit $RC
 fi
 log "NVIDIA installer finished successfully"
@@ -244,6 +268,75 @@ if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
     log "ERROR: initramfs rebuild failed. The driver is installed but the nouveau"
     log "       blacklist may not apply at boot. Run: ${INITRAMFS_CMD[*]}"
     exit 1
+fi
+
+# ── Step 6b: Verify the result (report only; never fails the install) ─
+# Everything here is a read-only check whose outcome goes to the log; the app
+# shows the "Verify:" lines after the install finishes.
+log "Verifying the installation…"
+VERIFY_WARNINGS=0
+verify_warn() { log "Verify: WARNING $*"; VERIFY_WARNINGS=$((VERIFY_WARNINGS + 1)); }
+
+if grep -qs '^blacklist nouveau' /etc/modprobe.d/blacklist-nouveau.conf; then
+    log "Verify: nouveau blacklist present"
+else
+    verify_warn "nouveau blacklist file is missing or empty"
+fi
+
+# initramfs: confirm it was built and carries the blacklist.
+if [[ "$PKG_MGR" == "apt" ]]; then
+    INITRAMFS_IMG="/boot/initrd.img-$KVER"
+    INITRAMFS_LIST_CMD=(lsinitramfs)
+else
+    INITRAMFS_IMG="/boot/initramfs-$KVER.img"
+    INITRAMFS_LIST_CMD=(lsinitrd)
+fi
+if [[ ! -f "$INITRAMFS_IMG" ]]; then
+    verify_warn "initramfs image not found at $INITRAMFS_IMG"
+elif command -v "${INITRAMFS_LIST_CMD[0]}" >/dev/null 2>&1; then
+    # Capture first: grep -q on a pipe would SIGPIPE the lister under pipefail.
+    INITRAMFS_FILES="$("${INITRAMFS_LIST_CMD[@]}" "$INITRAMFS_IMG" 2>/dev/null || true)"
+    if grep -q 'blacklist-nouveau' <<<"$INITRAMFS_FILES"; then
+        log "Verify: initramfs rebuilt and includes the nouveau blacklist ($INITRAMFS_IMG)"
+    else
+        verify_warn "initramfs $INITRAMFS_IMG does not list blacklist-nouveau.conf"
+    fi
+else
+    log "Verify: initramfs rebuilt ($INITRAMFS_IMG); contents not checked (${INITRAMFS_LIST_CMD[0]} not found)"
+fi
+
+# DKMS: the nvidia module should be built and installed for the running kernel.
+if [[ $USE_DKMS -eq 1 ]]; then
+    if command -v dkms >/dev/null 2>&1; then
+        DKMS_NVIDIA="$(dkms status 2>/dev/null | grep -i '^nvidia' || true)"
+        DKMS_FOR_KERNEL="$(grep -F "$KVER" <<<"$DKMS_NVIDIA" || true)"
+        if grep -q ': installed' <<<"$DKMS_FOR_KERNEL"; then
+            log "Verify: DKMS module installed for $KVER"
+        else
+            verify_warn "DKMS shows no installed nvidia module for $KVER (dkms status: ${DKMS_NVIDIA:-none})"
+            log_dkms_build_tail
+        fi
+    else
+        verify_warn "--dkms was requested but the dkms command is not available"
+    fi
+fi
+
+# Secure Boot: the module must carry a signature the firmware trusts.
+SB_STATE=""
+if command -v mokutil >/dev/null 2>&1; then SB_STATE="$(mokutil --sb-state 2>/dev/null || true)"; fi
+if grep -qi 'SecureBoot enabled' <<<"$SB_STATE"; then
+    MODULE_SIGNER="$(modinfo -k "$KVER" -F signer nvidia 2>/dev/null || true)"
+    if [[ -n "$MODULE_SIGNER" ]]; then
+        log "Verify: Secure Boot is on; nvidia module is signed by: $MODULE_SIGNER"
+    else
+        verify_warn "Secure Boot is on but the nvidia module for $KVER is unsigned; enroll a signing key with: mokutil --import <key.der>"
+    fi
+fi
+
+if [[ $VERIFY_WARNINGS -eq 0 ]]; then
+    log "Verify: all checks passed"
+else
+    log "Verify: $VERIFY_WARNINGS warning(s); see above"
 fi
 
 # ── Step 7: Optional package hold ──────────────────────────────────────

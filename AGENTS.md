@@ -31,6 +31,9 @@ them breaks existing installs' policy/settings).
   retries, and SHA256 verification.
 - `system.rs` — queries the local system: GPU, installed driver, kernel,
   DKMS status, Secure Boot state, free disk space, reboot-required state.
+- `preflight.rs` — pure, unit-tested decision logic: open/proprietary
+  module choice and validation, distro-package conflict filtering, Secure
+  Boot signing-key advice. `system.rs` gathers the facts it consumes.
 - `install.rs` — invokes `scripts/privileged-install.sh` via `pkexec`
   with `InstallOptions` (DKMS, version hold, etc).
 

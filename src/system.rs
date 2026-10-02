@@ -1,15 +1,26 @@
 //! system.rs — Query the local system for GPU, driver, kernel, disk, and boot info.
 
 
+use crate::preflight::{
+    parse_compute_caps, parse_dpkg_installed, parse_module_flavor, parse_mok_test_key,
+    parse_rpm_names, ComputeCap, ModuleFlavor, SigningKeyState, SIGNING_KEY_PATHS,
+};
 use std::process::Command;
 
 #[derive(Debug, Clone, Default)]
 pub struct SystemInfo {
     pub installed_driver: Option<String>,
     pub gpu_name: Option<String>,
+    /// CUDA compute capability per GPU, used to tell GPU generations apart.
+    pub gpu_compute_caps: Vec<ComputeCap>,
+    /// Flavor of the kernel module that is loaded right now.
+    pub module_flavor: ModuleFlavor,
     pub kernel_version: String,
     pub dkms_status: Vec<DkmsEntry>,
     pub secure_boot: SecureBootStatus,
+    pub signing_key: SigningKeyState,
+    /// Distro-packaged NVIDIA driver packages the install will remove.
+    pub distro_packages: Vec<String>,
     pub free_disk_bytes: Option<u64>,
     pub reboot_required: bool,
 }
@@ -41,15 +52,96 @@ impl std::fmt::Display for SecureBootStatus {
 }
 
 pub fn query_system() -> SystemInfo {
+    let secure_boot = get_secure_boot();
+    let signing_key = if secure_boot == SecureBootStatus::Enabled {
+        get_signing_key_state()
+    } else {
+        SigningKeyState::Unknown
+    };
     SystemInfo {
         installed_driver: get_installed_driver(),
         gpu_name: get_gpu_name(),
+        gpu_compute_caps: get_gpu_compute_caps(),
+        module_flavor: get_module_flavor(),
         kernel_version: get_kernel_version(),
         dkms_status: get_dkms_status(),
-        secure_boot: get_secure_boot(),
+        secure_boot,
+        signing_key,
+        distro_packages: get_distro_packages(),
         free_disk_bytes: get_free_disk(),
         reboot_required: check_reboot_required(),
     }
+}
+
+/// Compute capability of each GPU (`nvidia-smi`, driver 510+). Empty when no
+/// driver is running or the field is unsupported.
+fn get_gpu_compute_caps() -> Vec<ComputeCap> {
+    Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_compute_caps(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Open or proprietary flavor of the loaded kernel module.
+fn get_module_flavor() -> ModuleFlavor {
+    std::fs::read_to_string("/proc/driver/nvidia/version")
+        .map(|t| parse_module_flavor(&t))
+        .unwrap_or_default()
+}
+
+/// Installed distro driver packages (apt or rpm). Empty when none, or when
+/// neither package manager can be queried.
+fn get_distro_packages() -> Vec<String> {
+    const DEB_GLOBS: [&str; 4] =
+        ["nvidia-*", "libnvidia-*", "xserver-xorg-video-nvidia*", "system76-driver-nvidia*"];
+    const RPM_GLOBS: [&str; 5] = [
+        "akmod-nvidia*", "xorg-x11-drv-nvidia*", "kmod-nvidia*", "nvidia-driver*",
+        "nvidia-settings*",
+    ];
+    // dpkg-query exits non-zero when a glob matches nothing but still prints
+    // the matches of the others, so only the output is used.
+    if let Ok(out) = Command::new("dpkg-query")
+        .args(["-W", "-f", "${db:Status-Abbrev}|${Package}\\n"])
+        .args(DEB_GLOBS)
+        .output()
+    {
+        return parse_dpkg_installed(&String::from_utf8_lossy(&out.stdout));
+    }
+    if let Ok(out) = Command::new("rpm")
+        .args(["-qa", "--qf", "%{NAME}\\n"])
+        .args(RPM_GLOBS)
+        .output()
+    {
+        return parse_rpm_names(&String::from_utf8_lossy(&out.stdout));
+    }
+    vec![]
+}
+
+/// Whether a readable DKMS signing key is enrolled. Only meaningful with
+/// Secure Boot on; some key directories are root-only, which shows up as
+/// `Unknown`.
+fn get_signing_key_state() -> SigningKeyState {
+    for path in SIGNING_KEY_PATHS {
+        if !std::path::Path::new(path).is_file() {
+            continue;
+        }
+        if let Ok(out) = Command::new("mokutil").args(["--test-key", path]).output() {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            match parse_mok_test_key(&text) {
+                Some(true) => return SigningKeyState::Enrolled,
+                Some(false) => return SigningKeyState::NotEnrolled(path.to_string()),
+                None => {}
+            }
+        }
+    }
+    SigningKeyState::Unknown
 }
 
 /// Read the running driver version from nvidia-smi or /proc
@@ -67,22 +159,29 @@ fn get_installed_driver() -> Option<String> {
 
     // Fallback: /proc/driver/nvidia/version
     if let Ok(content) = std::fs::read_to_string("/proc/driver/nvidia/version") {
-        // Line format: "NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.84  ..."
-        for line in content.lines() {
-            if line.contains("NVRM version") {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                // Version is typically the 8th token
-                for (i, part) in parts.iter().enumerate() {
-                    if *part == "Module" {
-                        if let Some(ver) = parts.get(i + 1) {
-                            return Some(ver.to_string());
-                        }
-                    }
-                }
+        return parse_proc_driver_version(&content);
+    }
+
+    None
+}
+
+/// Extract the version from /proc/driver/nvidia/version. Proprietary format:
+///   "NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.84  ..."
+/// Open-module format puts "for x86_64" after "Module":
+///   "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.84  ..."
+/// so the version is the first token after "Module" that starts with a digit.
+fn parse_proc_driver_version(content: &str) -> Option<String> {
+    for line in content.lines().filter(|l| l.contains("NVRM version")) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(i) = parts.iter().position(|p| *p == "Module") {
+            if let Some(ver) = parts[i + 1..]
+                .iter()
+                .find(|p| p.starts_with(|c: char| c.is_ascii_digit()))
+            {
+                return Some(ver.to_string());
             }
         }
     }
-
     None
 }
 
@@ -243,6 +342,15 @@ mod tests {
         assert_eq!(format_bytes(1_572_864), "1.5 MB");
         assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
         assert_eq!(format_bytes(5 * 1_073_741_824 / 2), "2.5 GB");
+    }
+
+    #[test]
+    fn proc_version_both_flavors() {
+        let prop = "NVRM version: NVIDIA UNIX x86_64 Kernel Module  595.84  Tue Sep  1 2026\n";
+        let open = "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.84  Release Build\n";
+        assert_eq!(parse_proc_driver_version(prop).as_deref(), Some("595.84"));
+        assert_eq!(parse_proc_driver_version(open).as_deref(), Some("595.84"));
+        assert_eq!(parse_proc_driver_version("GCC version: gcc 15"), None);
     }
 
     #[test]

@@ -1,5 +1,8 @@
 use crate::download::{download_run_file, verify_sha256};
-use crate::install::{run_privileged_install, InstallOptions};
+use crate::install::{install_report, run_privileged_install, InstallOptions};
+use crate::preflight::{
+    conflict_summary, module_hint, secure_boot_advice, validate_module_choice, ModuleChoice,
+};
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
 use crate::versions::{fetch_checksum, fetch_versions, version_from_filename, DriverVersion};
 
@@ -11,7 +14,7 @@ use gtk4::{
 };
 use libadwaita::prelude::*;
 use libadwaita::{
-    AboutDialog, ActionRow, Application, ApplicationWindow, Banner, HeaderBar,
+    AboutDialog, ActionRow, Application, ApplicationWindow, Banner, ComboRow, HeaderBar,
     PreferencesGroup, Toast, ToastOverlay,
 };
 
@@ -30,6 +33,7 @@ struct AppState {
     expected_checksum: Option<String>,
     use_dkms: bool,
     hold_packages: bool,
+    module_choice: ModuleChoice,
     sysinfo: SystemInfo,
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
@@ -43,6 +47,7 @@ impl Default for AppState {
             expected_checksum: None,
             use_dkms: true,
             hold_packages: false,
+            module_choice: ModuleChoice::Auto,
             sysinfo: SystemInfo::default(),
             download_cancel: None,
         }
@@ -154,9 +159,11 @@ pub fn build_ui(app: &Application) {
     let hw_group = PreferencesGroup::builder().title("Hardware").build();
     let gpu_row = ActionRow::builder().title("GPU").subtitle("Detecting…").build();
     let driver_row = ActionRow::builder().title("Installed Driver").subtitle("Detecting…").build();
+    let module_row = ActionRow::builder().title("Kernel Module").subtitle("Detecting…").build();
     let kernel_row = ActionRow::builder().title("Kernel").subtitle("Detecting…").build();
     hw_group.add(&gpu_row);
     hw_group.add(&driver_row);
+    hw_group.add(&module_row);
     hw_group.add(&kernel_row);
     sysinfo_page.append(&hw_group);
 
@@ -260,8 +267,13 @@ pub fn build_ui(app: &Application) {
     let warn_group = PreferencesGroup::builder().title("Pre-install Checks").build();
     let disk_warn_row = ActionRow::builder().title("Disk Space").subtitle("—").build();
     let sb_warn_row = ActionRow::builder().title("Secure Boot").subtitle("—").build();
+    let pkg_warn_row = ActionRow::builder().title("Existing Driver Packages").subtitle("—").build();
+    for row in [&disk_warn_row, &sb_warn_row, &pkg_warn_row] {
+        row.set_subtitle_lines(0);
+    }
     warn_group.add(&disk_warn_row);
     warn_group.add(&sb_warn_row);
+    warn_group.add(&pkg_warn_row);
     config_page.append(&warn_group);
 
     let opts_group = PreferencesGroup::builder().title("Install Options").build();
@@ -282,7 +294,14 @@ pub fn build_ui(app: &Application) {
     hold_opt_row.add_suffix(&hold_switch);
     hold_opt_row.set_activatable_widget(Some(&hold_switch));
 
+    let module_combo = ComboRow::builder()
+        .title("Kernel Module")
+        .subtitle("Automatic: the installer picks from the detected GPUs")
+        .model(&gtk4::StringList::new(&["Automatic (recommended)", "Open", "Proprietary"]))
+        .build();
+
     opts_group.add(&dkms_opt_row);
+    opts_group.add(&module_combo);
     opts_group.add(&hold_opt_row);
     config_page.append(&opts_group);
 
@@ -381,6 +400,8 @@ pub fn build_ui(app: &Application) {
         let version_status_row = version_status_row.clone();
         let disk_warn_row = disk_warn_row.clone();
         let sb_warn_row = sb_warn_row.clone();
+        let pkg_warn_row = pkg_warn_row.clone();
+        let module_combo = module_combo.clone();
         let install_btn = install_btn.clone();
         let state = state.clone();
         move || {
@@ -441,10 +462,19 @@ pub fn build_ui(app: &Application) {
             // Secure boot check
             match &s.sysinfo.secure_boot {
                 SecureBootStatus::Enabled => sb_warn_row.set_subtitle(
-                    "Enabled — MOK enrollment may be required after install"),
+                    &secure_boot_advice(&s.sysinfo.secure_boot, &s.sysinfo.signing_key)
+                        .unwrap_or_else(|| "Enabled".to_string())),
                 SecureBootStatus::Disabled => sb_warn_row.set_subtitle("Disabled"),
                 SecureBootStatus::Unknown  => sb_warn_row.set_subtitle("Unknown"),
             }
+
+            // Distro driver packages the install will remove
+            pkg_warn_row.set_subtitle(
+                &conflict_summary(&s.sysinfo.distro_packages)
+                    .unwrap_or_else(|| "None found".to_string()));
+
+            // Kernel module flavor hint for the detected GPUs
+            module_combo.set_subtitle(&module_hint(&s.sysinfo.gpu_compute_caps));
         }
     };
 
@@ -455,6 +485,7 @@ pub fn build_ui(app: &Application) {
     let load_sysinfo = {
         let gpu_row = gpu_row.clone();
         let driver_row = driver_row.clone();
+        let module_row = module_row.clone();
         let kernel_row = kernel_row.clone();
         let dkms_row = dkms_row.clone();
         let secureboot_row = secureboot_row.clone();
@@ -476,6 +507,7 @@ pub fn build_ui(app: &Application) {
             let log_fn = log_fn.clone();
             let gpu_row = gpu_row.clone();
             let driver_row = driver_row.clone();
+            let module_row = module_row.clone();
             let kernel_row = kernel_row.clone();
             let dkms_row = dkms_row.clone();
             let secureboot_row = secureboot_row.clone();
@@ -504,6 +536,17 @@ pub fn build_ui(app: &Application) {
                         driver_badge.set_label("Driver: not installed");
                         log_fn("No NVIDIA driver detected".to_string());
                     }
+
+                    // Kernel module flavor (loaded) and GPU generation
+                    let gens = if info.gpu_compute_caps.is_empty() {
+                        String::new()
+                    } else {
+                        let mut g: Vec<&str> = info.gpu_compute_caps.iter()
+                            .map(|c| crate::preflight::generation_name(*c)).collect();
+                        g.dedup();
+                        format!(" ({})", g.join(", "))
+                    };
+                    module_row.set_subtitle(&format!("{}{}", info.module_flavor, gens));
 
                     // Kernel
                     kernel_row.set_subtitle(&info.kernel_version);
@@ -947,6 +990,16 @@ pub fn build_ui(app: &Application) {
     //  Switches
     // ─────────────────────────────────────────────────────────────────────────
     { let s = state.clone(); dkms_switch.connect_active_notify(move |sw| { s.borrow_mut().use_dkms = sw.is_active(); }); }
+    {
+        let s = state.clone();
+        module_combo.connect_selected_notify(move |row| {
+            s.borrow_mut().module_choice = match row.selected() {
+                1 => ModuleChoice::Open,
+                2 => ModuleChoice::Proprietary,
+                _ => ModuleChoice::Auto,
+            };
+        });
+    }
     { let s = state.clone(); hold_switch.connect_active_notify(move |sw| { s.borrow_mut().hold_packages = sw.is_active(); }); }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -971,9 +1024,24 @@ pub fn build_ui(app: &Application) {
                 }
             }
 
+            // Refuse module flavors that cannot work, before asking for a password.
+            let driver_major = std::path::Path::new(run_file)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(version_from_filename)
+                .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
+            if let Err(msg) = validate_module_choice(
+                s.module_choice, &s.sysinfo.gpu_compute_caps, driver_major,
+            ) {
+                log_fn(format!("Install not started: {}", msg));
+                toast_overlay.add_toast(Toast::new(&msg));
+                return;
+            }
+
             let opts = InstallOptions {
                 use_dkms: s.use_dkms,
                 hold_packages: s.hold_packages,
+                module: s.module_choice,
                 run_file: run_file.clone(),
                 sha256: s.expected_checksum.clone(),
             };
@@ -1009,11 +1077,22 @@ pub fn build_ui(app: &Application) {
 
             spawn_async(
                 async move {
-                    tokio::task::spawn_blocking(move || run_privileged_install(&opts)).await
+                    tokio::task::spawn_blocking(move || {
+                        let result = run_privileged_install(&opts);
+                        (result, install_report())
+                    })
+                    .await
                 },
                 move |result| {
                     btn.set_sensitive(true);
                     progress.set_visible(false);
+                    // Post-install verification results and any build-log excerpt
+                    if let Ok((_, report)) = &result {
+                        for line in report {
+                            log_fn(line.clone());
+                        }
+                    }
+                    let result = result.map(|(r, _)| r);
                     match result {
                         Ok(Ok(())) => {
                             log_fn("Install completed successfully.".to_string());
@@ -1064,7 +1143,10 @@ pub fn build_ui(app: &Application) {
                     gpu, driver, kernel
                 ))
                 .build();
-            dialog.add_acknowledgement_section(Some("Built with"), &["Claude Code (Anthropic)"]);
+            dialog.add_credit_section(
+                Some("Built with the help of"),
+                &["Claude (Anthropic)"],
+            );
             dialog.present(Some(&window));
         });
     }

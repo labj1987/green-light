@@ -1,5 +1,6 @@
 mod download;
 mod install;
+mod preflight;
 mod system;
 mod ui;
 mod versions;

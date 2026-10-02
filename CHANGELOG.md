@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.8.0 — 2026-10-02
+
+Kernel module flavor
+- New "Kernel Module" option on the Configure tab: Automatic (default, the
+  installer picks from your GPUs), Open, or Proprietary, passed to NVIDIA's
+  installer as `--kernel-module-type`. Choices that cannot work are refused
+  before the password prompt: open modules on a pre-Turing GPU or a driver
+  older than 515, proprietary modules on Blackwell and newer.
+- The System tab shows which flavor is loaded and your GPU generation.
+- Fixed the driver version fallback misreading `/proc/driver/nvidia/version`
+  on the open kernel module.
+
+Pre-install checks
+- Lists the distro driver packages (apt or rpm, including Pop!_OS
+  `system76-driver-nvidia*`) that the install will remove.
+- With Secure Boot on, checks whether a DKMS signing key is enrolled and shows
+  the exact `mokutil --import` steps when it is not.
+
+Post-install verification
+- The install script now checks the nouveau blacklist, the rebuilt initramfs,
+  the DKMS build for the running kernel, and the module signature under Secure
+  Boot. Results appear in the Log tab and `/var/log/green-light.log`. These
+  checks only report; they never fail an install.
+- When the installer or the DKMS build fails, the tail of the DKMS `make.log`
+  is added to the log.
+
+Other
+- The About dialog credits Claude (Anthropic) for help building the app.
+
 ## 2.7.5 — 2026-09-21
 
 Naming

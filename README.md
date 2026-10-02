@@ -28,6 +28,9 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 - Knows when a reboot is pending by comparing the kernel module on disk against the one that's loaded
 - Registers the driver with DKMS so the module rebuilds itself on kernel updates
 - Verifies the `.run` archive before changing anything, so a corrupt download stops the install with your current driver untouched
+- Lets you choose open or proprietary kernel modules (Automatic by default) and refuses combinations that cannot work, such as open modules on a pre-Turing GPU
+- Lists the distro driver packages the install will remove, and gives exact `mokutil` steps when Secure Boot is on and no signing key is enrolled
+- Checks the result after install (nouveau blacklist, initramfs, DKMS build, module signature) and shows the findings in the Log tab, with the DKMS build log tail if a build fails
 - The GUI never runs as root. Only the install script does, through polkit, and you can read every line of it in `scripts/privileged-install.sh`
 
 ## Requirements
@@ -72,6 +75,7 @@ Flags:
 |---|---|
 | `--dkms` | Register the module with DKMS (recommended) |
 | `--hold` | Pin the driver at its current version — `apt-mark hold` on apt, `dnf versionlock` on Fedora (needs `python3-dnf-plugin-versionlock` installed) |
+| `--kernel-module-type=open\|proprietary` | Pick the kernel module flavor. Without it, NVIDIA's installer chooses from the detected GPUs (open for Turing and newer) |
 | `--no-x-check` | Accepted for compatibility, the installer already skips the X check |
 
 Reboot afterward to switch drivers, same as the GUI flow.
