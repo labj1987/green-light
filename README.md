@@ -118,6 +118,10 @@ The output lands in the project directory. `Cargo.lock` is committed, so builds 
 
 The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers and DKMS are present, clears any conflicting distro driver packages, blacklists nouveau, and rebuilds the initramfs afterward. Around 120 lines of bash, all readable.
 
+## Acknowledgements
+
+Development assistance: Claude Code (Anthropic) and Codex (OpenAI).
+
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2.8.1 — 2026-10-02
+
+- The About dialog and README credit Codex (OpenAI) again, alongside Claude Code (Anthropic).
+
 ## 2.8.0 — 2026-10-02
 
 Kernel module flavor

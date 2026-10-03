@@ -1145,7 +1145,7 @@ pub fn build_ui(app: &Application) {
                 .build();
             dialog.add_credit_section(
                 Some("Built with the help of"),
-                &["Claude (Anthropic)"],
+                &["Claude Code (Anthropic)", "Codex (OpenAI)"],
             );
             dialog.present(Some(&window));
         });
