@@ -1,5 +1,30 @@
 # Changelog
 
+## 2.9.0 — 2026-10-08
+
+Automatic module signing
+- Every NVIDIA module Green Light installs is signed with the machine's
+  existing module-signing key, the one DKMS uses: `mok_signing_key`/
+  `mok_certificate` from the DKMS config, else Ubuntu's shim-signed
+  `MOK.priv`/`MOK.der`, else DKMS's `mok.key`/`mok.pub` (Fedora's akmods key
+  last). DKMS installs are signed by DKMS at build time; other installs pass
+  the key to NVIDIA's installer with `--module-signing-secret-key` and
+  `--module-signing-public-key`. With no key on the machine nothing changes.
+- New Set Up Signing button on the System tab: asks for a one-time password,
+  creates a key if there is none (`update-secureboot-policy --new-key` on
+  Ubuntu, otherwise DKMS's own), installs `mokutil`/`openssl` if missing, and
+  queues the certificate for enrollment at the MOK Manager screen on the next
+  reboot. The password goes to the install script on stdin, never on a command
+  line or in a log. Setup never touches the installed driver.
+- New Module Signing row on the System tab: the key, whether it is enrolled or
+  queued, and who signed the installed module. An unsigned module with a key
+  present is flagged for a one-click reinstall.
+- The post-install check now compares the module's signer with the signing
+  key's certificate whenever a key exists, not only with Secure Boot on, and
+  logs the certificate's enrollment state.
+- The Secure Boot pre-install check points at Set Up Signing instead of manual
+  `mokutil` steps.
+
 ## 2.8.1 — 2026-10-02
 
 - The About dialog and README credit Codex (OpenAI) again, alongside Claude Code (Anthropic).
