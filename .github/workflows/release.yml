@@ -21,8 +21,12 @@ jobs:
       - name: Build AppImage
         run: sudo -E env "PATH=$PATH" bash build-appimage.sh
 
+      # The release page carries this version's changes in full, from CHANGELOG.md: no link to it.
+      - name: Release notes from the changelog
+        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME}" > release-notes.md && cat release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
           files: green-light-*-x86_64.AppImage*
-          generate_release_notes: true
+          body_path: release-notes.md

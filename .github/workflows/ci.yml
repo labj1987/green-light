@@ -42,3 +42,6 @@ jobs:
 
       - name: ShellCheck
         run: shellcheck scripts/*.sh build-appimage.sh
+
+      - name: AppStream releases match the changelog
+        run: python3 scripts/sync_appdata_releases.py --check && python3 scripts/release_notes.py --self-test && python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d\" -f2)" > /dev/null

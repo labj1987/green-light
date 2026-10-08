@@ -1,29 +1,24 @@
 # Changelog
 
+One `## <version> — <date>` heading per released version, newest first. A release's page
+carries its section as written, and the AppStream `<releases>` list is generated from these
+headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
+under 2.3.0.
+
 ## 2.9.0 — 2026-10-08
 
-Automatic module signing
-- Every NVIDIA module Green Light installs is signed with the machine's
-  existing module-signing key, the one DKMS uses: `mok_signing_key`/
-  `mok_certificate` from the DKMS config, else Ubuntu's shim-signed
-  `MOK.priv`/`MOK.der`, else DKMS's `mok.key`/`mok.pub` (Fedora's akmods key
-  last). DKMS installs are signed by DKMS at build time; other installs pass
-  the key to NVIDIA's installer with `--module-signing-secret-key` and
-  `--module-signing-public-key`. With no key on the machine nothing changes.
-- New Set Up Signing button on the System tab: asks for a one-time password,
-  creates a key if there is none (`update-secureboot-policy --new-key` on
-  Ubuntu, otherwise DKMS's own), installs `mokutil`/`openssl` if missing, and
-  queues the certificate for enrollment at the MOK Manager screen on the next
-  reboot. The password goes to the install script on stdin, never on a command
-  line or in a log. Setup never touches the installed driver.
-- New Module Signing row on the System tab: the key, whether it is enrolled or
-  queued, and who signed the installed module. An unsigned module with a key
-  present is flagged for a one-click reinstall.
-- The post-install check now compares the module's signer with the signing
-  key's certificate whenever a key exists, not only with Secure Boot on, and
-  logs the certificate's enrollment state.
-- The Secure Boot pre-install check points at Set Up Signing instead of manual
-  `mokutil` steps.
+**Driver signing for Secure Boot.** Green Light can sign the NVIDIA driver it installs with
+your machine's module-signing key, the same key DKMS uses, so the driver can be used with
+Secure Boot on.
+
+- **Set Up Signing** on the System tab does the one-time setup. It creates a signing key if
+  the machine has none and queues it for enrollment. You choose a one-time password and
+  type it once at the blue MOK Manager screen on the next reboot.
+- After that, every driver install is signed. A driver installed before setup stays
+  unsigned until you reinstall it once; the System tab says when that's needed.
+- The System tab's new Module signing row shows whether there is a key, whether it is
+  enrolled or waiting for the reboot, and who signed the installed driver.
+- If you never set up signing, installs work as before.
 
 ## 2.8.1 — 2026-10-02
 
@@ -163,9 +158,9 @@ Other
   pre-rename `NVI` repo — it now points at `GreenLight`, matching where
   the 2.6.0 release actually lives.
 
-## 2.6.0 — Rebrand to GreenLight, new icon set
+## 2.6.0 — 2026-08-05
 
-NVI is now GreenLight. Full rename — crate/package name, application ID
+**Rebrand to GreenLight, new icon set.** NVI is now GreenLight. Full rename — crate/package name, application ID
 (`io.github.labj1987.GreenLight`), prgname, window title, About dialog,
 desktop file, appdata, polkit policy, install-script/log paths
 (`/usr/lib/greenlight/`, `/var/log/greenlight.log`), and the HTTP user
@@ -187,7 +182,9 @@ The GitHub repo itself (`labj1987/NVI`) is intentionally left unrenamed
 for now — `build-appimage.sh`'s `UPDATE_INFORMATION` and the appdata/
 policy URLs still point at NVI.
 
-## 2.5.10 — Switch packaging to bare appimagetool (drop bundled GTK)
+## 2.5.10 — 2026-08-04
+
+**Switch packaging to bare appimagetool (drop bundled GTK).**
 
 - NVI was the only one of the three apps built with `linuxdeploy` +
   `linuxdeploy-plugin-gtk`, which bundles its own copy of GTK4/libadwaita
@@ -206,7 +203,9 @@ policy URLs still point at NVI.
   apps as a side effect. AppDir layout, AppRun's privileged-install
   staging logic, and the polkit policy/appdata paths are unchanged.
 
-## 2.5.9 — Align app_id/StartupWMClass with MKI and proton-trainer
+## 2.5.9 — 2026-08-04
+
+**Align app_id/StartupWMClass with MKI and proton-trainer.**
 
 - NVI never exhibited the phantom-taskbar-entry bug hit by MKI and
   proton-trainer, because it runs under XWayland (the bundled
@@ -218,7 +217,9 @@ policy URLs still point at NVI.
   match MKI and proton-trainer's fix and remove the latent risk should
   NVI's packaging ever move off linuxdeploy's bundled GTK.
 
-## 2.5.8 — Fix phantom taskbar window from the About dialog
+## 2.5.8 — 2026-08-04
+
+**Fix phantom taskbar window from the About dialog.**
 
 - The About dialog used `gtk4::AboutDialog`, a `Gtk.Window` subclass that
   creates a real separate top-level Wayland surface, showing as a
@@ -227,7 +228,9 @@ policy URLs still point at NVI.
   (`Adw.Dialog` subclass, requires the `v1_5` feature, now enabled),
   which renders as a sheet inside the main window's own surface.
 
-## 2.5.7 — Fix UPDATE_INFORMATION to reference .zsync sidecar
+## 2.5.7 — 2026-08-04
+
+**Fix UPDATE_INFORMATION to reference .zsync sidecar.**
 
 - Per the AppImage update spec, the GitHub Releases zsync transport string
   must end in the `.zsync` sidecar filename, not the AppImage filename.
@@ -237,7 +240,9 @@ policy URLs still point at NVI.
   sidecar itself was already being generated and published correctly.
   Packaging-only fix, no application behavior changes.
 
-## 2.5.6 — Fix orphaned .zsync sidecar
+## 2.5.6 — 2026-07-17
+
+**Fix orphaned .zsync sidecar.**
 
 - build-appimage.sh renamed only the built .AppImage to its final
   versioned filename; a same-named .zsync sidecar produced by linuxdeploy
@@ -247,21 +252,27 @@ policy URLs still point at NVI.
   after 2.5.5 fixed zsync not being installed. The .zsync is now
   renamed alongside the AppImage.
 
-## 2.5.5 — Fix missing .zsync file
+## 2.5.5 — 2026-07-17
+
+**Fix missing .zsync file.**
 
 - The build runner never had zsync installed, so linuxdeploy silently
   skipped generating the .zsync file even though UPDATE_INFORMATION was
   already set in 2.5.4 — update-aware tools had nothing to delta-update
   against. zsync is now installed alongside the other build dependencies.
 
-## 2.5.4 — Enable update checking
+## 2.5.4 — 2026-07-17
+
+**Enable update checking.**
 
 - Embedded UPDATE_INFORMATION in the AppImage so update-aware tools
   (Gear Lever, AppImageUpdate) can check GitHub Releases for newer
   versions and delta-update via zsync. CI now also uploads the .zsync
   file alongside the AppImage.
 
-## 2.5.3 — Bug fixes and version-string consolidation
+## 2.5.3 — 2026-07-16
+
+**Bug fixes and version-string consolidation.**
 
 - Fixed wrong version being selected when the search filter is active:
   the selection handler indexed the full version list by visible row
@@ -286,15 +297,25 @@ policy URLs still point at NVI.
   parses Cargo.toml. The About dialog previously reported 2.4.0 in the
   2.5.x releases because the hardcoded copies were missed.
 
-## 2.5.2 — New application ID (retroactive entry)
+## 2.5.2 — 2026-07-13
 
-Application ID moved to io.github.labj1987.NVI (polkit action, appdata,
+**New application ID.** Application ID moved to io.github.labj1987.NVI (polkit action, appdata,
 application_id); all machine-specific references removed; .deb packaging
 and DBus service file deleted. AppImage is the only distribution format.
 
-## 2.4.0 — Fedora and dnf-based distro support
+## 2.5.1 — 2026-07-13
 
-The install script now detects the package manager (apt vs dnf) and
+- Packaging fix for the app's description metadata. No change to the app itself.
+
+## 2.5.0 — 2026-07-13
+
+- The AppImage now carries its description metadata, so AppImage managers and
+  software centers can show what the app is.
+- The README has screenshots.
+
+## 2.4.0 — 2026-07-08
+
+**Fedora and dnf-based distro support.** The install script now detects the package manager (apt vs dnf) and
 branches every distro-specific step accordingly: kernel header packages,
 clearing conflicting driver packages, initramfs rebuild (`dracut` instead
 of `update-initramfs`), and the optional version hold (`dnf versionlock`
@@ -302,9 +323,9 @@ instead of `apt-mark hold`). No changes needed to the GUI itself — it
 was already package-manager agnostic. Less tested than the Ubuntu path;
 if something doesn't work right on Fedora, open an issue.
 
-## 2.3.0 — Repo-style install
+## 2.3.0 — 2026-07-07
 
-The big one. Rethought the install model entirely: instead of tearing down
+**Repo-style install.** The big one. Rethought the install model entirely: instead of tearing down
 the graphical session to unload the live kernel module, the installer now
 runs with `--allow-installation-with-running-driver` and installs the new
 driver to disk while the old one keeps running — exactly like a distro
@@ -317,13 +338,17 @@ package upgrade. The switch happens at the next reboot.
   ~120 straightforward lines
 - Fully verified end to end with a live install
 
-## 2.2.x — Detached-install experiments (superseded)
+### Before this repository
+
+Versions 1.x to 2.2.x were released before this repository existed and have no dates.
+
+#### 2.2.x — Detached-install experiments (superseded)
 
 Attempted to survive session teardown by re-executing the privileged script
 into a detached `systemd-run` scope with `IgnoreOnIsolate=true`. Worked, but
 2.3.0 made the entire problem unnecessary. Kept in history for reference.
 
-## 2.1.x — Feature releases
+#### 2.1.x — Feature releases
 
 - **2.1.4** — Fixed AppImage first-run: root cannot read another user's
   FUSE mount, so privileged files are now staged through /tmp before
@@ -342,13 +367,13 @@ into a detached `systemd-run` scope with `IgnoreOnIsolate=true`. Worked, but
   custom NVI icon set; single-instance fix (Wayland WM_CLASS must match
   the full application ID); AppImage packaging
 
-## 2.0.0 — Rust rebuild
+#### 2.0.0 — Rust rebuild
 
 Complete rewrite from Python/GTK4 to Rust + GTK4 + libadwaita. Single
 static binary, Tokio async runtime bridged to the glib main loop, `.deb`
 packaging.
 
-## 1.x — Original Python version
+#### 1.x — Original Python version
 
 GTK4 Python GUI with polkit-authorized install script, version browsing,
 download with progress, and SHA256 verification (added in 1.2.0).

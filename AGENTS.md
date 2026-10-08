@@ -96,14 +96,31 @@ non-fatal (the AppImage is valid without the sidecar).
 ## Release process
 
 1. Bump `version` in `Cargo.toml`.
-2. Add a `CHANGELOG.md` entry.
-3. Commit, push to `main`.
-4. `git tag vX.Y.Z && git push origin vX.Y.Z`.
-5. The tag push triggers `.github/workflows/release.yml` ("Build and
+2. Add a `CHANGELOG.md` entry (see Changelog below).
+3. Run `python3 scripts/sync_appdata_releases.py` to regenerate the
+   appdata `<releases>` list; CI fails if it is out of date.
+4. Commit, push to `main`.
+5. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+6. The tag push triggers `.github/workflows/release.yml` ("Build and
    Release"), which runs `build-appimage.sh` and uploads the AppImage
-   (+ `.zsync`) to a GitHub Release via `softprops/action-gh-release`.
+   (+ `.zsync`) to a GitHub Release via `softprops/action-gh-release`,
+   with that version's changelog section as the release text.
    The release-asset glob must match both files — check it whenever the
    output filename pattern changes.
+
+## Changelog
+
+- One `## X.Y.Z — YYYY-MM-DD` heading per released version, newest
+  first. No entries for builds that were never released.
+- Write each entry for the people using the app: what changed for them
+  and anything they need to do. Leave out implementation detail (file
+  paths, flags, internal names, CI and packaging changes) unless a user
+  needs it to act.
+- The release page is the version's section written out in full
+  (`scripts/release_notes.py`), never a link to the changelog. The
+  release fails if the section is missing.
+- The appdata `<releases>` list is generated from the headings
+  (`scripts/sync_appdata_releases.py`). Don't edit it by hand.
 
 ## Conventions
 
