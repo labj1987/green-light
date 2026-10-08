@@ -1,7 +1,10 @@
 use crate::download::{download_run_file, verify_sha256};
-use crate::install::{install_report, run_privileged_install, InstallOptions};
+use crate::install::{
+    install_report, run_privileged_install, run_privileged_setup_signing, InstallOptions,
+};
 use crate::preflight::{
-    conflict_summary, module_hint, secure_boot_advice, validate_module_choice, ModuleChoice,
+    conflict_summary, module_hint, secure_boot_advice, signing_summary, validate_module_choice,
+    validate_mok_password, ModuleChoice,
 };
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
 use crate::versions::{fetch_checksum, fetch_versions, version_from_filename, DriverVersion};
@@ -170,10 +173,20 @@ pub fn build_ui(app: &Application) {
     let status_group = PreferencesGroup::builder().title("Status").build();
     let dkms_row = ActionRow::builder().title("DKMS Modules").subtitle("Checking…").build();
     let secureboot_row = ActionRow::builder().title("Secure Boot").subtitle("Checking…").build();
+    let signing_row = ActionRow::builder().title("Module Signing").subtitle("Checking…").build();
+    signing_row.set_subtitle_lines(0);
+    let signing_btn = Button::builder()
+        .label("Set Up Signing")
+        .valign(Align::Center)
+        .sensitive(false)
+        .tooltip_text("Create or reuse this computer's module-signing key and enroll it")
+        .build();
+    signing_row.add_suffix(&signing_btn);
     let disk_row = ActionRow::builder().title("Free Disk Space").subtitle("Checking…").build();
     let reboot_row = ActionRow::builder().title("Reboot Required").subtitle("Checking…").build();
     status_group.add(&dkms_row);
     status_group.add(&secureboot_row);
+    status_group.add(&signing_row);
     status_group.add(&disk_row);
     status_group.add(&reboot_row);
     sysinfo_page.append(&status_group);
@@ -489,6 +502,8 @@ pub fn build_ui(app: &Application) {
         let kernel_row = kernel_row.clone();
         let dkms_row = dkms_row.clone();
         let secureboot_row = secureboot_row.clone();
+        let signing_row = signing_row.clone();
+        let signing_btn = signing_btn.clone();
         let disk_row = disk_row.clone();
         let reboot_row = reboot_row.clone();
         let reboot_banner = reboot_banner.clone();
@@ -511,6 +526,8 @@ pub fn build_ui(app: &Application) {
             let kernel_row = kernel_row.clone();
             let dkms_row = dkms_row.clone();
             let secureboot_row = secureboot_row.clone();
+            let signing_row = signing_row.clone();
+            let signing_btn = signing_btn.clone();
             let disk_row = disk_row.clone();
             let reboot_row = reboot_row.clone();
             let reboot_banner = reboot_banner.clone();
@@ -565,6 +582,11 @@ pub fn build_ui(app: &Application) {
                     // Secure boot
                     secureboot_row.set_subtitle(&info.secure_boot.to_string());
 
+                    // Module signing: key state, installed module's signer
+                    signing_row.set_subtitle(
+                        &signing_summary(&info.signing_key, &info.module_signature));
+                    signing_btn.set_sensitive(info.signing_key.setup_needed());
+
                     // Disk
                     match info.free_disk_bytes {
                         Some(free) => disk_row.set_subtitle(&format!("{} free on /", format_bytes(free))),
@@ -597,6 +619,128 @@ pub fn build_ui(app: &Application) {
     load_sysinfo();
 
     { let ls = load_sysinfo.clone(); refresh_sysinfo_btn.connect_clicked(move |_| ls()); }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  Set Up Signing: one-time MOK password, then the privileged setup
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+        let window = window.clone();
+        let log_fn = log_fn.clone();
+        let toast_overlay = toast_overlay.clone();
+        let stack = stack.clone();
+        let load_sysinfo = load_sysinfo.clone();
+
+        signing_btn.connect_clicked(move |btn| {
+            let pw1 = gtk4::PasswordEntry::builder()
+                .placeholder_text("One-time password")
+                .show_peek_icon(true)
+                .build();
+            let pw2 = gtk4::PasswordEntry::builder()
+                .placeholder_text("Type it again")
+                .show_peek_icon(true)
+                .build();
+            let hint = Label::builder()
+                .label("Use 8 to 16 characters.")
+                .wrap(true)
+                .xalign(0.0)
+                .build();
+            hint.add_css_class("dim-label");
+            let fields = GtkBox::new(Orientation::Vertical, 8);
+            fields.append(&pw1);
+            fields.append(&pw2);
+            fields.append(&hint);
+
+            let dialog = libadwaita::AlertDialog::new(
+                Some("Set Up Module Signing"),
+                Some(
+                    "Pick a one-time password to approve this computer's module-signing key. \
+                     On the next restart a blue MOK Manager screen appears before Linux starts: \
+                     choose Enroll MOK and type this same password there once.",
+                ),
+            );
+            dialog.set_extra_child(Some(&fields));
+            dialog.add_responses(&[("cancel", "Cancel"), ("setup", "Set Up Signing")]);
+            dialog.set_response_appearance("setup", libadwaita::ResponseAppearance::Suggested);
+            dialog.set_response_enabled("setup", false);
+            dialog.set_close_response("cancel");
+
+            // Weak references: the entries' handlers must not keep the dialog alive.
+            for (entry, other) in [(&pw1, &pw2), (&pw2, &pw1)] {
+                let dialog = dialog.downgrade();
+                let other = other.downgrade();
+                let hint = hint.downgrade();
+                entry.connect_changed(move |entry| {
+                    let (Some(dialog), Some(other), Some(hint)) =
+                        (dialog.upgrade(), other.upgrade(), hint.upgrade())
+                    else {
+                        return;
+                    };
+                    match validate_mok_password(&entry.text(), &other.text()) {
+                        Ok(()) => {
+                            hint.set_label("Passwords match.");
+                            dialog.set_response_enabled("setup", true);
+                        }
+                        Err(msg) => {
+                            hint.set_label(&msg);
+                            dialog.set_response_enabled("setup", false);
+                        }
+                    }
+                });
+            }
+
+            let log_fn = log_fn.clone();
+            let toast_overlay = toast_overlay.clone();
+            let stack = stack.clone();
+            let load_sysinfo = load_sysinfo.clone();
+            let btn = btn.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+                if response != "setup" {
+                    return;
+                }
+                let password = pw1.text().to_string();
+                pw1.set_text("");
+                pw2.set_text("");
+                if validate_mok_password(&password, &password).is_err() {
+                    return;
+                }
+
+                btn.set_sensitive(false);
+                stack.set_visible_child_name("log");
+                log_fn("Setting up module signing…".to_string());
+
+                spawn_async(
+                    async move {
+                        tokio::task::spawn_blocking(move || run_privileged_setup_signing(&password))
+                            .await
+                    },
+                    move |outcome| {
+                        btn.set_sensitive(true);
+                        match outcome {
+                            Ok(outcome) => {
+                                for line in &outcome.lines {
+                                    log_fn(line.clone());
+                                }
+                                match outcome.result {
+                                    Ok(()) => {
+                                        log_fn("Module signing setup finished.".to_string());
+                                        toast_overlay.add_toast(Toast::new(
+                                            "Module signing set up — see Log tab"));
+                                    }
+                                    Err(e) => {
+                                        log_fn(format!("Module signing setup failed: {}", e));
+                                        toast_overlay.add_toast(Toast::new(
+                                            "Signing setup failed — see Log tab"));
+                                    }
+                                }
+                            }
+                            Err(e) => log_fn(format!("Task error: {}", e)),
+                        }
+                        load_sysinfo();
+                    },
+                );
+            });
+        });
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Load versions

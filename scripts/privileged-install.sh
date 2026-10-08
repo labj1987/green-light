@@ -19,6 +19,19 @@
 # Without --kernel-module-type the installer picks the flavor from the
 # detected GPUs (open for Turing and newer).
 #
+#        privileged-install.sh --setup-signing   (one-time password on stdin)
+# Setup mode makes sure the machine has a module-signing key and queues its
+# certificate for MOK enrollment. It never touches the installed driver.
+#
+# MODULE SIGNING
+# --------------
+# Modules are signed with the machine's existing module-signing key, looked
+# up in the order DKMS uses: mok_signing_key/mok_certificate from the DKMS
+# config, then Ubuntu's shim-signed MOK, then DKMS's own default, then
+# Fedora's akmods key. DKMS installs are signed by DKMS itself; other
+# installs get the key passed to nvidia-installer. With no key, nothing
+# about the install changes. Only --setup-signing ever creates a key.
+#
 # SECURITY MODEL
 # --------------
 # The .run file normally lives in a user-writable directory, so it could be
@@ -41,6 +54,236 @@ log() {
 }
 
 trap 'log "ERROR: step failed near line $LINENO (exit $?) — install aborted"' ERR
+
+# ── Package manager detection (shared by both modes) ───────────────────
+detect_pkg_mgr() {
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MGR="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MGR="dnf"
+    else
+        log "ERROR: Neither apt-get nor dnf found. This script supports"
+        log "       apt-based (Ubuntu, Debian, Mint) and dnf-based"
+        log "       (Fedora, RHEL, Nobara) distros only."
+        exit 1
+    fi
+}
+
+# ── Module-signing key helpers ─────────────────────────────────────────
+# Key/certificate pairs in lookup order after the DKMS config.
+DKMS_DEFAULT_KEY="/var/lib/dkms/mok.key"
+DKMS_DEFAULT_CERT="/var/lib/dkms/mok.pub"
+SIGNING_KEY_PAIRS=(
+    "/var/lib/shim-signed/mok/MOK.priv|/var/lib/shim-signed/mok/MOK.der"
+    "$DKMS_DEFAULT_KEY|$DKMS_DEFAULT_CERT"
+    "/etc/pki/akmods/private/private_key.priv|/etc/pki/akmods/certs/public_key.der"
+)
+
+# One value from a DKMS config assignment, as the shell would read it:
+# quoted values up to the closing quote, bare values up to whitespace.
+# $kernelver expands to the running kernel, as DKMS allows.
+conf_value() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    if [[ "$v" == \"* ]]; then
+        v="${v#\"}"; v="${v%%\"*}"
+    elif [[ "$v" == \'* ]]; then
+        v="${v#\'}"; v="${v%%\'*}"
+    else
+        v="${v%%[[:space:]]*}"
+    fi
+    v="${v//\$\{kernelver\}/$(uname -r)}"
+    v="${v//\$kernelver/$(uname -r)}"
+    printf '%s' "$v"
+}
+
+# mok_signing_key / mok_certificate from framework.conf, then
+# framework.conf.d/*.conf; the last assignment wins, as DKMS sources them.
+read_dkms_signing_config() {
+    CFG_KEY=""
+    CFG_CERT=""
+    local f line
+    for f in /etc/dkms/framework.conf /etc/dkms/framework.conf.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*mok_signing_key=(.*)$ ]]; then
+                CFG_KEY="$(conf_value "${BASH_REMATCH[1]}")"
+            elif [[ "$line" =~ ^[[:space:]]*mok_certificate=(.*)$ ]]; then
+                CFG_CERT="$(conf_value "${BASH_REMATCH[1]}")"
+            fi
+        done < "$f"
+    done
+}
+
+key_present() { [[ "$1" == pkcs11:* || -f "$1" ]]; }
+
+# Sets SIGN_KEY, SIGN_CERT and SIGN_SOURCE (config|default). SIGN_KEY stays
+# empty when no key exists. When the DKMS config names a key, those paths
+# are used even if missing (SIGN_MISSING=1), since that is what DKMS uses.
+resolve_signing_key() {
+    SIGN_KEY=""
+    SIGN_CERT=""
+    SIGN_SOURCE=""
+    SIGN_MISSING=0
+    read_dkms_signing_config
+    if [[ -n "$CFG_KEY" || -n "$CFG_CERT" ]]; then
+        SIGN_KEY="${CFG_KEY:-$DKMS_DEFAULT_KEY}"
+        SIGN_CERT="${CFG_CERT:-$DKMS_DEFAULT_CERT}"
+        SIGN_SOURCE="config"
+        if ! key_present "$SIGN_KEY" || [[ ! -f "$SIGN_CERT" ]]; then SIGN_MISSING=1; fi
+        return 0
+    fi
+    local pair
+    for pair in "${SIGNING_KEY_PAIRS[@]}"; do
+        if [[ -f "${pair%%|*}" && -f "${pair#*|}" ]]; then
+            SIGN_KEY="${pair%%|*}"
+            SIGN_CERT="${pair#*|}"
+            SIGN_SOURCE="default"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Setup mode only: make sure a key exists, creating one the standard way
+# when none does. Never overwrites an existing key or certificate.
+ensure_signing_key() {
+    resolve_signing_key
+    if [[ -n "$SIGN_KEY" && $SIGN_MISSING -eq 0 ]]; then
+        log "Using the existing module-signing key $SIGN_KEY (certificate $SIGN_CERT)"
+        return 0
+    fi
+    if [[ -n "$SIGN_KEY" ]] && { key_present "$SIGN_KEY" || [[ -f "$SIGN_CERT" ]]; }; then
+        log "ERROR: Only half of the signing key pair exists ($SIGN_KEY, $SIGN_CERT)."
+        log "       Refusing to replace it; restore the missing file or fix the DKMS config."
+        return 1
+    fi
+    if [[ "$SIGN_SOURCE" != "config" ]] && command -v update-secureboot-policy >/dev/null 2>&1; then
+        log "Creating a module-signing key with update-secureboot-policy…"
+        # SHIM_NOTRIGGER: create the key only; enrollment is queued below.
+        SHIM_NOTRIGGER=y update-secureboot-policy --new-key >>"$LOGFILE" 2>&1 \
+            || log "WARNING: update-secureboot-policy --new-key failed"
+        resolve_signing_key
+    fi
+    if [[ -z "$SIGN_KEY" || $SIGN_MISSING -eq 1 ]] && command -v dkms >/dev/null 2>&1; then
+        log "Letting DKMS create its module-signing key…"
+        dkms generate_mok >>"$LOGFILE" 2>&1 || log "WARNING: dkms generate_mok failed"
+        resolve_signing_key
+    fi
+    if [[ -z "$SIGN_KEY" || $SIGN_MISSING -eq 1 ]]; then
+        log "ERROR: Could not create a module-signing key (see $LOGFILE)."
+        return 1
+    fi
+    log "Created module-signing key $SIGN_KEY (certificate $SIGN_CERT)"
+    return 0
+}
+
+# Path of the certificate in DER form, converting a PEM certificate into
+# <dir> when needed. Without openssl the certificate is assumed to be DER
+# (every default location stores DER).
+cert_as_der() { # <cert> <dir>
+    if ! command -v openssl >/dev/null 2>&1 \
+        || openssl x509 -inform DER -in "$1" -noout >/dev/null 2>&1; then
+        printf '%s' "$1"
+        return 0
+    fi
+    openssl x509 -inform PEM -in "$1" -outform DER -out "$2/signing-cert.der" >/dev/null 2>&1 \
+        || return 1
+    printf '%s' "$2/signing-cert.der"
+}
+
+# Subject CN of a certificate (what modinfo reports as the signer), or
+# nothing when it can't be read.
+cert_subject_cn() { # <cert>
+    command -v openssl >/dev/null 2>&1 || return 0
+    local form subject line
+    for form in DER PEM; do
+        if subject="$(openssl x509 -inform "$form" -in "$1" -noout -subject \
+                -nameopt multiline 2>/dev/null)"; then
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^[[:space:]]*commonName[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+                    printf '%s' "${BASH_REMATCH[1]}"
+                    return 0
+                fi
+            done <<<"$subject"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# ── Setup mode: --setup-signing ────────────────────────────────────────
+# Creates the key if needed and queues its certificate for MOK enrollment.
+# The one-time password arrives on stdin and never appears in argv or a log.
+if [[ "${1:-}" == "--setup-signing" ]]; then
+    trap 'log "ERROR: step failed near line $LINENO (exit $?) — signing setup aborted"' ERR
+    MOK_PASSWORD=""
+    IFS= read -r MOK_PASSWORD || true
+    log "==== Module signing setup started ===="
+    PASSWORD_RE='^[[:print:]]{8,16}$'
+    if [[ ! "$MOK_PASSWORD" =~ $PASSWORD_RE ]]; then
+        log "ERROR: The one-time password must be 8 to 16 printable characters."
+        exit 1
+    fi
+    detect_pkg_mgr
+
+    MISSING_PKGS=()
+    command -v mokutil >/dev/null 2>&1 || MISSING_PKGS+=(mokutil)
+    command -v openssl >/dev/null 2>&1 || MISSING_PKGS+=(openssl)
+    if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
+        log "Installing ${MISSING_PKGS[*]}…"
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            apt-get install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
+                || { log "ERROR: apt-get could not install ${MISSING_PKGS[*]}"; exit 1; }
+        else
+            dnf install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
+                || { log "ERROR: dnf could not install ${MISSING_PKGS[*]}"; exit 1; }
+        fi
+    fi
+
+    ensure_signing_key || exit 1
+
+    PRIV_DIR="$(mktemp -d /var/tmp/green-light-signing.XXXXXX)"
+    chmod 700 "$PRIV_DIR"
+    trap 'rm -rf "$PRIV_DIR"' EXIT
+    if ! CERT_DER="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")"; then
+        log "ERROR: Could not read the certificate $SIGN_CERT"
+        exit 1
+    fi
+    SIGNER_CN="$(cert_subject_cn "$CERT_DER")"
+    log "Signing certificate: $SIGN_CERT${SIGNER_CN:+ (CN: $SIGNER_CN)}"
+
+    # Enrolled ("already enrolled"), trusted another way ("already in db",
+    # "already in the built-in trusted keyring") or already queued ("already
+    # in the enrollment request"): nothing to queue.
+    TEST_OUT="$(mokutil --test-key "$CERT_DER" 2>&1 || true)"
+    if grep -qiE 'already (enrolled|in )' <<<"$TEST_OUT"; then
+        log "The certificate is already enrolled or queued for enrollment; nothing to do."
+        log "==== Module signing setup done ===="
+        exit 0
+    fi
+
+    # mokutil --generate-hash reads the password twice from stdin when there
+    # is no tty and prints a SHA-512 crypt line; keep only that line.
+    HASH="$(printf '%s\n%s\n' "$MOK_PASSWORD" "$MOK_PASSWORD" \
+        | mokutil --generate-hash 2>/dev/null | grep -oE '[$]6[$][^[:space:]]+' | head -n 1 || true)"
+    MOK_PASSWORD=""
+    if [[ -z "$HASH" ]]; then
+        log "ERROR: mokutil --generate-hash produced no password hash."
+        exit 1
+    fi
+    HASH_FILE="$(umask 077; mktemp "$PRIV_DIR/hash.XXXXXX")"
+    printf '%s\n' "$HASH" > "$HASH_FILE"
+    HASH=""
+    if ! mokutil --import "$CERT_DER" --hash-file "$HASH_FILE" >>"$LOGFILE" 2>&1; then
+        log "ERROR: mokutil --import failed (see $LOGFILE)."
+        exit 1
+    fi
+    rm -f "$HASH_FILE"
+    log "Enrollment queued. On the next reboot, choose Enroll MOK at the blue MOK Manager screen and type the one-time password."
+    log "==== Module signing setup done ===="
+    exit 0
+fi
 
 ORIG_RUN_FILE="${1:-}"
 EXPECT_SHA256="${2:-}"
@@ -84,16 +327,7 @@ for arg in "$@"; do
 done
 
 # ── Detect package manager ─────────────────────────────────────────────
-if command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR="apt"
-elif command -v dnf >/dev/null 2>&1; then
-    PKG_MGR="dnf"
-else
-    log "ERROR: Neither apt-get nor dnf found. This script supports"
-    log "       apt-based (Ubuntu, Debian, Mint) and dnf-based"
-    log "       (Fedora, RHEL, Nobara) distros only."
-    exit 1
-fi
+detect_pkg_mgr
 
 log "==== NVIDIA driver install started ===="
 log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS hold=$HOLD_PKG module=${MODULE_TYPE:-auto} pkg_mgr=$PKG_MGR)"
@@ -247,6 +481,31 @@ INSTALLER_ARGS=(
 if [[ $USE_DKMS -eq 1 ]]; then INSTALLER_ARGS+=(--dkms); fi
 if [[ -n "$MODULE_TYPE" ]]; then INSTALLER_ARGS+=("--kernel-module-type=$MODULE_TYPE"); fi
 
+# Module signing: use the machine's existing key; with none, change nothing.
+# DKMS signs with this key itself at build time; without DKMS the installer
+# gets the key (PEM private key, DER certificate).
+resolve_signing_key
+if [[ -n "$SIGN_KEY" && $SIGN_MISSING -eq 1 ]]; then
+    log "WARNING: The DKMS config names signing key $SIGN_KEY / $SIGN_CERT, but it is missing"
+    SIGN_KEY=""
+    SIGN_CERT=""
+fi
+if [[ -n "$SIGN_KEY" ]]; then
+    log "Module signing key: $SIGN_KEY (certificate $SIGN_CERT)"
+    if [[ $USE_DKMS -eq 0 ]]; then
+        if [[ "$SIGN_KEY" == pkcs11:* ]]; then
+            log "WARNING: A PKCS#11 signing key can't be passed to the NVIDIA installer; the module will not be signed"
+        elif SIGN_CERT_DER="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")"; then
+            INSTALLER_ARGS+=(
+                "--module-signing-secret-key=$SIGN_KEY"
+                "--module-signing-public-key=$SIGN_CERT_DER"
+            )
+        else
+            log "WARNING: Could not read certificate $SIGN_CERT; the module will not be signed"
+        fi
+    fi
+fi
+
 RC=0
 "$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1 || RC=$?
 if [[ $RC -ne 0 ]]; then
@@ -321,15 +580,31 @@ if [[ $USE_DKMS -eq 1 ]]; then
     fi
 fi
 
-# Secure Boot: the module must carry a signature the firmware trusts.
+# Module signature: with a signing key, the module should be signed by it.
+# Without one, only Secure Boot makes the signature matter.
 SB_STATE=""
 if command -v mokutil >/dev/null 2>&1; then SB_STATE="$(mokutil --sb-state 2>/dev/null || true)"; fi
-if grep -qi 'SecureBoot enabled' <<<"$SB_STATE"; then
+if [[ -n "$SIGN_KEY" ]]; then
+    MODULE_SIGNER="$(modinfo -k "$KVER" -F signer nvidia 2>/dev/null || true)"
+    EXPECTED_SIGNER="$(cert_subject_cn "$SIGN_CERT")"
+    if [[ -z "$MODULE_SIGNER" ]]; then
+        verify_warn "the nvidia module for $KVER is unsigned; expected a signature from ${EXPECTED_SIGNER:-$SIGN_CERT}"
+    elif [[ -n "$EXPECTED_SIGNER" && "$MODULE_SIGNER" != "$EXPECTED_SIGNER" ]]; then
+        verify_warn "the nvidia module for $KVER is signed by \"$MODULE_SIGNER\", not by the signing key \"$EXPECTED_SIGNER\" ($SIGN_CERT)"
+    else
+        log "Verify: nvidia module is signed by: $MODULE_SIGNER"
+    fi
+    if command -v mokutil >/dev/null 2>&1; then
+        MOK_CERT="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR" || printf '%s' "$SIGN_CERT")"
+        MOK_TEST="$(mokutil --test-key "$MOK_CERT" 2>&1 | head -n 1 || true)"
+        log "Verify: signing certificate enrollment: ${MOK_TEST:-unknown}"
+    fi
+elif grep -qi 'SecureBoot enabled' <<<"$SB_STATE"; then
     MODULE_SIGNER="$(modinfo -k "$KVER" -F signer nvidia 2>/dev/null || true)"
     if [[ -n "$MODULE_SIGNER" ]]; then
         log "Verify: Secure Boot is on; nvidia module is signed by: $MODULE_SIGNER"
     else
-        verify_warn "Secure Boot is on but the nvidia module for $KVER is unsigned; enroll a signing key with: mokutil --import <key.der>"
+        verify_warn "Secure Boot is on but the nvidia module for $KVER is unsigned; use Set Up Signing on Green Light's System tab, then reinstall the driver"
     fi
 fi
 

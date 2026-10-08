@@ -29,8 +29,9 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 - Registers the driver with DKMS so the module rebuilds itself on kernel updates
 - Verifies the `.run` archive before changing anything, so a corrupt download stops the install with your current driver untouched
 - Lets you choose open or proprietary kernel modules (Automatic by default) and refuses combinations that cannot work, such as open modules on a pre-Turing GPU
-- Lists the distro driver packages the install will remove, and gives exact `mokutil` steps when Secure Boot is on and no signing key is enrolled
-- Checks the result after install (nouveau blacklist, initramfs, DKMS build, module signature) and shows the findings in the Log tab, with the DKMS build log tail if a build fails
+- Lists the distro driver packages the install will remove
+- Signs the kernel module with your machine's module-signing key, once you've run Set Up Signing (see below)
+- Checks the result after install (nouveau blacklist, initramfs, DKMS build, module signer) and shows the findings in the Log tab, with the DKMS build log tail if a build fails
 - The GUI never runs as root. Only the install script does, through polkit, and you can read every line of it in `scripts/privileged-install.sh`
 
 ## Requirements
@@ -60,6 +61,14 @@ The first launch asks for your password once so it can place the install helper 
 4. Enter your password and wait a few minutes while the kernel module builds. The desktop stays up the whole time.
 5. Reboot whenever it suits you. The System tab shows Reboot Required: Yes until you do.
 
+## Module signing and Secure Boot
+
+With Secure Boot on, the kernel only loads modules signed by a key it trusts. Green Light signs the NVIDIA module with your machine's existing module-signing key, the same one DKMS uses: the key named by `mok_signing_key`/`mok_certificate` in `/etc/dkms/framework.conf` (or `framework.conf.d/`), otherwise Ubuntu's `/var/lib/shim-signed/mok/MOK.priv` and `MOK.der`, otherwise DKMS's `/var/lib/dkms/mok.key` and `mok.pub`. DKMS installs are signed by DKMS while it builds the module; without DKMS, the key is passed to NVIDIA's installer.
+
+The Module Signing row on the System tab shows the key, whether it's enrolled, and who signed the installed module. Set Up Signing is a one-time step: it creates a key if your machine has none (`update-secureboot-policy --new-key` on Ubuntu, otherwise DKMS's own) and queues it for enrollment with a one-time password you choose. On the next reboot a blue MOK Manager screen appears; choose Enroll MOK and type that password. Setup doesn't touch the installed driver, so if the module on disk is unsigned, reinstall the driver once to sign it.
+
+Without setup, and with no key on the machine, installs work exactly as before and nothing is signed.
+
 ## Headless servers
 
 The GUI is optional. The install script is standalone bash and works the same on apt or dnf systems:
@@ -79,6 +88,12 @@ Flags:
 | `--no-x-check` | Accepted for compatibility, the installer already skips the X check |
 
 Reboot afterward to switch drivers, same as the GUI flow.
+
+Module-signing setup runs headless too; the script reads the one-time MOK password from stdin:
+
+```bash
+sudo ./privileged-install.sh --setup-signing
+```
 
 ## Logs and troubleshooting
 
@@ -116,7 +131,7 @@ The output lands in the project directory. `Cargo.lock` is committed, so builds 
 
 ## How the install actually works
 
-The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers and DKMS are present, clears any conflicting distro driver packages, blacklists nouveau, and rebuilds the initramfs afterward. Around 120 lines of bash, all readable.
+The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers and DKMS are present, clears any conflicting distro driver packages, blacklists nouveau, signs the module with your machine's signing key if it has one, and rebuilds the initramfs afterward. All plain bash, all readable.
 
 ## Acknowledgements
 

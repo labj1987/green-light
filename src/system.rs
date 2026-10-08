@@ -2,8 +2,9 @@
 
 
 use crate::preflight::{
-    parse_compute_caps, parse_dpkg_installed, parse_module_flavor, parse_mok_test_key,
-    parse_rpm_names, ComputeCap, ModuleFlavor, SigningKeyState, SIGNING_KEY_PATHS,
+    classify_signing_key, parse_compute_caps, parse_dkms_signing_config, parse_dpkg_installed,
+    parse_module_flavor, parse_module_signer, parse_mok_fingerprints, parse_rpm_names,
+    signing_cert_candidates, ComputeCap, ModuleFlavor, ModuleSignature, SigningKeyState,
 };
 use std::process::Command;
 
@@ -19,6 +20,8 @@ pub struct SystemInfo {
     pub dkms_status: Vec<DkmsEntry>,
     pub secure_boot: SecureBootStatus,
     pub signing_key: SigningKeyState,
+    /// Signature on the nvidia module on disk for the running kernel.
+    pub module_signature: ModuleSignature,
     /// Distro-packaged NVIDIA driver packages the install will remove.
     pub distro_packages: Vec<String>,
     pub free_disk_bytes: Option<u64>,
@@ -53,11 +56,7 @@ impl std::fmt::Display for SecureBootStatus {
 
 pub fn query_system() -> SystemInfo {
     let secure_boot = get_secure_boot();
-    let signing_key = if secure_boot == SecureBootStatus::Enabled {
-        get_signing_key_state()
-    } else {
-        SigningKeyState::Unknown
-    };
+    let signing_key = get_signing_key_state();
     SystemInfo {
         installed_driver: get_installed_driver(),
         gpu_name: get_gpu_name(),
@@ -67,6 +66,7 @@ pub fn query_system() -> SystemInfo {
         dkms_status: get_dkms_status(),
         secure_boot,
         signing_key,
+        module_signature: get_module_signature(),
         distro_packages: get_distro_packages(),
         free_disk_bytes: get_free_disk(),
         reboot_required: check_reboot_required(),
@@ -120,28 +120,66 @@ fn get_distro_packages() -> Vec<String> {
     vec![]
 }
 
-/// Whether a readable DKMS signing key is enrolled. Only meaningful with
-/// Secure Boot on; some key directories are root-only, which shows up as
-/// `Unknown`.
-fn get_signing_key_state() -> SigningKeyState {
-    for path in SIGNING_KEY_PATHS {
-        if !std::path::Path::new(path).is_file() {
-            continue;
-        }
-        if let Ok(out) = Command::new("mokutil").args(["--test-key", path]).output() {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            match parse_mok_test_key(&text) {
-                Some(true) => return SigningKeyState::Enrolled,
-                Some(false) => return SigningKeyState::NotEnrolled(path.to_string()),
-                None => {}
-            }
-        }
+/// The DKMS signing settings, read the way DKMS reads them.
+fn get_dkms_signing_config() -> crate::preflight::DkmsSigningConfig {
+    let mut paths = vec![std::path::PathBuf::from("/etc/dkms/framework.conf")];
+    if let Ok(dir) = std::fs::read_dir("/etc/dkms/framework.conf.d") {
+        let mut extra: Vec<_> = dir
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "conf"))
+            .collect();
+        extra.sort();
+        paths.extend(extra);
     }
-    SigningKeyState::Unknown
+    let texts: Vec<String> = paths
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    parse_dkms_signing_config(&refs, &get_kernel_version())
+}
+
+fn command_text(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    Some(format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    ))
+}
+
+/// The machine's module-signing certificate and whether it is enrolled,
+/// queued for enrollment, or neither. Checked whatever the Secure Boot state.
+fn get_signing_key_state() -> SigningKeyState {
+    let candidates = signing_cert_candidates(&get_dkms_signing_config());
+    let Some(path) = candidates.iter().find(|p| std::path::Path::new(p).is_file()) else {
+        return SigningKeyState::NoKey;
+    };
+    let pending = command_text("mokutil", &["--list-new"])
+        .map(|t| parse_mok_fingerprints(&t))
+        .unwrap_or_default();
+    let sha1 = Command::new("sha1sum")
+        .arg(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string)
+        });
+    command_text("mokutil", &["--test-key", path])
+        .and_then(|t| classify_signing_key(path, &t, &pending, sha1.as_deref()))
+        .unwrap_or_else(|| SigningKeyState::Untested(path.clone()))
+}
+
+/// Who signed the nvidia module on disk for the running kernel.
+fn get_module_signature() -> ModuleSignature {
+    match Command::new("modinfo").args(["-F", "signer", "nvidia"]).output() {
+        Ok(out) => parse_module_signer(
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+        ),
+        Err(_) => ModuleSignature::Missing,
+    }
 }
 
 /// Read the running driver version from nvidia-smi or /proc

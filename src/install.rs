@@ -1,11 +1,12 @@
 use crate::preflight::ModuleChoice;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const INSTALL_LOG: &str = "/var/log/green-light.log";
+const PRIVILEGED_SCRIPT: &str = "/usr/lib/green-light/privileged-install.sh";
 const RUN_START_MARKER: &str = "==== NVIDIA driver install started";
 
 pub struct InstallOptions {
@@ -43,7 +44,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// reboot. Nothing touches the live session, so a plain blocking call
 /// is safe — the GUI stays up the whole time.
 pub fn run_privileged_install(opts: &InstallOptions) -> Result<()> {
-    let script = "/usr/lib/green-light/privileged-install.sh";
+    let script = PRIVILEGED_SCRIPT;
 
     if !Path::new(script).exists() {
         bail!("Privileged install script not found at {}", script);
@@ -85,6 +86,69 @@ pub fn run_privileged_install(opts: &InstallOptions) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Result of `--setup-signing`: whether it succeeded and the script's
+/// output lines for the Log tab.
+pub struct SetupOutcome {
+    pub result: Result<()>,
+    pub lines: Vec<String>,
+}
+
+/// Run the privileged script's one-time signing setup: make sure the
+/// machine has a module-signing key and queue its certificate for MOK
+/// enrollment. The one-time password goes to the script on stdin, never on
+/// the command line.
+pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
+    let fail = |e: anyhow::Error| SetupOutcome { result: Err(e), lines: vec![] };
+    if !Path::new(PRIVILEGED_SCRIPT).exists() {
+        return fail(anyhow::anyhow!(
+            "Privileged install script not found at {}",
+            PRIVILEGED_SCRIPT
+        ));
+    }
+
+    let child = Command::new("pkexec")
+        .args([PRIVILEGED_SCRIPT, "--setup-signing"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return fail(anyhow::Error::new(e).context("Failed to launch pkexec — is polkit installed?"))
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // A write error means the script already exited (e.g. cancelled
+        // authentication); its exit code below says why.
+        let _ = writeln!(stdin, "{password}");
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => return fail(anyhow::Error::new(e).context("Waiting for pkexec failed")),
+    };
+
+    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .chain(String::from_utf8_lossy(&out.stderr).lines())
+        .map(|l| l.strip_prefix("[green-light] ").unwrap_or(l).to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+
+    let result = if out.status.success() {
+        Ok(())
+    } else {
+        match out.status.code().unwrap_or(-1) {
+            126 | 127 => Err(anyhow::anyhow!("Authentication was cancelled.")),
+            code => Err(anyhow::anyhow!(
+                "Signing setup exited with code {} (see /var/log/green-light.log)",
+                code
+            )),
+        }
+    };
+    SetupOutcome { result, lines }
 }
 
 /// Lines of the most recent install run in the log that carry its post-install
