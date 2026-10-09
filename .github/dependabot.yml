@@ -10,3 +10,18 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # The gtk-rs crates release in lockstep and require matching versions of each other
+    # (gio 0.22.10 does not build against gio-sys 0.22.8), so they update together.
+    groups:
+      gtk-rs:
+        patterns:
+          - "glib*"
+          - "gio*"
+          - "gtk4*"
+          - "gdk4*"
+          - "gsk4*"
+          - "gdk-pixbuf*"
+          - "pango*"
+          - "cairo*"
+          - "graphene*"
+          - "libadwaita*"
