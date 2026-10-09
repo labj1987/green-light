@@ -15,7 +15,7 @@
 # startup and every package-related step below branches on it.
 #
 # Usage: privileged-install.sh <path-to.run> <sha256-of-run-file> [--dkms] [--hold]
-#        [--no-x-check] [--kernel-module-type=open|proprietary]
+#        [--kernel-module-type=open|proprietary]
 # Without --kernel-module-type the installer picks the flavor from the
 # detected GPUs (open for Turing and newer).
 #
@@ -319,7 +319,6 @@ for arg in "$@"; do
     case "$arg" in
         --dkms)       USE_DKMS=1 ;;
         --hold)       HOLD_PKG=1 ;;
-        --no-x-check) : ;;   # always passed to the installer now; kept for compatibility
         --kernel-module-type=open|--kernel-module-type=proprietary)
             MODULE_TYPE="${arg#--kernel-module-type=}" ;;
         *) log "WARNING: Unknown argument: $arg" ;;

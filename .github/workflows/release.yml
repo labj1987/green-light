@@ -15,8 +15,25 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Check tag matches Cargo.toml version
+        run: |
+          cargo_ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [[ "${GITHUB_REF_NAME}" != "v${cargo_ver}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_ver}" >&2
+            exit 1
+          fi
+          python3 scripts/sync_appdata_releases.py --check
+
       - name: Set up Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install GTK4 / libadwaita headers
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config
+
+      - name: Test
+        run: cargo test --locked
 
       - name: Build AppImage
         run: sudo -E env "PATH=$PATH" bash build-appimage.sh

@@ -149,7 +149,7 @@ Other
   on Ubuntu 26.04.
 - CI: the release workflow no longer sets `GITHUB_TOKEN` explicitly (picked
   up automatically via the `contents: write` permission) and now generates
-  release notes automatically, matching KernelPop/SteamPunk's workflow.
+  release notes automatically.
 - The `screenshots/` directory is now wired into the AppStream metadata.
 
 ## 2.6.1 — 2026-08-05
@@ -186,35 +186,35 @@ policy URLs still point at NVI.
 
 **Switch packaging to bare appimagetool (drop bundled GTK).**
 
-- NVI was the only one of the three apps built with `linuxdeploy` +
+- NVI was built with `linuxdeploy` +
   `linuxdeploy-plugin-gtk`, which bundles its own copy of GTK4/libadwaita
   into the AppImage from whatever the CI runner's apt repo offers — Ubuntu
   24.04's `libadwaita-1-0 1.5.0-1ubuntu2`. That's the earliest release to
   support `Adw.Dialog`, and its floating-dialog presentation (used by the
   About dialog since 2.5.8) lacks the border/backdrop-dim styling refined
   in later libadwaita releases, making it look visually flat compared to
-  MKI and proton-trainer — both of which dynamically link the host's
-  libadwaita instead of bundling one.
-  Switched `build-appimage.sh` to the same bare-`appimagetool` approach
-  already used by MKI and proton-trainer: the binary now links against
+  apps that dynamically link the host's libadwaita instead of bundling
+  one.
+  Switched `build-appimage.sh` to a bare-`appimagetool` approach: the
+  binary now links against
   the host's system GTK4/libadwaita at runtime instead of a bundled copy,
-  giving it the same modern dialog styling and removing the
-  Wayland-vs-XWayland backend asymmetry between NVI and the other two
-  apps as a side effect. AppDir layout, AppRun's privileged-install
+  giving it the host's modern dialog styling and running natively on
+  Wayland instead of under XWayland as a side effect. AppDir layout,
+  AppRun's privileged-install
   staging logic, and the polkit policy/appdata paths are unchanged.
 
 ## 2.5.9 — 2026-08-04
 
-**Align app_id/StartupWMClass with MKI and proton-trainer.**
+**Align prgname/StartupWMClass with the application ID.**
 
-- NVI never exhibited the phantom-taskbar-entry bug hit by MKI and
-  proton-trainer, because it runs under XWayland (the bundled
+- NVI never exhibited the phantom-taskbar-entry bug that a mismatched
+  `app_id` causes on Wayland, because it runs under XWayland (the bundled
   linuxdeploy GTK stack falls back to X11), where WM_CLASS comes from
   `prgname`, which already matched `StartupWMClass`. On Wayland, though,
   GTK4 announces the GApplication ID as the toplevel's `app_id`, not
   `prgname` — so this was latent, not fixed. Set both `prgname` and
   `StartupWMClass` to the application ID (`io.github.labj1987.NVI`) to
-  match MKI and proton-trainer's fix and remove the latent risk should
+  remove the latent risk should
   NVI's packaging ever move off linuxdeploy's bundled GTK.
 
 ## 2.5.8 — 2026-08-04
@@ -223,8 +223,7 @@ policy URLs still point at NVI.
 
 - The About dialog used `gtk4::AboutDialog`, a `Gtk.Window` subclass that
   creates a real separate top-level Wayland surface, showing as a
-  second, unnamed window in the dock (same bug class MKI hit and fixed
-  in its 1.0.7 and 1.0.9 releases). Switched to `libadwaita::AboutDialog`
+  second, unnamed window in the dock. Switched to `libadwaita::AboutDialog`
   (`Adw.Dialog` subclass, requires the `v1_5` feature, now enabled),
   which renders as a sheet inside the main window's own surface.
 
