@@ -17,7 +17,7 @@ glib = "0.22"
 gio = "0.22"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["stream"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 futures-util = "0.3"
 scraper = "0.27"
