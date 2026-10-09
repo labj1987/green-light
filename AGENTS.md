@@ -74,16 +74,21 @@ then `framework.conf.d/*.conf` (last wins), else
 `build-appimage.sh` builds the AppImage — `appimagetool`-direct,
 not `linuxdeploy` (an earlier version of this doc claimed otherwise;
 the script itself never has):
-1. Installs the tools the script itself uses via apt, unconditionally
-   (`zsync`, `wget`, `file`, `desktop-file-utils`), and the toolchain
-   (cargo, rustc, gtk4/adwaita dev headers, `pkg-config`) only when
-   cargo or the GTK4 headers are missing.
+1. Runs as an ordinary user and writes only inside the checkout. It
+   installs packages via apt (cargo, rustc, gtk4/adwaita dev headers,
+   `pkg-config`, `zsync`, `wget`, `file`, `desktop-file-utils`) only on a
+   machine with no toolchain (cargo or the GTK4 headers missing), the one
+   case that needs root. In CI the workflow installs the headers and the
+   packaging tools; the script then fails early if `wget`, `file` or
+   `desktop-file-validate` is missing.
 2. `cargo build --release --locked`.
 3. Assembles the AppDir (binary, privileged script, `green-light-setup`
    helper, polkit policy, appdata, desktop file, icon, generated
    `AppRun`) and runs `desktop-file-validate` on the desktop file.
-4. Downloads `appimagetool` (pinned 1.9.1, SHA256-verified, cached in
-   `.cache/`) and packs the AppDir into
+4. Downloads `appimagetool` (pinned 1.9.1) and the type2 runtime it
+   puts in front of the squashfs (pinned 20251108, passed with
+   `--runtime-file`), both SHA256-verified and cached in `.cache/`, and
+   packs the AppDir into
    `green-light-$VERSION-x86_64.AppImage`, with `UPDATE_INFORMATION` set
    for `gh-releases-zsync` delta updates.
 5. Runs `zsyncmake` directly on the built AppImage to produce the
@@ -94,8 +99,13 @@ the script itself never has):
 GitHub Actions runner even when `UPDATE_INFORMATION` is set and
 `zsync`/`zsyncmake` are installed and working. Do not rely on
 `appimagetool` to generate the `.zsync` — call `zsyncmake "$OUT"`
-directly right after packing, as the script does now. Keep that call
-non-fatal (the AppImage is valid without the sidecar).
+directly right after packing, as the script does now. A missing or
+failing `zsyncmake` is fatal when `CI` is set (the update information
+points at a `.zsync`, so a release without one cannot update); a local
+build only warns.
+
+Rust is pinned in `rust-toolchain.toml`; bump it there and in both
+workflows together (each checks the two agree).
 
 ## Release process
 
@@ -106,10 +116,14 @@ non-fatal (the AppImage is valid without the sidecar).
 4. Commit, push to `main`.
 5. `git tag vX.Y.Z && git push origin vX.Y.Z`.
 6. The tag push triggers `.github/workflows/release.yml` ("Build and
-   Release"), which checks the tag against the `Cargo.toml` version,
-   runs the tests, runs `build-appimage.sh` and uploads the AppImage
-   (+ `.zsync`) to a GitHub Release via `softprops/action-gh-release`,
-   with that version's changelog section as the release text.
+   Release"). Its `build` job has a read-only token: it checks the tag
+   against the `Cargo.toml` version, runs the tests and
+   `build-appimage.sh`, and hands the AppImage, `.zsync` and release
+   notes on as a workflow artifact. A separate `publish` job, the only
+   one with write access, attaches them to a GitHub Release via
+   `softprops/action-gh-release`, with that version's changelog section
+   as the release text. Actions in both workflows are pinned to commit
+   SHAs; Dependabot (`.github/dependabot.yml`) proposes the updates.
    The release-asset glob must match both files — check it whenever the
    output filename pattern changes.
 

@@ -120,10 +120,10 @@ sudo rm /usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy
 
 ## Building from source
 
-Needs `cargo`, `rustc`, `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The build script installs its own dependencies through apt.
+Needs `cargo`, `rustc`, `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils` and `zsync`. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
 
 ```bash
-sudo bash build-appimage.sh
+bash build-appimage.sh
 ```
 
 The output lands in the project directory. `Cargo.lock` is committed, so builds are reproducible.
