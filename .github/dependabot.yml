@@ -1,6 +1,6 @@
 # Keeps the workflows' SHA-pinned actions current (one pull request per update, with the new
-# commit SHA and its release in the trailing comment) and the lockfile current (one weekly pull
-# request for every patch-level crate update).
+# commit SHA and its release in the trailing comment) and the lockfile current (two weekly pull
+# requests: one for patch-level crate updates, one for minor ones).
 version: 2
 updates:
   - package-ecosystem: github-actions
@@ -13,14 +13,19 @@ updates:
       interval: weekly
     # Indirect crates are included: a gtk-rs release has to move its -sys crates with it
     # (gio 0.22.10 does not build against gio-sys 0.22.8), and a direct-only update leaves them
-    # behind. Only patch-level updates are grouped: Dependabot counts a 0.x bump such as
-    # sha2 0.10 -> 0.11 as "minor" although it breaks the API, so minor and major updates each
-    # get a pull request of their own.
+    # behind. Patch and minor updates are grouped separately because Dependabot counts a 0.x
+    # bump such as sha2 0.10 -> 0.11 as "minor" although it breaks the API: a breaking bump can
+    # only fail the minor group, never the patch one. Major updates each get their own pull request.
     allow:
       - dependency-type: all
     groups:
-      cargo:
+      cargo-patch:
         patterns:
           - "*"
         update-types:
           - patch
+      cargo-minor:
+        patterns:
+          - "*"
+        update-types:
+          - minor
