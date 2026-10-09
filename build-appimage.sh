@@ -74,10 +74,11 @@ desktop-file-validate "$APPDIR/$APP.desktop"
 # On first launch the privileged script and polkit policy must exist at
 # fixed system paths (polkit refuses relative/user paths), so AppRun
 # installs them via the dedicated green-light-setup helper when missing or
-# outdated, then execs the app. Once the helper is installed, updates use
-# its own polkit action (a specific prompt); the very first run has no such
-# action yet, so pkexec runs the staged helper directly (its prompt names
-# the program, and the helper verifies everything against baked-in hashes).
+# outdated, then execs the app. The helper verifies the staged files against
+# hashes baked into it at build time, so an installed helper can only
+# reinstall the files of its own build (restoring deleted or altered ones,
+# under its own polkit action). For a new build, or the very first run,
+# pkexec runs the staged helper directly; its prompt names the program.
 cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
@@ -107,7 +108,8 @@ if [[ $needs_install -eq 1 ]]; then
     chmod 755 "$STAGE/green-light-setup"
 
     rc=0
-    if [[ -x "$DST_HELPER" ]] && pkaction --action-id "$SETUP_ACTION" >/dev/null 2>&1; then
+    if [[ -x "$DST_HELPER" ]] && cmp -s "$SRC_HELPER" "$DST_HELPER" \
+        && pkaction --action-id "$SETUP_ACTION" >/dev/null 2>&1; then
         pkexec "$DST_HELPER" "$STAGE" || rc=$?
     else
         pkexec "$STAGE/green-light-setup" "$STAGE" || rc=$?
@@ -140,7 +142,7 @@ TOOL_DIR=".cache"
 TOOL="$TOOL_DIR/appimagetool-$APPIMAGETOOL_VERSION"
 if [[ ! -f "$TOOL" ]]; then
     mkdir -p "$TOOL_DIR"
-    wget -q -O "$TOOL.part" \
+    wget -q --no-hsts -O "$TOOL.part" \
         "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
     mv "$TOOL.part" "$TOOL"
 fi
@@ -160,7 +162,7 @@ RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 RUNTIME="$TOOL_DIR/runtime-x86_64-$RUNTIME_VERSION"
 if [[ ! -f "$RUNTIME" ]]; then
     mkdir -p "$TOOL_DIR"
-    wget -q -O "$RUNTIME.part" \
+    wget -q --no-hsts -O "$RUNTIME.part" \
         "https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_VERSION/runtime-x86_64"
     mv "$RUNTIME.part" "$RUNTIME"
 fi
