@@ -1,0 +1,12 @@
+# Keeps the workflows' SHA-pinned actions current: one pull request per update, with the new
+# commit SHA and its release in the trailing comment.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly

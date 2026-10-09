@@ -5,45 +5,113 @@ on:
     tags:
       - 'v*'
 
+# Nothing here can write to the repository except the `publish` job, which only downloads the
+# build job's files and attaches them to the release. The `build` job runs the whole toolchain
+# (cargo, build scripts, apt packages) with a read-only token and no stored git credentials, so
+# a compromised dependency has nothing to publish with. Every action is pinned to a full commit
+# SHA: a tag such as `v3` can be moved to other code, a SHA cannot. The trailing comment names
+# the release the SHA is; Dependabot proposes the updates (.github/dependabot.yml).
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      # Makes a missing or failing zsyncmake fatal in build-appimage.sh (GitHub Actions sets it
+      # already; stated here so the build does not depend on that).
+      CI: "true"
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Check tag matches Cargo.toml version
+      # The tag names the version that is released: refuse a tag that is not the Cargo
+      # version before anything is built.
+      - name: Tag matches the Cargo version
         run: |
-          cargo_ver="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
-          if [[ "${GITHUB_REF_NAME}" != "v${cargo_ver}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_ver}" >&2
-            exit 1
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+              echo "error: tag $GITHUB_REF_NAME does not match the Cargo version $version" >&2
+              exit 1
           fi
-          python3 scripts/sync_appdata_releases.py --check
-
-      - name: Set up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install GTK4 / libadwaita headers
-        run: |
-          sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config
-
-      - name: Test
-        run: cargo test --locked
-
-      - name: Build AppImage
-        run: sudo -E env "PATH=$PATH" bash build-appimage.sh
 
       # The release page carries this version's changes in full, from CHANGELOG.md: no link to it.
+      # The release fails here, before the build, when the section is missing.
       - name: Release notes from the changelog
-        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME}" > release-notes.md && cat release-notes.md
+        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME#v}" > release-notes.md && cat release-notes.md
+
+      # The version in rust-toolchain.toml; keep the two in step (the build fails on a mismatch).
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.96.0
+          components: clippy
+
+      - name: Toolchain matches rust-toolchain.toml
+        run: grep -q '^channel = "1.96.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.96\.0 '
+
+      # The GTK headers the build needs and the packaging tools build-appimage.sh uses. This is
+      # the only privileged step: the AppImage build below runs as the runner user.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config \
+            zsync wget file desktop-file-utils
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: Release notes script self-test
+        run: python3 scripts/release_notes.py --self-test
+
+      - name: AppStream releases match the changelog
+        run: python3 scripts/sync_appdata_releases.py --check
+
+      - name: Build AppImage
+        run: bash build-appimage.sh
+
+      - name: Check the release files
+        run: |
+          appimage="$(ls green-light-*-x86_64.AppImage)"
+          test -s "$appimage"
+          test -s "$appimage.zsync"
+          ls -l "$appimage" "$appimage.zsync"
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: |
+            green-light-*-x86_64.AppImage
+            green-light-*-x86_64.AppImage.zsync
+            release-notes.md
+          if-no-files-found: error
+
+  # The only job with write access, and it runs no project code: it attaches what `build` made.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
 
       - name: Create Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          files: green-light-*-x86_64.AppImage*
+          files: |
+            green-light-*-x86_64.AppImage
+            green-light-*-x86_64.AppImage.zsync
+          fail_on_unmatched_files: true
           body_path: release-notes.md
