@@ -20,20 +20,20 @@ echo "==> Building $APP $VERSION AppImage"
 # only `apt-get install` failing on a package we actually need should be fatal.
 apt-get update -qq || true
 
-# zsync is installed unconditionally: the guard below evaluates false in CI
-# (a prior workflow step already installs cargo), so the guarded block —
-# and zsync along with it — was being silently skipped.
-apt-get install -y -qq zsync
+# The tools this script itself uses are installed unconditionally: the guard
+# below evaluates false in CI (a prior workflow step already installs cargo),
+# so anything listed only in the guarded block would be silently skipped.
+apt-get install -y -qq zsync wget file desktop-file-utils
 
 if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null; then
     echo "==> Installing build dependencies"
     apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
-        pkg-config libssl-dev wget file desktop-file-utils zsync
+        pkg-config
 fi
 
 # ── Release build ─────────────────────────────────────────────────────
-echo "==> cargo build --release"
-cargo build --release
+echo "==> cargo build --release --locked"
+cargo build --release --locked
 
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
@@ -68,6 +68,8 @@ cp data/io.github.labj1987.GreenLight.appdata.xml  "$APPDIR/usr/share/metainfo/"
 # Top-level AppImage requirements
 cp data/$APP.desktop "$APPDIR/"
 cp data/$APP-256.png "$APPDIR/$APP.png"
+
+desktop-file-validate "$APPDIR/$APP.desktop"
 
 # ── AppRun ────────────────────────────────────────────────────────────
 # On first launch the privileged script and polkit policy must exist at
@@ -135,14 +137,19 @@ chmod 755 "$APPDIR/AppRun"
 # release build doesn't depend on a moving, unverified "continuous" artifact.
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
-TOOL="$BUILD_DIR/appimagetool"
+TOOL_DIR=".cache"
+TOOL="$TOOL_DIR/appimagetool-$APPIMAGETOOL_VERSION"
 if [[ ! -f "$TOOL" ]]; then
-    echo "==> Downloading appimagetool $APPIMAGETOOL_VERSION"
-    wget -q -O "$TOOL" \
+    mkdir -p "$TOOL_DIR"
+    wget -q -O "$TOOL.part" \
         "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+    mv "$TOOL.part" "$TOOL"
 fi
-echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c - \
-    || { echo "ERROR: appimagetool checksum mismatch" >&2; rm -f "$TOOL"; exit 1; }
+if ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status -; then
+    echo "==> ERROR: appimagetool checksum mismatch" >&2
+    rm -f "$TOOL"
+    exit 1
+fi
 chmod +x "$TOOL"
 
 echo "==> Packing AppImage"

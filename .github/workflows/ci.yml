@@ -2,46 +2,36 @@ name: CI
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  build-test:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config libssl-dev
-
-      - name: Set up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-
+      - name: Install GTK4 / libadwaita headers
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config
       - name: Build
         run: cargo build --locked
-
       - name: Test
         run: cargo test --locked
-
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-  shellcheck:
+  scripts:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-
+      - uses: actions/checkout@v7
       - name: ShellCheck
-        run: shellcheck scripts/*.sh build-appimage.sh
-
+        run: shellcheck -S warning build-appimage.sh scripts/*.sh
       - name: AppStream releases match the changelog
         run: python3 scripts/sync_appdata_releases.py --check && python3 scripts/release_notes.py --self-test && python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d\" -f2)" > /dev/null

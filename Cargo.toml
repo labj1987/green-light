@@ -26,5 +26,6 @@ anyhow = "1"
 
 [profile.release]
 opt-level = 3
-strip = true
 lto = true
+codegen-units = 1
+strip = true
