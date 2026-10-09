@@ -10,12 +10,20 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      # Every action is pinned to a full commit SHA: a tag such as `v3` can be moved to other
+      # code, a SHA cannot. The trailing comment names the release the SHA is; Dependabot
+      # proposes the updates (.github/dependabot.yml).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.96.0
           components: clippy
+      - name: Toolchain matches rust-toolchain.toml
+        run: grep -q '^channel = "1.96.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.96\.0 '
       - name: Install GTK4 / libadwaita headers
         run: |
           sudo apt-get update -qq || true
@@ -28,9 +36,11 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
 
   scripts:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: ShellCheck
         run: shellcheck -S warning build-appimage.sh scripts/*.sh
       - name: AppStream releases match the changelog
