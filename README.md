@@ -1,6 +1,6 @@
 # Green Light
 
-A Linux desktop app for installing NVIDIA drivers from the official `.run` files. Written in Rust with GTK4 and libadwaita. (Formerly known as NVI / NVIDIA Driver Installer.)
+A Linux desktop app for installing NVIDIA drivers from the official `.run` files. Written in Rust with GTK4 and libadwaita.
 
 I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag behind and I sometimes need a specific version. The usual routine for that is dropping to a TTY, stopping the display manager, running the installer blind, and hoping the desktop comes back. This app skips all of that. It installs the new driver to disk the same way a package manager does, while the current driver keeps running. The swap happens on your next reboot and your desktop never goes down.
 
@@ -85,7 +85,6 @@ Flags:
 | `--dkms` | Register the module with DKMS (recommended) |
 | `--hold` | Pin the driver at its current version — `apt-mark hold` on apt, `dnf versionlock` on Fedora (needs `python3-dnf-plugin-versionlock` installed) |
 | `--kernel-module-type=open\|proprietary` | Pick the kernel module flavor. Without it, NVIDIA's installer chooses from the detected GPUs (open for Turing and newer) |
-| `--no-x-check` | Accepted for compatibility, the installer already skips the X check |
 
 Reboot afterward to switch drivers, same as the GUI flow.
 
@@ -121,7 +120,7 @@ sudo rm /usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy
 
 ## Building from source
 
-Needs `cargo`, `rustc`, `libgtk-4-dev`, `libadwaita-1-dev`, `pkg-config`, and `libssl-dev`. The build script installs its own dependencies through apt.
+Needs `cargo`, `rustc`, `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The build script installs its own dependencies through apt.
 
 ```bash
 sudo bash build-appimage.sh
