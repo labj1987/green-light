@@ -6,3 +6,4 @@
 /.cache/
 *.AppImage
 *.AppImage.zsync
+release-notes.md
