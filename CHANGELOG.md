@@ -5,6 +5,48 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.0 — 2026-10-11
+
+**Installs that fail safely**
+- Installing a driver downloaded in Green Light, or a `.run` file you downloaded yourself,
+  no longer fails because of the file's permissions. A file other users can change is still
+  refused, and Green Light now says why before asking for your password.
+- Before it removes your distribution's NVIDIA driver, the install checks that the new
+  driver's kernel module can be built (kernel headers, compiler, DKMS) and stops without
+  changing anything if it can't.
+- If NVIDIA's installer still fails, the install puts back everything it changed: the
+  distribution's driver packages, their holds and the boot configuration. The next boot uses
+  the driver you had before. If that doesn't work either, Green Light tells you not to
+  reboot yet.
+- The Log tab shows the install's progress as it happens, and a failed install explains what
+  went wrong in a dialog, not just with an exit code.
+
+**Block Distro Driver Packages** replaces Hold Package Version, which never held anything.
+When it's on, apt (or dnf5 on Fedora) won't install your distribution's NVIDIA driver over
+the one Green Light installed, for example as a dependency of a CUDA package. The switch
+shows whether the block is in place; install with it off to remove the block. Older dnf
+versions can't do this, so there the switch is greyed out.
+
+Downloads
+- Only one download runs at a time, and installing or signing setup waits until it is done.
+- When NVIDIA's checksum can't be fetched (network trouble, a server error), Green Light
+  offers to try again instead of saying NVIDIA publishes none. Installing without
+  verification is offered only when NVIDIA really publishes no checksum.
+- A failed or cancelled download no longer leaves a partial file behind.
+- A server error while loading the version list shows the error instead of an empty list.
+
+Other
+- With Secure Boot on and a signing key kept on a hardware token, the pre-install check now
+  says to turn on DKMS (NVIDIA's own installer can't sign with such a key) instead of
+  promising a signed module.
+- The System tab picks the signing key the same way the install does, and shows a key that
+  is only half set up as such.
+- Pop!_OS's NVIDIA driver metapackages are now removed along with the other distribution
+  driver packages, as the pre-install check already said. Held driver packages are listed
+  there too, and older NVIDIA container runtime packages are left alone.
+- The first-launch setup works when the temporary folder doesn't allow running programs,
+  and tells a cancelled password prompt apart from a failure.
+
 ## 2.9.0 — 2026-10-08
 
 **Driver signing for Secure Boot.** Green Light can sign the NVIDIA driver it installs with
