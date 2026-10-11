@@ -1,13 +1,15 @@
 use crate::download::{download_run_file, verify_sha256};
 use crate::install::{
-    install_report, run_privileged_install, run_privileged_setup_signing, InstallOptions,
+    check_run_file, run_privileged_install, run_privileged_setup_signing, InstallOptions,
 };
 use crate::preflight::{
     conflict_summary, module_hint, secure_boot_advice, signing_summary, validate_module_choice,
     validate_mok_password, ModuleChoice,
 };
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
-use crate::versions::{fetch_checksum, fetch_versions, version_from_filename, DriverVersion};
+use crate::versions::{
+    fetch_checksum, fetch_versions, is_sha256_hex, version_from_filename, DriverVersion,
+};
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -22,6 +24,7 @@ use libadwaita::{
 };
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -29,15 +32,29 @@ use std::sync::Arc;
 //  App state
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// The one long operation running. Only one runs at a time: a second
+/// download would write the same file and fight over the progress bar, and
+/// the privileged actions must not run on a file still being written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Busy {
+    /// From the download through checksum verification and any question
+    /// about an unverified file.
+    Download,
+    Install,
+    Signing,
+}
+
 struct AppState {
     versions: Vec<DriverVersion>,
     selected_version: Option<DriverVersion>,
     downloaded_path: Option<String>,
     expected_checksum: Option<String>,
     use_dkms: bool,
-    hold_packages: bool,
+    block_distro_driver: bool,
     module_choice: ModuleChoice,
     sysinfo: SystemInfo,
+    sysinfo_loaded: bool,
+    busy: Option<Busy>,
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -49,11 +66,32 @@ impl Default for AppState {
             downloaded_path: None,
             expected_checksum: None,
             use_dkms: true,
-            hold_packages: false,
+            block_distro_driver: false,
             module_choice: ModuleChoice::Auto,
             sysinfo: SystemInfo::default(),
+            sysinfo_loaded: false,
+            busy: None,
             download_cancel: None,
         }
+    }
+}
+
+/// Which actions may start now, given what is running.
+#[derive(Debug, PartialEq, Eq)]
+struct ActionsEnabled {
+    download: bool,
+    open_file: bool,
+    install: bool,
+    setup_signing: bool,
+}
+
+fn actions_enabled(s: &AppState) -> ActionsEnabled {
+    let idle = s.busy.is_none();
+    ActionsEnabled {
+        download: idle && s.selected_version.is_some(),
+        open_file: idle,
+        install: idle && s.downloaded_path.is_some(),
+        setup_signing: idle && s.sysinfo_loaded && s.sysinfo.signing_key.setup_needed(),
     }
 }
 
@@ -299,13 +337,14 @@ pub fn build_ui(app: &Application) {
     dkms_opt_row.add_suffix(&dkms_switch);
     dkms_opt_row.set_activatable_widget(Some(&dkms_switch));
 
-    let hold_opt_row = ActionRow::builder()
-        .title("Hold Package Version")
-        .subtitle("Pin the driver version with apt-mark hold")
+    let block_opt_row = ActionRow::builder()
+        .title("Block Distro Driver Packages")
+        .subtitle(BLOCK_SUBTITLE)
         .build();
-    let hold_switch = Switch::builder().valign(Align::Center).build();
-    hold_opt_row.add_suffix(&hold_switch);
-    hold_opt_row.set_activatable_widget(Some(&hold_switch));
+    block_opt_row.set_subtitle_lines(0);
+    let block_switch = Switch::builder().valign(Align::Center).build();
+    block_opt_row.add_suffix(&block_switch);
+    block_opt_row.set_activatable_widget(Some(&block_switch));
 
     let module_combo = ComboRow::builder()
         .title("Kernel Module")
@@ -315,7 +354,7 @@ pub fn build_ui(app: &Application) {
 
     opts_group.add(&dkms_opt_row);
     opts_group.add(&module_combo);
-    opts_group.add(&hold_opt_row);
+    opts_group.add(&block_opt_row);
     config_page.append(&opts_group);
 
     let progress = ProgressBar::new();
@@ -396,18 +435,34 @@ pub fn build_ui(app: &Application) {
     //  Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
-    let log_fn = {
+    let log_fn: Rc<dyn Fn(String)> = {
         let log_view = log_view.clone();
-        move |msg: String| {
+        Rc::new(move |msg: String| {
             let buf = log_view.buffer();
             let mut end = buf.end_iter();
             buf.insert(&mut end, &format!("{}\n", msg));
             let mark = buf.create_mark(None, &buf.end_iter(), false);
             log_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
-        }
+        })
     };
 
-    let update_config_tab = {
+    // Button sensitivity, from the state; call after every change to it.
+    let refresh_actions: Rc<dyn Fn()> = {
+        let state = state.clone();
+        let download_btn = download_btn.clone();
+        let open_file_btn = open_file_btn.clone();
+        let install_btn = install_btn.clone();
+        let signing_btn = signing_btn.clone();
+        Rc::new(move || {
+            let a = actions_enabled(&state.borrow());
+            download_btn.set_sensitive(a.download);
+            open_file_btn.set_sensitive(a.open_file);
+            install_btn.set_sensitive(a.install);
+            signing_btn.set_sensitive(a.setup_signing);
+        })
+    };
+
+    let update_config_tab: Rc<dyn Fn()> = {
         let file_row = file_row.clone();
         let checksum_row = checksum_row.clone();
         let version_status_row = version_status_row.clone();
@@ -415,9 +470,9 @@ pub fn build_ui(app: &Application) {
         let sb_warn_row = sb_warn_row.clone();
         let pkg_warn_row = pkg_warn_row.clone();
         let module_combo = module_combo.clone();
-        let install_btn = install_btn.clone();
+        let refresh_actions = refresh_actions.clone();
         let state = state.clone();
-        move || {
+        Rc::new(move || {
             let s = state.borrow();
 
             // File info
@@ -426,8 +481,8 @@ pub fn build_ui(app: &Application) {
                     .file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
                 file_row.set_title(&fname);
                 file_row.set_subtitle(path.as_str());
-                if let Some(cs) = &s.expected_checksum {
-                    checksum_row.set_subtitle(&format!("SHA256: {}…", &cs[..16]));
+                if let Some(cs) = s.expected_checksum.as_deref().filter(|c| is_sha256_hex(c)) {
+                    checksum_row.set_subtitle(&format!("SHA256: {}… (verified)", &cs[..16]));
                 } else {
                     checksum_row.set_subtitle("No checksum available");
                 }
@@ -451,13 +506,11 @@ pub fn build_ui(app: &Application) {
                 } else {
                     version_status_row.set_subtitle("No driver currently installed");
                 }
-                install_btn.set_sensitive(true);
             } else {
                 file_row.set_title("No file selected");
                 file_row.set_subtitle("Go to Browse tab to select or download a driver");
                 checksum_row.set_subtitle("—");
                 version_status_row.set_subtitle("—");
-                install_btn.set_sensitive(false);
             }
 
             // Disk check
@@ -475,8 +528,13 @@ pub fn build_ui(app: &Application) {
             // Secure boot check
             match &s.sysinfo.secure_boot {
                 SecureBootStatus::Enabled => sb_warn_row.set_subtitle(
-                    &secure_boot_advice(&s.sysinfo.secure_boot, &s.sysinfo.signing_key)
-                        .unwrap_or_else(|| "Enabled".to_string())),
+                    &secure_boot_advice(
+                        &s.sysinfo.secure_boot,
+                        &s.sysinfo.signing_key,
+                        s.sysinfo.signing_pair.as_ref(),
+                        s.use_dkms,
+                    )
+                    .unwrap_or_else(|| "Enabled".to_string())),
                 SecureBootStatus::Disabled => sb_warn_row.set_subtitle("Disabled"),
                 SecureBootStatus::Unknown  => sb_warn_row.set_subtitle("Unknown"),
             }
@@ -488,7 +546,9 @@ pub fn build_ui(app: &Application) {
 
             // Kernel module flavor hint for the detected GPUs
             module_combo.set_subtitle(&module_hint(&s.sysinfo.gpu_compute_caps));
-        }
+            drop(s);
+            refresh_actions();
+        })
     };
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -503,7 +563,6 @@ pub fn build_ui(app: &Application) {
         let dkms_row = dkms_row.clone();
         let secureboot_row = secureboot_row.clone();
         let signing_row = signing_row.clone();
-        let signing_btn = signing_btn.clone();
         let disk_row = disk_row.clone();
         let reboot_row = reboot_row.clone();
         let reboot_banner = reboot_banner.clone();
@@ -513,6 +572,8 @@ pub fn build_ui(app: &Application) {
         let log_fn = log_fn.clone();
         let list_box = list_box.clone();
         let search_entry = search_entry.clone();
+        let block_switch = block_switch.clone();
+        let block_opt_row = block_opt_row.clone();
 
         move || {
             gpu_row.set_subtitle("Detecting…");
@@ -527,7 +588,6 @@ pub fn build_ui(app: &Application) {
             let dkms_row = dkms_row.clone();
             let secureboot_row = secureboot_row.clone();
             let signing_row = signing_row.clone();
-            let signing_btn = signing_btn.clone();
             let disk_row = disk_row.clone();
             let reboot_row = reboot_row.clone();
             let reboot_banner = reboot_banner.clone();
@@ -536,6 +596,8 @@ pub fn build_ui(app: &Application) {
             let update_config_tab = update_config_tab.clone();
             let list_box = list_box.clone();
             let search_entry = search_entry.clone();
+            let block_switch = block_switch.clone();
+            let block_opt_row = block_opt_row.clone();
 
             spawn_async(
                 async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() },
@@ -585,7 +647,6 @@ pub fn build_ui(app: &Application) {
                     // Module signing: key state, installed module's signer
                     signing_row.set_subtitle(
                         &signing_summary(&info.signing_key, &info.module_signature));
-                    signing_btn.set_sensitive(info.signing_key.setup_needed());
 
                     // Disk
                     match info.free_disk_bytes {
@@ -602,7 +663,22 @@ pub fn build_ui(app: &Application) {
                         reboot_banner.set_revealed(false);
                     }
 
-                    state.borrow_mut().sysinfo = info;
+                    // The block option shows what is in place now: leaving it
+                    // on keeps an existing block, turning it off removes it.
+                    block_switch.set_active(info.distro_driver_blocked);
+                    block_switch.set_sensitive(info.block_supported);
+                    block_opt_row.set_subtitle(if info.block_supported {
+                        BLOCK_SUBTITLE
+                    } else {
+                        "Not available here: this dnf has no way to exclude packages for good"
+                    });
+
+                    {
+                        let mut s = state.borrow_mut();
+                        s.block_distro_driver = info.distro_driver_blocked && info.block_supported;
+                        s.sysinfo = info;
+                        s.sysinfo_loaded = true;
+                    }
                     // Update configure tab with new disk/secureboot/version info
                     update_config_tab();
                     // Re-populate browse list with version badges now that driver is known
@@ -629,8 +705,10 @@ pub fn build_ui(app: &Application) {
         let toast_overlay = toast_overlay.clone();
         let stack = stack.clone();
         let load_sysinfo = load_sysinfo.clone();
+        let state = state.clone();
+        let refresh_actions = refresh_actions.clone();
 
-        signing_btn.connect_clicked(move |btn| {
+        signing_btn.connect_clicked(move |_| {
             let pw1 = gtk4::PasswordEntry::builder()
                 .placeholder_text("One-time password")
                 .show_peek_icon(true)
@@ -692,7 +770,8 @@ pub fn build_ui(app: &Application) {
             let toast_overlay = toast_overlay.clone();
             let stack = stack.clone();
             let load_sysinfo = load_sysinfo.clone();
-            let btn = btn.clone();
+            let state = state.clone();
+            let refresh_actions = refresh_actions.clone();
             dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
                 if response != "setup" {
                     return;
@@ -703,8 +782,12 @@ pub fn build_ui(app: &Application) {
                 if validate_mok_password(&password, &password).is_err() {
                     return;
                 }
+                if state.borrow().busy.is_some() {
+                    return;
+                }
 
-                btn.set_sensitive(false);
+                state.borrow_mut().busy = Some(Busy::Signing);
+                refresh_actions();
                 stack.set_visible_child_name("log");
                 log_fn("Setting up module signing…".to_string());
 
@@ -714,7 +797,8 @@ pub fn build_ui(app: &Application) {
                             .await
                     },
                     move |outcome| {
-                        btn.set_sensitive(true);
+                        state.borrow_mut().busy = None;
+                        refresh_actions();
                         match outcome {
                             Ok(outcome) => {
                                 for line in &outcome.lines {
@@ -749,7 +833,7 @@ pub fn build_ui(app: &Application) {
     let load_versions = {
         let list_box = list_box.clone();
         let list_spinner = list_spinner.clone();
-        let download_btn = download_btn.clone();
+        let refresh_actions = refresh_actions.clone();
         let selected_label = selected_label.clone();
         let banner = banner.clone();
         let state = state.clone();
@@ -761,7 +845,7 @@ pub fn build_ui(app: &Application) {
             list_spinner.set_visible(true);
             banner.set_revealed(false);
             while let Some(c) = list_box.first_child() { list_box.remove(&c); }
-            download_btn.set_sensitive(false);
+            refresh_actions();
             selected_label.set_label("Loading…");
             log_fn("Fetching version list from NVIDIA…".to_string());
 
@@ -785,6 +869,7 @@ pub fn build_ui(app: &Application) {
                     }
                     Ok(versions) => {
                         log_fn(format!("Found {} versions", versions.len()));
+                        selected_label.set_label("No version selected");
                         state.borrow_mut().versions = versions.clone();
                         let installed = state.borrow().sysinfo.installed_driver.clone();
                         populate_list(&list_box, &versions, &search_entry.text(), installed.as_deref());
@@ -806,7 +891,7 @@ pub fn build_ui(app: &Application) {
     // ─────────────────────────────────────────────────────────────────────────
     {
         let state = state.clone();
-        let download_btn = download_btn.clone();
+        let refresh_actions = refresh_actions.clone();
         let selected_label = selected_label.clone();
         list_box.connect_row_selected(move |_, row| {
             let selected = row
@@ -819,14 +904,14 @@ pub fn build_ui(app: &Application) {
                 Some(ver) => {
                     selected_label.set_label(&format!("Selected: {}", ver.version));
                     state.borrow_mut().selected_version = Some(ver);
-                    download_btn.set_sensitive(true);
                 }
                 None => {
-                    download_btn.set_sensitive(false);
                     selected_label.set_label("No version selected");
                     state.borrow_mut().selected_version = None;
                 }
             }
+            // Selecting a row never enables Download while something runs.
+            refresh_actions();
         });
     }
 
@@ -848,58 +933,62 @@ pub fn build_ui(app: &Application) {
     // ─────────────────────────────────────────────────────────────────────────
     //  Download
     // ─────────────────────────────────────────────────────────────────────────
+    let dl_ui = DownloadUi {
+        state: state.clone(),
+        progress: progress.clone(),
+        cancel_btn: cancel_dl_btn.clone(),
+        log: log_fn.clone(),
+        update_config_tab: update_config_tab.clone(),
+        refresh_actions: refresh_actions.clone(),
+        stack: stack.clone(),
+        toast: toast_overlay.clone(),
+        window: window.clone(),
+    };
     {
-        let state = state.clone();
-        let progress = progress.clone();
-        let log_fn = log_fn.clone();
-        let update_config_tab = update_config_tab.clone();
-        let stack = stack.clone();
-        let toast_overlay = toast_overlay.clone();
-        let cancel_dl_btn = cancel_dl_btn.clone();
-        let window = window.clone();
-
-        download_btn.connect_clicked(move |btn| {
-            let ver = { state.borrow().selected_version.clone() };
+        let dl_ui = dl_ui.clone();
+        download_btn.connect_clicked(move |_| {
+            let ui = dl_ui.clone();
+            let (ver, free) = {
+                let s = ui.state.borrow();
+                if s.busy.is_some() {
+                    return;
+                }
+                (s.selected_version.clone(), s.sysinfo.free_disk_bytes)
+            };
             let Some(ver) = ver else { return };
 
-            // Check disk space before starting
-            let free = state.borrow().sysinfo.free_disk_bytes;
-            if let Some(f) = free {
-                if f < MIN_DISK_BYTES {
-                    toast_overlay.add_toast(Toast::new(
-                        "Low disk space — install may fail"));
-                }
+            if free.is_some_and(|f| f < MIN_DISK_BYTES) {
+                ui.toast.add_toast(Toast::new("Low disk space — install may fail"));
             }
 
-            btn.set_sensitive(false);
-            cancel_dl_btn.set_visible(true);
-            progress.set_visible(true);
-            progress.set_fraction(0.0);
-            progress.set_text(Some(&format!("Downloading {}…", ver.version)));
-
-            // Cancel token
             let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            state.borrow_mut().download_cancel = Some(cancel_flag.clone());
+            {
+                let mut s = ui.state.borrow_mut();
+                s.busy = Some(Busy::Download);
+                s.download_cancel = Some(cancel_flag.clone());
+            }
+            (ui.refresh_actions)();
+            ui.cancel_btn.set_visible(true);
+            ui.progress.set_visible(true);
+            ui.progress.set_fraction(0.0);
+            ui.progress.set_text(Some(&format!("Downloading {}…", ver.version)));
 
             // XDG_DOWNLOAD_DIR normally lives only in ~/.config/user-dirs.dirs,
             // not the environment — ask GLib, which reads that file.
             let dest_dir = glib::user_special_dir(glib::UserDirectory::Downloads)
                 .unwrap_or_else(|| {
-                    std::path::PathBuf::from(
-                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-                    )
-                    .join("Downloads")
+                    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+                        .join("Downloads")
                 });
 
             // Progress channel — sent from the Tokio side, drained on the GTK
             // main context. The loop exits when the sender drops at download
-            // end, so nothing is leaked (the old timer ran forever).
+            // end, so nothing is leaked.
             let (prog_tx, mut prog_rx) =
                 tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
             let download_start = std::time::Instant::now();
-
             {
-                let progress = progress.clone();
+                let progress = ui.progress.clone();
                 glib::MainContext::default().spawn_local(async move {
                     let mut last_ui = std::time::Instant::now();
                     while let Some(mut msg) = prog_rx.recv().await {
@@ -939,141 +1028,38 @@ pub fn build_ui(app: &Application) {
 
             let url = ver.url.clone();
             let filename = ver.filename.clone();
-            let state = state.clone();
-            let progress = progress.clone();
-            let log_fn = log_fn.clone();
-            let update_config_tab = update_config_tab.clone();
-            let stack = stack.clone();
-            let btn = btn.clone();
-            let toast_overlay = toast_overlay.clone();
-            let cancel_dl_btn = cancel_dl_btn.clone();
-            let cancel_flag2 = cancel_flag.clone();
-            let window = window.clone();
-
             spawn_async(
                 async move {
-                    // Keep fetch errors distinct from "no checksum published":
-                    // neither may silently turn into an unverified install.
-                    let (checksum, checksum_err) = match fetch_checksum(&ver).await {
-                        Ok(c) => (c, None),
-                        Err(e) => (None, Some(format!("{:#}", e))),
-                    };
+                    // Fetch errors stay distinct from "no checksum published":
+                    // only the latter may lead to an unverified install.
+                    let checksum = fetch_checksum(&ver).await.map_err(|e| format!("{e:#}"));
                     let tx = prog_tx;
                     let result = download_run_file(
                         &url, &dest_dir, &filename,
                         move |dl, total| { let _ = tx.send((dl, total)); },
-                        cancel_flag2,
+                        cancel_flag,
                     ).await;
-                    (checksum, checksum_err, result)
+                    (ver, checksum, result)
                 },
-                move |(checksum, checksum_err, result)| {
-                    btn.set_sensitive(true);
-                    cancel_dl_btn.set_visible(false);
-                    state.borrow_mut().download_cancel = None;
-
+                move |(ver, checksum, result)| {
+                    ui.cancel_btn.set_visible(false);
+                    ui.state.borrow_mut().download_cancel = None;
                     match result {
                         Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("cancelled") {
-                                log_fn("Download cancelled.".to_string());
-                                progress.set_text(Some("Cancelled"));
+                            if e.to_string().contains("cancelled") {
+                                (ui.log)("Download cancelled.".to_string());
+                                ui.progress.set_text(Some("Cancelled"));
                             } else {
-                                log_fn(format!("Download failed: {}", e));
-                                progress.set_text(Some("Download failed"));
-                                toast_overlay.add_toast(Toast::new("Download failed"));
+                                (ui.log)(format!("Download failed: {e:#}"));
+                                ui.progress.set_text(Some("Download failed"));
+                                ui.toast.add_toast(Toast::new("Download failed — see Log tab"));
                             }
+                            ui.end();
                         }
                         Ok(path) => {
-                            log_fn(format!("Download complete: {}", path.display()));
-                            progress.set_fraction(1.0);
-
-                            if let Some(ref cs) = checksum {
-                                log_fn("Verifying SHA256…".to_string());
-                                progress.set_text(Some("Verifying…"));
-                                let cs_clone = cs.clone();
-                                let path_clone = path.clone();
-                                let log_fn2 = log_fn.clone();
-                                let progress2 = progress.clone();
-                                let toast2 = toast_overlay.clone();
-                                let state2 = state.clone();
-                                let cs2 = checksum.clone();
-                                let update2 = update_config_tab.clone();
-                                let stack2 = stack.clone();
-                                spawn_async(
-                                    async move { verify_sha256(&path_clone, &cs_clone).await },
-                                    move |verify_result| match verify_result {
-                                        Ok(()) => {
-                                            log_fn2("SHA256 verified OK".to_string());
-                                            progress2.set_text(Some("Verified"));
-                                            let path_str = path.to_string_lossy().to_string();
-                                            { let mut s = state2.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = cs2; }
-                                            update2();
-                                            stack2.set_visible_child_name("configure");
-                                            toast2.add_toast(Toast::new("Download complete"));
-                                        }
-                                        Err(e) => {
-                                            log_fn2(format!("SHA256 FAILED: {}", e));
-                                            match std::fs::remove_file(&path) {
-                                                Ok(()) => {
-                                                    log_fn2(format!("Deleted corrupt file: {}", path.display()));
-                                                    progress2.set_text(Some("Checksum mismatch — file deleted"));
-                                                }
-                                                Err(del_err) => {
-                                                    log_fn2(format!("Could not delete file: {}", del_err));
-                                                    progress2.set_text(Some("Checksum mismatch — delete the file manually"));
-                                                }
-                                            }
-                                            toast2.add_toast(Toast::new("Checksum mismatch — do not install"));
-                                        }
-                                    },
-                                );
-                            } else {
-                                let reason = match &checksum_err {
-                                    Some(e) => {
-                                        log_fn(format!("Could not fetch the SHA256 checksum: {}", e));
-                                        format!("The SHA256 checksum could not be fetched ({}).", e)
-                                    }
-                                    None => {
-                                        log_fn("NVIDIA publishes no SHA256 checksum for this version".to_string());
-                                        "NVIDIA does not publish a SHA256 checksum for this version.".to_string()
-                                    }
-                                };
-                                progress.set_text(Some("Downloaded — not verified"));
-                                let dialog = libadwaita::AlertDialog::new(
-                                    Some("Install without verification?"),
-                                    Some(&format!(
-                                        "{}\n\nThe download cannot be verified against NVIDIA's published hash. \
-                                         Only continue if you trust the network you downloaded it over.",
-                                        reason
-                                    )),
-                                );
-                                dialog.add_responses(&[("cancel", "Discard Download"), ("use", "Use Unverified")]);
-                                dialog.set_response_appearance("use", libadwaita::ResponseAppearance::Destructive);
-                                dialog.set_default_response(Some("cancel"));
-                                dialog.set_close_response("cancel");
-                                let state = state.clone();
-                                let log_fn = log_fn.clone();
-                                let progress = progress.clone();
-                                let update_config_tab = update_config_tab.clone();
-                                let stack = stack.clone();
-                                let toast_overlay = toast_overlay.clone();
-                                dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                                    if response == "use" {
-                                        log_fn("User chose to continue WITHOUT checksum verification".to_string());
-                                        progress.set_text(Some("Complete (unverified)"));
-                                        let path_str = path.to_string_lossy().to_string();
-                                        { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
-                                        update_config_tab();
-                                        stack.set_visible_child_name("configure");
-                                        toast_overlay.add_toast(Toast::new("Download complete (unverified)"));
-                                    } else {
-                                        let _ = std::fs::remove_file(&path);
-                                        log_fn(format!("Discarded unverified download: {}", path.display()));
-                                        progress.set_text(Some("Discarded (not verified)"));
-                                        toast_overlay.add_toast(Toast::new("Unverified download discarded"));
-                                    }
-                                });
-                            }
+                            (ui.log)(format!("Download complete: {}", path.display()));
+                            ui.progress.set_fraction(1.0);
+                            finish_download(ui, ver, path, checksum);
                         }
                     }
                 },
@@ -1084,7 +1070,6 @@ pub fn build_ui(app: &Application) {
     // Cancel download button
     {
         let state = state.clone();
-        let cancel_dl_btn = cancel_dl_btn.clone();
         cancel_dl_btn.connect_clicked(move |_| {
             if let Some(flag) = &state.borrow().download_cancel {
                 flag.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1103,6 +1088,9 @@ pub fn build_ui(app: &Application) {
         let log_fn = log_fn.clone();
 
         open_file_btn.connect_clicked(move |_| {
+            if state.borrow().busy.is_some() {
+                return;
+            }
             let dialog = FileDialog::builder().title("Select NVIDIA .run File").modal(true).build();
             let filter = gtk4::FileFilter::new();
             filter.add_pattern("*.run");
@@ -1115,17 +1103,22 @@ pub fn build_ui(app: &Application) {
             let update_config_tab = update_config_tab.clone();
             let stack = stack.clone();
             let log_fn = log_fn.clone();
+            let window = window.clone();
 
-            dialog.open(Some(&window), gio::Cancellable::NONE, move |result| {
-                if let Ok(file) = result {
-                    if let Some(path) = file.path() {
-                        let path_str = path.to_string_lossy().to_string();
-                        log_fn(format!("Opened local file: {}", path_str));
-                        { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
-                        update_config_tab();
-                        stack.set_visible_child_name("configure");
-                    }
+            dialog.open(Some(&window.clone()), gio::Cancellable::NONE, move |result| {
+                let Some(path) = result.ok().and_then(|f| f.path()) else { return };
+                // The install script refuses symlinks; use the file itself.
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                let path_str = path.to_string_lossy().to_string();
+                if let Err(e) = check_run_file(&path_str) {
+                    log_fn(format!("Can't use {path_str}: {e}"));
+                    show_error(&window, "This file can't be installed", &e.to_string());
+                    return;
                 }
+                log_fn(format!("Opened local file: {}", path_str));
+                { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
+                update_config_tab();
+                stack.set_visible_child_name("configure");
             });
         });
     }
@@ -1133,7 +1126,15 @@ pub fn build_ui(app: &Application) {
     // ─────────────────────────────────────────────────────────────────────────
     //  Switches
     // ─────────────────────────────────────────────────────────────────────────
-    { let s = state.clone(); dkms_switch.connect_active_notify(move |sw| { s.borrow_mut().use_dkms = sw.is_active(); }); }
+    {
+        let s = state.clone();
+        let update_config_tab = update_config_tab.clone();
+        dkms_switch.connect_active_notify(move |sw| {
+            s.borrow_mut().use_dkms = sw.is_active();
+            // The Secure Boot advice depends on it.
+            update_config_tab();
+        });
+    }
     {
         let s = state.clone();
         module_combo.connect_selected_notify(move |row| {
@@ -1144,7 +1145,7 @@ pub fn build_ui(app: &Application) {
             };
         });
     }
-    { let s = state.clone(); hold_switch.connect_active_notify(move |sw| { s.borrow_mut().hold_packages = sw.is_active(); }); }
+    { let s = state.clone(); block_switch.connect_active_notify(move |sw| { s.borrow_mut().block_distro_driver = sw.is_active(); }); }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Install
@@ -1156,9 +1157,14 @@ pub fn build_ui(app: &Application) {
         let toast_overlay = toast_overlay.clone();
         let progress = progress.clone();
         let load_sysinfo = load_sysinfo.clone();
+        let refresh_actions = refresh_actions.clone();
+        let window = window.clone();
 
-        install_btn.connect_clicked(move |btn| {
+        install_btn.connect_clicked(move |_| {
             let s = state.borrow();
+            if s.busy.is_some() {
+                return;
+            }
             let Some(ref run_file) = s.downloaded_path else { return };
 
             if let Some(free) = s.sysinfo.free_disk_bytes {
@@ -1169,7 +1175,7 @@ pub fn build_ui(app: &Application) {
             }
 
             // Refuse module flavors that cannot work, before asking for a password.
-            let driver_major = std::path::Path::new(run_file)
+            let driver_major = Path::new(run_file)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(version_from_filename)
@@ -1184,14 +1190,15 @@ pub fn build_ui(app: &Application) {
 
             let opts = InstallOptions {
                 use_dkms: s.use_dkms,
-                hold_packages: s.hold_packages,
+                block_distro_driver: s.block_distro_driver,
                 module: s.module_choice,
                 run_file: run_file.clone(),
                 sha256: s.expected_checksum.clone(),
             };
             drop(s);
 
-            btn.set_sensitive(false);
+            state.borrow_mut().busy = Some(Busy::Install);
+            refresh_actions();
             progress.set_visible(true);
             progress.set_text(Some("Installing… the desktop stays up; this takes a few minutes"));
             stack.set_visible_child_name("log");
@@ -1199,16 +1206,27 @@ pub fn build_ui(app: &Application) {
             log_fn("The new driver installs alongside the running one; reboot afterward to switch over.".to_string());
 
             // Pulse the bar while the install runs; the timer stops itself
-            // once the completion callback re-enables the button.
+            // once the install is no longer running.
             {
                 let progress = progress.clone();
-                let btn = btn.clone();
+                let state = state.clone();
                 glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
-                    if btn.is_sensitive() {
-                        glib::ControlFlow::Break
-                    } else {
+                    if state.borrow().busy == Some(Busy::Install) {
                         progress.pulse();
                         glib::ControlFlow::Continue
+                    } else {
+                        glib::ControlFlow::Break
+                    }
+                });
+            }
+
+            // The script's output, line by line as it runs, into the Log tab.
+            let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            {
+                let log_fn = log_fn.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    while let Some(line) = line_rx.recv().await {
+                        log_fn(line);
                     }
                 });
             }
@@ -1216,42 +1234,40 @@ pub fn build_ui(app: &Application) {
             let log_fn = log_fn.clone();
             let toast_overlay = toast_overlay.clone();
             let progress = progress.clone();
-            let btn = btn.clone();
             let load_sysinfo = load_sysinfo.clone();
+            let state = state.clone();
+            let refresh_actions = refresh_actions.clone();
+            let window = window.clone();
 
             spawn_async(
                 async move {
                     tokio::task::spawn_blocking(move || {
-                        let result = run_privileged_install(&opts);
-                        (result, install_report())
+                        run_privileged_install(&opts, |line| {
+                            let _ = line_tx.send(line.to_string());
+                        })
                     })
                     .await
                 },
                 move |result| {
-                    btn.set_sensitive(true);
+                    state.borrow_mut().busy = None;
+                    refresh_actions();
                     progress.set_visible(false);
-                    // Post-install verification results and any build-log excerpt
-                    if let Ok((_, report)) = &result {
-                        for line in report {
-                            log_fn(line.clone());
-                        }
-                    }
-                    let result = result.map(|(r, _)| r);
                     match result {
                         Ok(Ok(())) => {
                             log_fn("Install completed successfully.".to_string());
                             log_fn("Reboot to switch to the new driver.".to_string());
                             toast_overlay.add_toast(Toast::new("Install complete — reboot to activate"));
-                            load_sysinfo();
                         }
                         Ok(Err(e)) => {
-                            log_fn(format!("Install failed: {}", e));
-                            toast_overlay.add_toast(Toast::new("Install failed — see Log tab"));
+                            log_fn(format!("Install failed: {e:#}"));
+                            show_error(&window, "Install failed", &format!("{e:#}"));
                         }
                         Err(e) => {
                             log_fn(format!("Task error: {}", e));
                         }
                     }
+                    // A failed install may have changed (or put back) packages too.
+                    load_sysinfo();
                 },
             );
         });
@@ -1299,6 +1315,162 @@ pub fn build_ui(app: &Application) {
     { let lv = log_view.clone(); clear_btn.connect_clicked(move |_| { lv.buffer().set_text(""); }); }
 
     window.present();
+}
+
+const BLOCK_SUBTITLE: &str =
+    "Keep apt or dnf from installing the distribution's NVIDIA driver over this one later";
+
+/// A message the user has to see, in a dialog over the window.
+fn show_error(window: &ApplicationWindow, heading: &str, body: &str) {
+    let dialog = libadwaita::AlertDialog::new(Some(heading), Some(body));
+    dialog.add_responses(&[("close", "Close")]);
+    dialog.set_close_response("close");
+    dialog.present(Some(window));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  After a download: checksum verification, or a decision without one
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct DownloadUi {
+    state: Rc<RefCell<AppState>>,
+    progress: ProgressBar,
+    cancel_btn: Button,
+    log: Rc<dyn Fn(String)>,
+    update_config_tab: Rc<dyn Fn()>,
+    refresh_actions: Rc<dyn Fn()>,
+    stack: gtk4::Stack,
+    toast: ToastOverlay,
+    window: ApplicationWindow,
+}
+
+impl DownloadUi {
+    /// The download is over, whichever way it went.
+    fn end(&self) {
+        {
+            let mut s = self.state.borrow_mut();
+            s.busy = None;
+            s.download_cancel = None;
+        }
+        (self.refresh_actions)();
+    }
+
+    /// Make the file the one to install.
+    fn accept(&self, path: &Path, checksum: Option<String>, progress_text: &str, toast: &str) {
+        self.progress.set_text(Some(progress_text));
+        {
+            let mut s = self.state.borrow_mut();
+            s.downloaded_path = Some(path.to_string_lossy().to_string());
+            s.expected_checksum = checksum;
+        }
+        self.end();
+        (self.update_config_tab)();
+        self.stack.set_visible_child_name("configure");
+        self.toast.add_toast(Toast::new(toast));
+    }
+
+    fn discard(&self, path: &Path, progress_text: &str, toast: &str) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                (self.log)(format!("Deleted {}", path.display()));
+                self.progress.set_text(Some(progress_text));
+            }
+            Err(e) => {
+                (self.log)(format!("Could not delete {}: {}", path.display(), e));
+                self.progress.set_text(Some("Could not delete the download — remove it by hand"));
+            }
+        }
+        self.end();
+        self.toast.add_toast(Toast::new(toast));
+    }
+}
+
+/// Verify a finished download against NVIDIA's checksum. With none published
+/// (`Ok(None)`) the user decides whether to use the file unverified; when
+/// the checksum couldn't be fetched (`Err`), the choice is to retry or to
+/// discard the file — never to skip the check.
+fn finish_download(
+    ui: DownloadUi,
+    ver: DriverVersion,
+    path: PathBuf,
+    checksum: Result<Option<String>, String>,
+) {
+    match checksum {
+        Ok(Some(cs)) => {
+            (ui.log)("Verifying SHA256…".to_string());
+            ui.progress.set_text(Some("Verifying…"));
+            let file = path.clone();
+            let expected = cs.clone();
+            spawn_async(
+                async move { verify_sha256(&file, &expected).await },
+                move |verified| match verified {
+                    Ok(()) => {
+                        (ui.log)("SHA256 verified OK".to_string());
+                        ui.accept(&path, Some(cs), "Verified", "Download complete");
+                    }
+                    Err(e) => {
+                        (ui.log)(format!("SHA256 FAILED: {}", e));
+                        ui.discard(&path, "Checksum mismatch — file deleted", "Checksum mismatch — do not install");
+                    }
+                },
+            );
+        }
+        Ok(None) => {
+            (ui.log)("NVIDIA publishes no SHA256 checksum for this version".to_string());
+            ui.progress.set_text(Some("Downloaded — not verified"));
+            let dialog = libadwaita::AlertDialog::new(
+                Some("Install without verification?"),
+                Some(
+                    "NVIDIA does not publish a SHA256 checksum for this version, so the download \
+                     cannot be checked against it. Only continue if you trust the network you \
+                     downloaded it over.",
+                ),
+            );
+            dialog.add_responses(&[("cancel", "Discard Download"), ("use", "Use Unverified")]);
+            dialog.set_response_appearance("use", libadwaita::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
+            let window = ui.window.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+                if response == "use" {
+                    (ui.log)("User chose to continue WITHOUT checksum verification".to_string());
+                    ui.accept(&path, None, "Complete (unverified)", "Download complete (unverified)");
+                } else {
+                    ui.discard(&path, "Discarded (not verified)", "Unverified download discarded");
+                }
+            });
+        }
+        Err(e) => {
+            (ui.log)(format!("Could not fetch the SHA256 checksum: {}", e));
+            ui.progress.set_text(Some("Downloaded — checksum not fetched yet"));
+            let dialog = libadwaita::AlertDialog::new(
+                Some("Couldn't get NVIDIA's checksum"),
+                Some(&format!(
+                    "The driver downloaded, but its SHA256 checksum could not be fetched to \
+                     check it:\n\n{e}\n\nTry again once the connection to NVIDIA works."
+                )),
+            );
+            dialog.add_responses(&[("discard", "Discard Download"), ("retry", "Try Again")]);
+            dialog.set_response_appearance("retry", libadwaita::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("retry"));
+            dialog.set_close_response("discard");
+            let window = ui.window.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+                if response != "retry" {
+                    ui.discard(&path, "Discarded (not verified)", "Download discarded");
+                    return;
+                }
+                (ui.log)("Fetching the SHA256 checksum again…".to_string());
+                ui.progress.set_text(Some("Fetching checksum…"));
+                let v = ver.clone();
+                spawn_async(
+                    async move { fetch_checksum(&v).await.map_err(|e| format!("{e:#}")) },
+                    move |checksum| finish_download(ui, ver, path, checksum),
+                );
+            });
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1357,6 +1529,7 @@ fn populate_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::preflight::SigningKeyState;
 
     #[test]
     fn compare_newer_same_older() {
@@ -1370,6 +1543,36 @@ mod tests {
     fn compare_numeric_not_lexicographic() {
         // 595.9 < 595.10 numerically even though "9" > "1" as text.
         assert!(compare_versions("595.9", "595.10") == VersionRelation::Newer);
+    }
+
+    #[test]
+    fn one_operation_at_a_time() {
+        let ver = DriverVersion {
+            version: "595.84".into(),
+            filename: "NVIDIA-Linux-x86_64-595.84.run".into(),
+            url: String::new(),
+            branch: None,
+        };
+        let mut s = AppState {
+            selected_version: Some(ver),
+            downloaded_path: Some("/x.run".into()),
+            sysinfo_loaded: true,
+            ..AppState::default()
+        };
+        s.sysinfo.signing_key = SigningKeyState::NoKey;
+        let all = ActionsEnabled { download: true, open_file: true, install: true, setup_signing: true };
+        assert_eq!(actions_enabled(&s), all);
+        let none = ActionsEnabled { download: false, open_file: false, install: false, setup_signing: false };
+        for busy in [Busy::Download, Busy::Install, Busy::Signing] {
+            s.busy = Some(busy);
+            assert_eq!(actions_enabled(&s), none, "{busy:?}");
+        }
+        s.busy = None;
+        s.selected_version = None;
+        s.downloaded_path = None;
+        s.sysinfo_loaded = false;
+        let idle = actions_enabled(&s);
+        assert!(!idle.download && !idle.install && !idle.setup_signing && idle.open_file);
     }
 
     #[test]

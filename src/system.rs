@@ -4,7 +4,8 @@
 use crate::preflight::{
     classify_signing_key, parse_compute_caps, parse_dkms_signing_config, parse_dpkg_installed,
     parse_module_flavor, parse_module_signer, parse_mok_fingerprints, parse_rpm_names,
-    signing_cert_candidates, ComputeCap, ModuleFlavor, ModuleSignature, SigningKeyState,
+    resolve_signing_pair, ComputeCap, ModuleFlavor, ModuleSignature, SigningKeyState,
+    SigningPair, APT_BLOCK_FILE, DEB_DRIVER_GLOBS, DNF_BLOCK_FILE, RPM_DRIVER_GLOBS,
 };
 use std::process::Command;
 
@@ -20,10 +21,16 @@ pub struct SystemInfo {
     pub dkms_status: Vec<DkmsEntry>,
     pub secure_boot: SecureBootStatus,
     pub signing_key: SigningKeyState,
+    /// The key pair the install script would sign with.
+    pub signing_pair: Option<SigningPair>,
     /// Signature on the nvidia module on disk for the running kernel.
     pub module_signature: ModuleSignature,
     /// Distro-packaged NVIDIA driver packages the install will remove.
     pub distro_packages: Vec<String>,
+    /// The install script's block on the distro driver packages is in place.
+    pub distro_driver_blocked: bool,
+    /// This package manager can block them (apt, or dnf5; not dnf4).
+    pub block_supported: bool,
     pub free_disk_bytes: Option<u64>,
     pub reboot_required: bool,
 }
@@ -56,7 +63,7 @@ impl std::fmt::Display for SecureBootStatus {
 
 pub fn query_system() -> SystemInfo {
     let secure_boot = get_secure_boot();
-    let signing_key = get_signing_key_state();
+    let (signing_key, signing_pair) = get_signing_key_state();
     SystemInfo {
         installed_driver: get_installed_driver(),
         gpu_name: get_gpu_name(),
@@ -66,8 +73,12 @@ pub fn query_system() -> SystemInfo {
         dkms_status: get_dkms_status(),
         secure_boot,
         signing_key,
+        signing_pair,
         module_signature: get_module_signature(),
         distro_packages: get_distro_packages(),
+        distro_driver_blocked: std::path::Path::new(APT_BLOCK_FILE).is_file()
+            || std::path::Path::new(DNF_BLOCK_FILE).is_file(),
+        block_supported: on_path("apt-get") || on_path("dnf5"),
         free_disk_bytes: get_free_disk(),
         reboot_required: check_reboot_required(),
     }
@@ -92,27 +103,33 @@ fn get_module_flavor() -> ModuleFlavor {
         .unwrap_or_default()
 }
 
-/// Installed distro driver packages (apt or rpm). Empty when none, or when
-/// neither package manager can be queried.
+/// Whether an executable `name` is on PATH.
+fn on_path(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
+/// Installed distro driver packages (apt or rpm), with the install script's
+/// package globs. Empty when none, or when neither package manager can be
+/// queried.
 fn get_distro_packages() -> Vec<String> {
-    const DEB_GLOBS: [&str; 4] =
-        ["nvidia-*", "libnvidia-*", "xserver-xorg-video-nvidia*", "system76-driver-nvidia*"];
-    const RPM_GLOBS: [&str; 5] = [
-        "akmod-nvidia*", "xorg-x11-drv-nvidia*", "kmod-nvidia*", "nvidia-driver*",
-        "nvidia-settings*",
-    ];
     // dpkg-query exits non-zero when a glob matches nothing but still prints
     // the matches of the others, so only the output is used.
     if let Ok(out) = Command::new("dpkg-query")
         .args(["-W", "-f", "${db:Status-Abbrev}|${Package}\\n"])
-        .args(DEB_GLOBS)
+        .args(DEB_DRIVER_GLOBS)
         .output()
     {
         return parse_dpkg_installed(&String::from_utf8_lossy(&out.stdout));
     }
     if let Ok(out) = Command::new("rpm")
         .args(["-qa", "--qf", "%{NAME}\\n"])
-        .args(RPM_GLOBS)
+        .args(RPM_DRIVER_GLOBS)
         .output()
     {
         return parse_rpm_names(&String::from_utf8_lossy(&out.stdout));
@@ -148,13 +165,24 @@ fn command_text(cmd: &str, args: &[&str]) -> Option<String> {
     ))
 }
 
-/// The machine's module-signing certificate and whether it is enrolled,
-/// queued for enrollment, or neither. Checked whatever the Secure Boot state.
-fn get_signing_key_state() -> SigningKeyState {
-    let candidates = signing_cert_candidates(&get_dkms_signing_config());
-    let Some(path) = candidates.iter().find(|p| std::path::Path::new(p).is_file()) else {
-        return SigningKeyState::NoKey;
+/// The machine's module-signing key pair, chosen as the install script
+/// chooses it, and whether its certificate is enrolled, queued for
+/// enrollment, or neither. Checked whatever the Secure Boot state. (The
+/// private keys are root-only to read, but their existence can be seen.)
+fn get_signing_key_state() -> (SigningKeyState, Option<SigningPair>) {
+    let pair = resolve_signing_pair(&get_dkms_signing_config(), |p| {
+        std::path::Path::new(p).is_file()
+    });
+    let state = match &pair {
+        None => SigningKeyState::NoKey,
+        Some(p) if !p.complete => SigningKeyState::Incomplete(p.key.clone(), p.cert.clone()),
+        Some(p) => cert_enrollment(&p.cert),
     };
+    (state, pair)
+}
+
+/// Enrollment state of the certificate at `path`.
+fn cert_enrollment(path: &str) -> SigningKeyState {
     let pending = command_text("mokutil", &["--list-new"])
         .map(|t| parse_mok_fingerprints(&t))
         .unwrap_or_default();
@@ -168,7 +196,7 @@ fn get_signing_key_state() -> SigningKeyState {
         });
     command_text("mokutil", &["--test-key", path])
         .and_then(|t| classify_signing_key(path, &t, &pending, sha1.as_deref()))
-        .unwrap_or_else(|| SigningKeyState::Untested(path.clone()))
+        .unwrap_or_else(|| SigningKeyState::Untested(path.to_string()))
 }
 
 /// Who signed the nvidia module on disk for the running kernel.

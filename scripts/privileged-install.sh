@@ -14,14 +14,32 @@
 # distros (Fedora, RHEL, Nobara). Package manager is detected once at
 # startup and every package-related step below branches on it.
 #
-# Usage: privileged-install.sh <path-to.run> <sha256-of-run-file> [--dkms] [--hold]
-#        [--kernel-module-type=open|proprietary]
+# Usage: privileged-install.sh <absolute-path-to.run> <sha256-of-run-file> [--dkms]
+#        [--block-distro-driver] [--kernel-module-type=open|proprietary]
 # Without --kernel-module-type the installer picks the flavor from the
-# detected GPUs (open for Turing and newer).
+# detected GPUs (open for Turing and newer). --block-distro-driver keeps the
+# package manager from installing the distro's NVIDIA driver packages over
+# this driver later (apt pin / dnf5 exclude); without it any such block from
+# an earlier install is removed.
 #
 #        privileged-install.sh --setup-signing   (one-time password on stdin)
 # Setup mode makes sure the machine has a module-signing key and queues its
 # certificate for MOK enrollment. It never touches the installed driver.
+#
+# EXIT CODES
+# ----------
+# pkexec itself exits 126 when the password prompt is dismissed and 127 when
+# authorization fails, so this script never exits with either (the EXIT trap
+# maps a stray 126/127, e.g. a missing command, to 1):
+#   0  success
+#   1  failed before anything was changed
+#   2  bad arguments, or a .run file it refuses to use
+#   3  the install failed after it had started changing the system (distro
+#      driver packages removed, boot config written), and all of that was
+#      put back: the next boot uses the driver the machine had before
+#   4  as 3, but putting it back failed too: the machine needs attention
+#      before a reboot
+#   5  the driver is installed, but rebuilding the initramfs failed
 #
 # MODULE SIGNING
 # --------------
@@ -37,14 +55,23 @@
 # The .run file normally lives in a user-writable directory, so it could be
 # swapped between the app's checks and this script running it as root. To
 # close that window the script (1) refuses files that are symlinks, owned
-# by anyone but root or the invoking user, or writable by group/others,
-# (2) copies the file into a root-only private directory, (3) verifies the
-# SHA256 passed in by the caller against that PRIVATE COPY, and (4) runs
-# everything (integrity check + install) from the copy, never the original.
+# by anyone but root or the invoking user, or writable by anyone else
+# (group-writable is accepted only for the owner's own private group, the
+# umask-002 default on Ubuntu, Debian and Fedora, where nobody else is in
+# the group), (2) copies the file into a root-only private directory,
+# (3) verifies the SHA256 passed in by the caller against that PRIVATE COPY,
+# and (4) runs everything (integrity check + install) from the copy, never
+# the original.
 
 # -e: any unhandled failure aborts, so a partially-applied config can't
 # report success. Steps that are allowed to fail are handled explicitly.
 set -euo pipefail
+
+EXIT_FAILED=1
+EXIT_USAGE=2
+EXIT_ROLLED_BACK=3
+EXIT_ROLLBACK_FAILED=4
+EXIT_INITRAMFS=5
 
 LOGFILE="/var/log/green-light.log"
 log() {
@@ -54,6 +81,25 @@ log() {
 }
 
 trap 'log "ERROR: step failed near line $LINENO (exit $?) — install aborted"' ERR
+
+# Set once the install starts changing the system (distro packages, boot
+# config); cleared once NVIDIA's installer has succeeded. Any failure in
+# between restores the previous setup (rollback, defined below).
+ROLLBACK_ARMED=0
+PRIV_DIR=""
+on_exit() {
+    local rc=$?
+    set +e
+    trap - ERR
+    if [[ $ROLLBACK_ARMED -eq 1 && $rc -ne 0 ]]; then
+        ROLLBACK_ARMED=0
+        if rollback; then rc=$EXIT_ROLLED_BACK; else rc=$EXIT_ROLLBACK_FAILED; fi
+    fi
+    if [[ -n "$PRIV_DIR" ]]; then rm -rf "$PRIV_DIR"; fi
+    if [[ $rc -eq 126 || $rc -eq 127 ]]; then rc=$EXIT_FAILED; fi
+    exit "$rc"
+}
+trap on_exit EXIT
 
 # ── Package manager detection (shared by both modes) ───────────────────
 detect_pkg_mgr() {
@@ -65,7 +111,7 @@ detect_pkg_mgr() {
         log "ERROR: Neither apt-get nor dnf found. This script supports"
         log "       apt-based (Ubuntu, Debian, Mint) and dnf-based"
         log "       (Fedora, RHEL, Nobara) distros only."
-        exit 1
+        exit "$EXIT_FAILED"
     fi
 }
 
@@ -244,8 +290,7 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     ensure_signing_key || exit 1
 
     PRIV_DIR="$(mktemp -d /var/tmp/green-light-signing.XXXXXX)"
-    chmod 700 "$PRIV_DIR"
-    trap 'rm -rf "$PRIV_DIR"' EXIT
+    chmod 700 "$PRIV_DIR"   # removed by on_exit
     if ! CERT_DER="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")"; then
         log "ERROR: Could not read the certificate $SIGN_CERT"
         exit 1
@@ -285,51 +330,150 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     exit 0
 fi
 
+# ── Install mode ───────────────────────────────────────────────────────
+# Logged first, so every message of this run (argument and file errors
+# included) comes after it in the log.
+log "==== NVIDIA driver install started ===="
+
+usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
+
 ORIG_RUN_FILE="${1:-}"
 EXPECT_SHA256="${2:-}"
 USE_DKMS=0
-HOLD_PKG=0
+BLOCK_DISTRO=0
 MODULE_TYPE=""
 
-if [[ -z "$ORIG_RUN_FILE" ]]; then log "ERROR: No .run file specified"; exit 1; fi
-if [[ ! "$ORIG_RUN_FILE" =~ ^/.*\.run$ ]]; then log "ERROR: Invalid run file path: $ORIG_RUN_FILE"; exit 1; fi
-if [[ -L "$ORIG_RUN_FILE" ]]; then log "ERROR: Refusing symlink: $ORIG_RUN_FILE"; exit 1; fi
-if [[ ! -f "$ORIG_RUN_FILE" ]]; then log "ERROR: File not found: $ORIG_RUN_FILE"; exit 1; fi
+if [[ -z "$ORIG_RUN_FILE" ]]; then usage_error "No .run file specified"; fi
+if [[ ! "$ORIG_RUN_FILE" =~ ^/.*\.run$ ]]; then usage_error "Invalid run file path (must be absolute and end in .run): $ORIG_RUN_FILE"; fi
+if [[ -L "$ORIG_RUN_FILE" ]]; then usage_error "Refusing symlink: $ORIG_RUN_FILE"; fi
+if [[ ! -f "$ORIG_RUN_FILE" ]]; then usage_error "File not found: $ORIG_RUN_FILE"; fi
 if [[ ! "$EXPECT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    log "ERROR: A 64-character SHA256 of the run file is required as the second argument"
-    exit 1
+    usage_error "A 64-character SHA256 of the run file is required as the second argument"
 fi
 EXPECT_SHA256="${EXPECT_SHA256,,}"
-
-# Ownership / permission check on the original file.
-FILE_UID="$(stat -c '%u' "$ORIG_RUN_FILE")"
-FILE_MODE="$(stat -c '%a' "$ORIG_RUN_FILE")"
-CALLER_UID="${PKEXEC_UID:-${SUDO_UID:-0}}"
-if [[ "$FILE_UID" != "0" && "$FILE_UID" != "$CALLER_UID" ]]; then
-    log "ERROR: $ORIG_RUN_FILE is owned by uid $FILE_UID, not root or the invoking user ($CALLER_UID)"
-    exit 1
-fi
-if (( (8#$FILE_MODE) & 8#022 )); then
-    log "ERROR: $ORIG_RUN_FILE is writable by group/others (mode $FILE_MODE) — refusing"
-    exit 1
-fi
 
 shift 2
 for arg in "$@"; do
     case "$arg" in
-        --dkms)       USE_DKMS=1 ;;
-        --hold)       HOLD_PKG=1 ;;
+        --dkms)                USE_DKMS=1 ;;
+        --block-distro-driver) BLOCK_DISTRO=1 ;;
         --kernel-module-type=open|--kernel-module-type=proprietary)
             MODULE_TYPE="${arg#--kernel-module-type=}" ;;
-        *) log "WARNING: Unknown argument: $arg" ;;
+        *) usage_error "Unknown argument: $arg" ;;
     esac
 done
+
+# Whether <gid> is the private group of the account <uid>: named after it,
+# its primary group, and with no other member (supplementary or primary).
+group_is_owners_private_group() { # <gid> <uid>
+    local entry owner owner_gid gname members name pgid
+    entry="$(getent passwd "$2")" || return 1
+    IFS=: read -r owner _ _ owner_gid _ <<<"$entry"
+    [[ "$owner_gid" == "$1" ]] || return 1
+    entry="$(getent group "$1")" || return 1
+    IFS=: read -r gname _ _ members <<<"$entry"
+    [[ "$gname" == "$owner" ]] || return 1
+    [[ -z "$members" || "$members" == "$owner" ]] || return 1
+    while IFS=: read -r name _ _ pgid _; do
+        if [[ "$pgid" == "$1" && "$name" != "$owner" ]]; then return 1; fi
+    done < <(getent passwd || true)
+    return 0
+}
+
+# Ownership / permission check on the original file: only its owner (root
+# or the invoking user) may have been able to write it.
+FILE_UID="$(stat -c '%u' -- "$ORIG_RUN_FILE")"
+FILE_GID="$(stat -c '%g' -- "$ORIG_RUN_FILE")"
+FILE_MODE="$(stat -c '%a' -- "$ORIG_RUN_FILE")"
+CALLER_UID="${PKEXEC_UID:-${SUDO_UID:-0}}"
+if [[ "$FILE_UID" != "0" && "$FILE_UID" != "$CALLER_UID" ]]; then
+    usage_error "$ORIG_RUN_FILE is owned by uid $FILE_UID, not root or the invoking user ($CALLER_UID)"
+fi
+if (( (8#$FILE_MODE) & 8#002 )); then
+    usage_error "$ORIG_RUN_FILE can be changed by every user (mode $FILE_MODE) — refusing. Remove that permission (chmod go-w) and retry."
+fi
+if (( (8#$FILE_MODE) & 8#020 )) && ! group_is_owners_private_group "$FILE_GID" "$FILE_UID"; then
+    usage_error "$ORIG_RUN_FILE can be changed by other members of group $FILE_GID (mode $FILE_MODE) — refusing. Remove that permission (chmod go-w) and retry."
+fi
 
 # ── Detect package manager ─────────────────────────────────────────────
 detect_pkg_mgr
 
-log "==== NVIDIA driver install started ===="
-log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS hold=$HOLD_PKG module=${MODULE_TYPE:-auto} pkg_mgr=$PKG_MGR)"
+log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS block_distro_driver=$BLOCK_DISTRO module=${MODULE_TYPE:-auto} pkg_mgr=$PKG_MGR)"
+
+KVER="$(uname -r)"
+if [[ "$PKG_MGR" == "apt" ]]; then
+    INITRAMFS_CMD=(update-initramfs -u -k "$KVER")
+else
+    INITRAMFS_CMD=(dracut --force --kver "$KVER")
+fi
+
+# Distro driver packages, removed before the install. Keep in step with
+# DEB_DRIVER_GLOBS / RPM_DRIVER_GLOBS / is_driver_package in preflight.rs
+# (a unit test there compares them). Docker's GPU plumbing
+# (nvidia-container-toolkit, libnvidia-container*) matches the globs but is
+# not the display driver; see Step 3.
+DEB_DRIVER_GLOBS=('nvidia-*' 'libnvidia-*' 'xserver-xorg-video-nvidia*' 'system76-driver-nvidia*')
+RPM_DRIVER_GLOBS=('akmod-nvidia*' 'xorg-x11-drv-nvidia*' 'kmod-nvidia*' 'nvidia-driver*' 'nvidia-settings*')
+NOT_DRIVER_RE='^(nvidia-container|libnvidia-container)'
+
+is_driver_pkg() { # <name[:arch]> <glob>...
+    local name="${1%%:*}" glob
+    shift
+    if [[ "$name" =~ $NOT_DRIVER_RE ]]; then return 1; fi
+    for glob in "$@"; do
+        # shellcheck disable=SC2053  # the right-hand side is a glob on purpose
+        if [[ "$name" == $glob ]]; then return 0; fi
+    done
+    return 1
+}
+
+# Where --block-distro-driver keeps the distro driver out (keep in step with
+# APT_BLOCK_FILE / DNF_BLOCK_FILE in system.rs, which shows the state).
+APT_BLOCK_FILE="/etc/apt/preferences.d/green-light-nvidia"
+DNF_BLOCK_DIR="/etc/dnf/libdnf5.conf.d"
+DNF_BLOCK_FILE="$DNF_BLOCK_DIR/90-green-light-nvidia.conf"
+
+distro_driver_blocked() { [[ -f "$APT_BLOCK_FILE" || -f "$DNF_BLOCK_FILE" ]]; }
+
+# apt: a Pin-Priority of -1 means "never install". The driver comes from the
+# nvidia-graphics-drivers* source packages (Ubuntu's numbered and -server
+# branches, Debian's), so pinning those sources catches every binary package
+# of every branch, present or future, and nothing else (the container
+# toolkit is a different source). Ubuntu's prebuilt module packages and
+# Pop!_OS's metapackage are named directly.
+# dnf5: an excludepkgs drop-in, added to dnf.conf's own excludes. dnf4 has no
+# drop-in for it, so there the block isn't available.
+block_distro_driver() {
+    local tmp
+    tmp="$(mktemp "$PRIV_DIR/block.XXXXXX")" || return 1
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        cat > "$tmp" <<'PIN' || return 1
+Explanation: Written by Green Light. The NVIDIA driver on this computer comes from
+Explanation: NVIDIA's .run installer; never install the distribution's driver over it.
+Explanation: Turn off "Block Distro Driver Packages" in Green Light and reinstall to remove this.
+Package: src:nvidia-graphics-drivers* src:nvidia-settings linux-modules-nvidia-* linux-objects-nvidia-* linux-signatures-nvidia-* system76-driver-nvidia*
+Pin: version *
+Pin-Priority: -1
+PIN
+        install -m 0644 "$tmp" "$APT_BLOCK_FILE" || return 1
+    elif command -v dnf5 >/dev/null 2>&1; then
+        {
+            echo "# Written by Green Light. The NVIDIA driver on this computer comes from"
+            echo "# NVIDIA's .run installer; never install the distribution's driver over it."
+            echo "# Turn off \"Block Distro Driver Packages\" in Green Light and reinstall to remove this."
+            echo "[main]"
+            echo "excludepkgs=$(IFS=,; echo "${RPM_DRIVER_GLOBS[*]}")"
+        } > "$tmp" || return 1
+        install -D -m 0644 "$tmp" "$DNF_BLOCK_FILE" || return 1
+    else
+        log "WARNING: Blocking the distro driver packages needs apt or dnf5; this dnf has no way to do it"
+        return 1
+    fi
+    return 0
+}
+
+unblock_distro_driver() { rm -f "$APT_BLOCK_FILE" "$DNF_BLOCK_FILE"; }
 
 # Log the tail of the newest DKMS build log for the nvidia module, so a failed
 # kernel module build is visible in the log and the app without digging.
@@ -352,18 +496,17 @@ log_dkms_build_tail() {
 # /tmp is often mounted noexec.
 PRIV_DIR="$(mktemp -d /var/tmp/green-light-install.XXXXXX)"
 chmod 700 "$PRIV_DIR"
-trap 'rm -rf "$PRIV_DIR"' EXIT
 RUN_FILE="$PRIV_DIR/installer.run"
 log "Copying installer to private directory…"
 if ! cp --no-preserve=mode,ownership -- "$ORIG_RUN_FILE" "$RUN_FILE"; then
     log "ERROR: Could not copy the installer (disk full?). No changes made."
-    exit 1
+    exit "$EXIT_FAILED"
 fi
 chmod 700 "$RUN_FILE"
 ACTUAL_SHA256="$(sha256sum "$RUN_FILE" | cut -d' ' -f1)"
 if [[ "$ACTUAL_SHA256" != "$EXPECT_SHA256" ]]; then
     log "ERROR: SHA256 mismatch on the private copy (expected $EXPECT_SHA256, got $ACTUAL_SHA256). No changes made."
-    exit 1
+    exit "$EXIT_FAILED"
 fi
 log "SHA256 verified on private copy"
 
@@ -371,23 +514,56 @@ log "SHA256 verified on private copy"
 log "Verifying installer archive integrity…"
 if ! "$RUN_FILE" --check >>"$LOGFILE" 2>&1; then
     log "ERROR: Installer failed its integrity self-check. No changes made."
-    exit 1
+    exit "$EXIT_FAILED"
 fi
 log "Integrity OK"
 
-# ── Step 2: Build prerequisites (non-fatal if the package manager balks)
-KVER="$(uname -r)"
+# ── Step 2: Build prerequisites ───────────────────────────────────────
+# Installing them may fail for reasons that don't matter (an unrelated
+# repository being down, packages already present under other names), so
+# that alone is not fatal. What is checked afterwards is fatal: everything
+# below removes the distro driver, and a module that can't build would leave
+# the next boot without any NVIDIA driver.
 log "Ensuring kernel headers and build tools for $KVER…"
 if [[ "$PKG_MGR" == "apt" ]]; then
     apt-get install -y "linux-headers-${KVER}" build-essential dkms >>"$LOGFILE" 2>&1 \
-        || log "WARNING: apt could not confirm prerequisites — continuing"
+        || log "WARNING: apt could not install all of the prerequisites; checking what is there"
 else
     dnf install -y "kernel-devel-${KVER}" "kernel-headers-${KVER}" \
         gcc make dkms >>"$LOGFILE" 2>&1 \
-        || log "WARNING: dnf could not confirm prerequisites — continuing"
+        || log "WARNING: dnf could not install all of the prerequisites; checking what is there"
 fi
 
-# ── Step 3: Clear conflicting distro packages (non-fatal)
+check_build_prereqs() {
+    local build="/lib/modules/$KVER/build" autoconf missing=() list
+    autoconf="$build/include/generated/autoconf.h"
+    if [[ ! -f "$build/Makefile" || ! -f "$autoconf" ]]; then
+        missing+=("the kernel headers for $KVER ($build)")
+    fi
+    # Modules must be built with the compiler (and linker) the kernel was.
+    if grep -qs '^#define CONFIG_CC_IS_CLANG 1' "$autoconf"; then
+        command -v clang >/dev/null 2>&1 || missing+=("clang")
+    else
+        command -v gcc >/dev/null 2>&1 || missing+=("gcc")
+    fi
+    if grep -qs '^#define CONFIG_LD_IS_LLD 1' "$autoconf"; then
+        command -v ld.lld >/dev/null 2>&1 || missing+=("ld.lld")
+    fi
+    command -v make >/dev/null 2>&1 || missing+=("make")
+    if [[ $USE_DKMS -eq 1 ]]; then
+        command -v dkms >/dev/null 2>&1 || missing+=("dkms")
+    fi
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf -v list '%s, ' "${missing[@]}"
+        log "ERROR: The NVIDIA kernel module can't be built for kernel $KVER: missing ${list%, }."
+        log "       Install them and retry (the package manager's output is in $LOGFILE). No changes made."
+        exit "$EXIT_FAILED"
+    fi
+    log "Build prerequisites for $KVER are present"
+}
+check_build_prereqs
+
+# ── Step 3: Clear conflicting distro packages ─────────────────────────
 # Removing package files does not affect the running driver — the loaded
 # kernel module and already-mapped libraries keep working, same as
 # during a normal package-manager driver upgrade.
@@ -401,32 +577,134 @@ fi
 #   - xserver-xorg-video-nvidia-<ver> does NOT match nvidia-*/libnvidia-*
 #     (wrong prefix) but is part of the same apt-managed driver flavor and
 #     is a reverse-dependency of nvidia-support-<ver>. Leaving it installed
-#     makes dpkg refuse to remove nvidia-support-<ver> — silently, since
-#     every removal below used to be `|| true`. The half-removed state that
-#     resulted left nvidia-support-<ver>'s
+#     makes dpkg refuse to remove nvidia-support-<ver>. The half-removed
+#     state that results leaves nvidia-support-<ver>'s
 #     /usr/lib/nvidia/alternate-install-present marker file in place, which
 #     makes the .run installer itself abort with "please use the Debian
 #     packages instead" — on a machine that's mid-purge of those exact
 #     packages. Confirmed end to end against a real install.
+#
+# Everything this step and the next change is recorded first, so a failure
+# from here until NVIDIA's installer succeeds puts it all back (rollback).
+PKGS=()       # installed driver packages (name[:arch] / rpm name)
+PKG_SPECS=()  # the same at their installed versions, for reinstalling
+HELD=()       # apt holds on them
+BACKUPS=()    # "<path>|<saved copy, or empty when it didn't exist>"
+WAS_BLOCKED=0
+BACKUP_DIR="$PRIV_DIR/backup"
+mkdir -p "$BACKUP_DIR"
+
+backup_file() { # <path>
+    local saved=""
+    if [[ -e "$1" ]]; then
+        saved="$BACKUP_DIR/${#BACKUPS[@]}"
+        cp -a -- "$1" "$saved"
+    fi
+    BACKUPS+=("$1|$saved")
+}
+
+restore_backups() {
+    local entry path saved rc=0
+    for entry in "${BACKUPS[@]}"; do
+        path="${entry%%|*}"
+        saved="${entry#*|}"
+        if [[ -n "$saved" ]]; then
+            cp -a -- "$saved" "$path" || { log "ERROR: Could not restore $path"; rc=1; }
+        else
+            rm -f -- "$path" || { log "ERROR: Could not remove $path"; rc=1; }
+        fi
+    done
+    return "$rc"
+}
+
+rollback() {
+    local ok=1
+    log "Restoring the previous driver setup…"
+    restore_backups || ok=0
+    if [[ ${#PKGS[@]} -gt 0 ]]; then
+        log "Reinstalling the distro packages that were removed: ${PKGS[*]}"
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            if ! apt-get install -y --allow-downgrades "${PKG_SPECS[@]}" >>"$LOGFILE" 2>&1; then
+                log "WARNING: The removed versions can't be reinstalled; installing the distro's current ones"
+                apt-get install -y "${PKGS[@]}" >>"$LOGFILE" 2>&1 \
+                    || { log "ERROR: apt-get could not reinstall the distro driver packages"; ok=0; }
+            fi
+        else
+            if ! dnf install -y "${PKG_SPECS[@]}" >>"$LOGFILE" 2>&1; then
+                log "WARNING: The removed versions can't be reinstalled; installing the distro's current ones"
+                dnf install -y "${PKGS[@]}" >>"$LOGFILE" 2>&1 \
+                    || { log "ERROR: dnf could not reinstall the distro driver packages"; ok=0; }
+            fi
+        fi
+    fi
+    if [[ ${#HELD[@]} -gt 0 ]]; then
+        apt-mark hold "${HELD[@]}" >>"$LOGFILE" 2>&1 \
+            || { log "ERROR: Could not restore the apt holds on ${HELD[*]}"; ok=0; }
+    fi
+    if [[ $WAS_BLOCKED -eq 1 ]]; then
+        block_distro_driver || { log "ERROR: Could not restore the block on the distro driver packages"; ok=0; }
+    fi
+    if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
+        log "ERROR: Rebuilding the initramfs failed. Run: ${INITRAMFS_CMD[*]}"
+        ok=0
+    fi
+    if [[ $ok -eq 1 ]]; then
+        log "Restored the previous driver setup; the next boot uses the driver this computer had before."
+        return 0
+    fi
+    log "ERROR: Restoring the previous driver setup did not fully work (see $LOGFILE)."
+    log "       Fix the steps above before rebooting, or the next boot may have no NVIDIA driver."
+    return 1
+}
+
 log "Removing distro-managed NVIDIA packages (if any)…"
 if [[ "$PKG_MGR" == "apt" ]]; then
-    apt-mark unhold 'nvidia*' 'libnvidia*' 'xserver-xorg-video-nvidia*' 2>/dev/null || true
+    # Second status letter "i" = installed, whatever the selection (a held
+    # package reads "hi"). binary:Package keeps the :i386 of multiarch copies.
+    while IFS='|' read -r st name ver; do
+        if [[ "${st:1:1}" == "i" ]] && is_driver_pkg "$name" "${DEB_DRIVER_GLOBS[@]}"; then
+            PKGS+=("$name")
+            PKG_SPECS+=("$name=$ver")
+        fi
+    done < <(dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}|${Version}\n' \
+                 "${DEB_DRIVER_GLOBS[@]}" 2>/dev/null || true)
+    while IFS= read -r name; do
+        if is_driver_pkg "$name" "${DEB_DRIVER_GLOBS[@]}"; then HELD+=("$name"); fi
+    done < <(apt-mark showhold 2>/dev/null || true)
+else
+    while IFS='|' read -r name spec; do
+        if is_driver_pkg "$name" "${RPM_DRIVER_GLOBS[@]}"; then
+            PKGS+=("$name")
+            PKG_SPECS+=("$spec")
+        fi
+    done < <(rpm -qa --qf '%{NAME}|%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' \
+                 "${RPM_DRIVER_GLOBS[@]}" 2>/dev/null || true)
+fi
+if distro_driver_blocked; then WAS_BLOCKED=1; fi
+backup_file /etc/modprobe.d/blacklist-nouveau.conf
+backup_file /etc/modprobe.d/nvidia-drm-modeset.conf
+backup_file /usr/lib/nvidia/alternate-install-present
+
+ROLLBACK_ARMED=1
+
+# The block (if any) would stop the package manager from touching these
+# packages; it is set again at the end, as asked.
+unblock_distro_driver
+if [[ "$PKG_MGR" == "apt" ]]; then
+    # apt refuses to remove held packages.
+    if [[ ${#HELD[@]} -gt 0 ]]; then
+        apt-mark unhold "${HELD[@]}" >>"$LOGFILE" 2>&1
+    fi
     # Driver packages only. libcuda*/libcudnn* are deliberately NOT matched:
     # they can belong to a user-installed CUDA toolkit unrelated to the
     # display driver (the driver's own libcuda is in libnvidia-compute-*).
-    mapfile -t PKGS < <(dpkg -l 'nvidia-*' 'libnvidia-*' \
-                 'xserver-xorg-video-nvidia*' 2>/dev/null \
-        | awk '/^ii/{print $2}' | grep -v '^green-light' \
-        | grep -vE '^(nvidia-container-toolkit|libnvidia-container)' || true)
     if [[ ${#PKGS[@]} -gt 0 ]]; then
         log "  purging: ${PKGS[*]}"
         # No dpkg --force-all fallback: it can leave dpkg in a broken
-        # dependency state. Fail cleanly instead — nothing has been
-        # installed yet and the running driver is untouched.
+        # dependency state. Fail and restore instead.
         if ! apt-get purge -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
-            log "ERROR: apt-get purge of the distro NVIDIA packages failed. No driver changes made."
-            log "       Resolve the dependency conflict (see $LOGFILE) and retry."
-            exit 1
+            log "ERROR: apt-get purge of the distro NVIDIA packages failed (see $LOGFILE)."
+            exit "$EXIT_FAILED"
         fi
     fi
     update-alternatives --remove-all nvidia 2>/dev/null || true   # absent alternative is fine
@@ -442,17 +720,11 @@ if [[ "$PKG_MGR" == "apt" ]]; then
 else
     # Fedora driver packages typically come from RPM Fusion: akmod-nvidia,
     # xorg-x11-drv-nvidia*, kmod-nvidia*, nvidia-driver* if present.
-    if dnf versionlock --help >/dev/null 2>&1; then
-        dnf versionlock delete 'nvidia*' 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' \
-            'kmod-nvidia*' 2>/dev/null || true
-    fi
-    mapfile -t PKGS < <(rpm -qa 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' 'kmod-nvidia*' \
-        'nvidia-driver*' 'nvidia-settings*' 2>/dev/null || true)
     if [[ ${#PKGS[@]} -gt 0 ]]; then
         log "  removing: ${PKGS[*]}"
         if ! dnf remove -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
-            log "ERROR: dnf remove of the distro NVIDIA packages failed. No driver changes made."
-            exit 1
+            log "ERROR: dnf remove of the distro NVIDIA packages failed (see $LOGFILE)."
+            exit "$EXIT_FAILED"
         fi
     fi
 fi
@@ -493,7 +765,7 @@ if [[ -n "$SIGN_KEY" ]]; then
     log "Module signing key: $SIGN_KEY (certificate $SIGN_CERT)"
     if [[ $USE_DKMS -eq 0 ]]; then
         if [[ "$SIGN_KEY" == pkcs11:* ]]; then
-            log "WARNING: A PKCS#11 signing key can't be passed to the NVIDIA installer; the module will not be signed"
+            log "WARNING: A PKCS#11 signing key can't be passed to the NVIDIA installer; the module will not be signed (turn on DKMS to have it signed)"
         elif SIGN_CERT_DER="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")"; then
             INSTALLER_ARGS+=(
                 "--module-signing-secret-key=$SIGN_KEY"
@@ -511,21 +783,17 @@ if [[ $RC -ne 0 ]]; then
     log "ERROR: NVIDIA installer exited with code $RC"
     log "See /var/log/nvidia-installer.log for details."
     log_dkms_build_tail
-    exit $RC
+    exit "$EXIT_FAILED"
 fi
+ROLLBACK_ARMED=0
 log "NVIDIA installer finished successfully"
 
 # ── Step 6: Rebuild initramfs so the blacklist applies at boot ────────
 log "Rebuilding initramfs…"
-if [[ "$PKG_MGR" == "apt" ]]; then
-    INITRAMFS_CMD=(update-initramfs -u -k "$KVER")
-else
-    INITRAMFS_CMD=(dracut --force --kver "$KVER")
-fi
 if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
     log "ERROR: initramfs rebuild failed. The driver is installed but the nouveau"
     log "       blacklist may not apply at boot. Run: ${INITRAMFS_CMD[*]}"
-    exit 1
+    exit "$EXIT_INITRAMFS"
 fi
 
 # ── Step 6b: Verify the result (report only; never fails the install) ─
@@ -613,34 +881,15 @@ else
     log "Verify: $VERIFY_WARNINGS warning(s); see above"
 fi
 
-# ── Step 7: Optional package hold ──────────────────────────────────────
-if [[ $HOLD_PKG -eq 1 ]]; then
-    if [[ "$PKG_MGR" == "apt" ]]; then
-        HELD=$(dpkg -l 'nvidia-*' 'libnvidia-*' 'xserver-xorg-video-nvidia*' 2>/dev/null \
-            | awk '/^ii/{print $2}' \
-            | grep -vE '^(nvidia-container-toolkit|libnvidia-container)' || true)
-        if [[ -n "$HELD" ]]; then
-            # $HELD is newline-separated package names; word-splitting intended.
-            # shellcheck disable=SC2086
-            if apt-mark hold $HELD >>"$LOGFILE" 2>&1; then
-                log "Held packages: $HELD"
-            else
-                log "WARNING: apt-mark hold failed — packages not held"
-            fi
-        fi
+# ── Step 7: Keep the distro driver from coming back (optional) ────────
+if [[ $BLOCK_DISTRO -eq 1 ]]; then
+    if block_distro_driver; then
+        log "Blocked the distro's NVIDIA driver packages: the package manager won't install them over this driver"
     else
-        if dnf versionlock --help >/dev/null 2>&1; then
-            if dnf versionlock add 'akmod-nvidia*' 'xorg-x11-drv-nvidia*' \
-                'kmod-nvidia*' >>"$LOGFILE" 2>&1; then
-                log "Versionlock applied to nvidia packages"
-            else
-                log "WARNING: dnf versionlock add failed — packages not locked"
-            fi
-        else
-            log "WARNING: --hold requested but dnf versionlock plugin is not"
-            log "         installed. Run: dnf install python3-dnf-plugin-versionlock"
-        fi
+        log "WARNING: Could not block the distro's NVIDIA driver packages"
     fi
+elif [[ $WAS_BLOCKED -eq 1 ]]; then
+    log "Removed the block on the distro's NVIDIA driver packages"
 fi
 
 log "==== Done. Reboot to switch to the new driver. ===="

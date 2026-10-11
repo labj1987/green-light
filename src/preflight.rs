@@ -158,13 +158,21 @@ pub fn parse_module_flavor(proc_version: &str) -> ModuleFlavor {
 //  Conflicting distro packages
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Driver packages from the distro (apt or rpm) that the install script
-/// removes before running the .run installer. Mirrors the script's package
-/// set: Docker's GPU plumbing (nvidia-container-toolkit, libnvidia-container)
-/// is excluded, and Pop!_OS's system76-driver-nvidia metapackages are
+/// The package globs the install script removes (`DEB_DRIVER_GLOBS` /
+/// `RPM_DRIVER_GLOBS` in `scripts/privileged-install.sh`; a test below keeps
+/// the two in step). Pop!_OS's system76-driver-nvidia metapackages are
 /// included because they pin the distro driver.
+pub const DEB_DRIVER_GLOBS: [&str; 4] =
+    ["nvidia-*", "libnvidia-*", "xserver-xorg-video-nvidia*", "system76-driver-nvidia*"];
+pub const RPM_DRIVER_GLOBS: [&str; 5] =
+    ["akmod-nvidia*", "xorg-x11-drv-nvidia*", "kmod-nvidia*", "nvidia-driver*", "nvidia-settings*"];
+
+/// Driver packages from the distro (apt or rpm) that the install script
+/// removes before running the .run installer: what the globs above match,
+/// minus Docker's GPU plumbing (nvidia-container-*, libnvidia-container*,
+/// the script's `NOT_DRIVER_RE`), which is not the display driver.
 pub fn is_driver_package(name: &str) -> bool {
-    if name.starts_with("nvidia-container-toolkit") || name.starts_with("libnvidia-container") {
+    if name.starts_with("nvidia-container") || name.starts_with("libnvidia-container") {
         return false;
     }
     name.starts_with("nvidia-")
@@ -177,12 +185,13 @@ pub fn is_driver_package(name: &str) -> bool {
 }
 
 /// Parse `dpkg-query -W -f '${db:Status-Abbrev}|${Package}\n'` output into the
-/// installed driver package names (status "ii").
+/// installed driver package names: second status letter "i", whatever the
+/// selection ("ii", or "hi" for a held package), as the script reads it.
 pub fn parse_dpkg_installed(text: &str) -> Vec<String> {
     let mut names: Vec<String> = text
         .lines()
         .filter_map(|l| l.split_once('|'))
-        .filter(|(status, _)| status.trim() == "ii")
+        .filter(|(status, _)| status.as_bytes().get(1) == Some(&b'i'))
         .map(|(_, name)| name.trim().to_string())
         .filter(|n| is_driver_package(n))
         .collect();
@@ -217,6 +226,95 @@ pub fn conflict_summary(packages: &[String]) -> Option<String> {
         text.push_str(" (Pop!_OS driver packages)");
     }
     Some(text)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Blocking the distro driver
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Where the install script's `--block-distro-driver` keeps the distro's
+/// driver packages out: an apt pin, or a dnf5 excludepkgs drop-in. Keep in
+/// step with `APT_BLOCK_FILE` / `DNF_BLOCK_FILE` in the script (tested below).
+pub const APT_BLOCK_FILE: &str = "/etc/apt/preferences.d/green-light-nvidia";
+pub const DNF_BLOCK_FILE: &str = "/etc/dnf/libdnf5.conf.d/90-green-light-nvidia.conf";
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  The .run file the install script will accept
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Owner and permissions of a .run file, as `stat` reports them.
+#[derive(Debug, Clone, Copy)]
+pub struct FileFacts {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// One `getent passwd` line: (name, uid, primary gid).
+fn passwd_entry(line: &str) -> Option<(&str, u32, u32)> {
+    let mut f = line.split(':');
+    let name = f.next()?;
+    let uid = f.nth(1)?.parse().ok()?;
+    let gid = f.next()?.parse().ok()?;
+    Some((name, uid, gid))
+}
+
+/// Whether `gid` is the private group of account `uid`: named after it, its
+/// primary group, and with no other member, supplementary or primary.
+/// `passwd` is `getent passwd` output, `group` the `getent group <gid>` line.
+/// Mirrors `group_is_owners_private_group` in the install script.
+pub fn group_is_owners_private_group(gid: u32, uid: u32, passwd: &str, group: Option<&str>) -> bool {
+    let entries: Vec<_> = passwd.lines().filter_map(passwd_entry).collect();
+    let Some(&(owner, _, owner_gid)) = entries.iter().find(|e| e.1 == uid) else {
+        return false;
+    };
+    let Some(group) = group else { return false };
+    let mut g = group.trim_end().split(':');
+    let gname = g.next().unwrap_or("");
+    let members = g.nth(2).unwrap_or("");
+    owner_gid == gid
+        && gname == owner
+        && (members.is_empty() || members == owner)
+        && !entries.iter().any(|e| e.2 == gid && e.0 != owner)
+}
+
+/// Why the install script would refuse this .run file, checked the way the
+/// script checks it, so the reason shows before the password prompt: an
+/// absolute `.run` path, owned by root or the caller, and writable by nobody
+/// else.
+pub fn run_file_problem(
+    path: &str,
+    facts: FileFacts,
+    caller_uid: u32,
+    passwd: &str,
+    group: Option<&str>,
+) -> Option<String> {
+    if !path.starts_with('/') || !path.ends_with(".run") {
+        return Some(format!("{path} is not an absolute path to a .run file."));
+    }
+    if facts.uid != 0 && facts.uid != caller_uid {
+        return Some(format!(
+            "{path} belongs to another user (uid {}); use a copy of your own.",
+            facts.uid
+        ));
+    }
+    if facts.mode & 0o002 != 0 {
+        return Some(format!(
+            "{path} can be changed by every user (mode {:o}). Remove that permission \
+             (chmod go-w) and try again.",
+            facts.mode & 0o7777
+        ));
+    }
+    if facts.mode & 0o020 != 0
+        && !group_is_owners_private_group(facts.gid, facts.uid, passwd, group)
+    {
+        return Some(format!(
+            "{path} can be changed by other members of its group (mode {:o}). Remove that \
+             permission (chmod go-w) and try again.",
+            facts.mode & 0o7777
+        ));
+    }
+    None
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -282,20 +380,56 @@ pub fn parse_dkms_signing_config(files: &[&str], kernel: &str) -> DkmsSigningCon
     cfg
 }
 
-/// Certificates to check for enrollment, in the install script's lookup
-/// order. When the DKMS config names a key, DKMS uses only that pair (with
-/// its defaults filling a missing half), so only that certificate counts.
-pub fn signing_cert_candidates(cfg: &DkmsSigningConfig) -> Vec<String> {
-    if cfg.key.is_some() || cfg.cert.is_some() {
-        return vec![cfg.cert.clone().unwrap_or_else(|| DKMS_DEFAULT_CERT.to_string())];
+/// The module-signing key pair the install script would sign with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningPair {
+    /// Private key path, or a `pkcs11:` URI.
+    pub key: String,
+    pub cert: String,
+    /// False when the DKMS config names a pair that is (partly) missing; the
+    /// script then signs nothing.
+    pub complete: bool,
+}
+
+impl SigningPair {
+    /// A key on a PKCS#11 token: DKMS can sign with it, NVIDIA's installer can't.
+    pub fn is_pkcs11(&self) -> bool {
+        self.key.starts_with("pkcs11:")
     }
-    SIGNING_KEY_PATHS.iter().map(|(_, cert)| cert.to_string()).collect()
+}
+
+/// The signing pair, resolved like `resolve_signing_key` in the install
+/// script: a pair named by the DKMS config is used as named (DKMS's defaults
+/// fill a missing half, and it counts even when its files are missing);
+/// otherwise the first default pair whose key AND certificate both exist.
+/// `exists` says whether a file exists.
+pub fn resolve_signing_pair(
+    cfg: &DkmsSigningConfig,
+    exists: impl Fn(&str) -> bool,
+) -> Option<SigningPair> {
+    let key_present = |k: &str| k.starts_with("pkcs11:") || exists(k);
+    if cfg.key.is_some() || cfg.cert.is_some() {
+        let key = cfg.key.clone().unwrap_or_else(|| DKMS_DEFAULT_KEY.to_string());
+        let cert = cfg.cert.clone().unwrap_or_else(|| DKMS_DEFAULT_CERT.to_string());
+        let complete = key_present(&key) && exists(&cert);
+        return Some(SigningPair { key, cert, complete });
+    }
+    SIGNING_KEY_PATHS
+        .iter()
+        .find(|(key, cert)| exists(key) && exists(cert))
+        .map(|(key, cert)| SigningPair {
+            key: key.to_string(),
+            cert: cert.to_string(),
+            complete: true,
+        })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum SigningKeyState {
-    /// No module-signing certificate exists yet.
+    /// No module-signing key pair exists yet.
     NoKey,
+    /// The DKMS config names a key pair that is (partly) missing: (key, cert).
+    Incomplete(String, String),
     /// The certificate (path) exists but is not enrolled.
     NotEnrolled(String),
     /// The certificate is queued with `mokutil --import`; MOK Manager
@@ -317,7 +451,7 @@ impl SigningKeyState {
         match self {
             Self::NotEnrolled(p) | Self::PendingEnrollment(p) | Self::Enrolled(p)
             | Self::Untested(p) => Some(p),
-            Self::NoKey | Self::Unknown => None,
+            Self::NoKey | Self::Incomplete(..) | Self::Unknown => None,
         }
     }
 
@@ -420,6 +554,9 @@ pub fn parse_module_signer(modinfo_succeeded: bool, output: &str) -> ModuleSigna
 pub fn signing_summary(key: &SigningKeyState, module: &ModuleSignature) -> String {
     let key_text = match key {
         SigningKeyState::NoKey => "No signing key yet".to_string(),
+        SigningKeyState::Incomplete(k, c) => {
+            format!("The DKMS config names key {k} and certificate {c}, but they don't both exist")
+        }
         SigningKeyState::NotEnrolled(p) => format!("Key {p} is not enrolled"),
         SigningKeyState::PendingEnrollment(p) => {
             format!("Key {p} is queued; enroll it at the MOK Manager screen on the next reboot")
@@ -455,12 +592,33 @@ pub fn validate_mok_password(first: &str, second: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Warning text for the pre-install checks. `None` means nothing to warn about.
-pub fn secure_boot_advice(sb: &SecureBootStatus, key: &SigningKeyState) -> Option<String> {
+/// Warning text for the pre-install checks. `None` means nothing to warn
+/// about. `pair` is the key the install would sign with and `use_dkms` the
+/// DKMS option: DKMS signs with any key, NVIDIA's installer (no DKMS) can't
+/// use a PKCS#11 one, so then the module stays unsigned.
+pub fn secure_boot_advice(
+    sb: &SecureBootStatus,
+    key: &SigningKeyState,
+    pair: Option<&SigningPair>,
+    use_dkms: bool,
+) -> Option<String> {
     if *sb != SecureBootStatus::Enabled {
         return None;
     }
+    let unsignable = !use_dkms && pair.is_some_and(SigningPair::is_pkcs11);
+    if unsignable && key.cert_path().is_some() {
+        return Some(
+            "Enabled. The module-signing key is on a PKCS#11 token, which NVIDIA's installer \
+             can't sign with, so without DKMS the new module will be unsigned and won't load. \
+             Turn on DKMS to have it signed."
+                .to_string(),
+        );
+    }
     Some(match key {
+        SigningKeyState::Enrolled(_) if use_dkms => {
+            "Enabled. The module-signing key is enrolled; DKMS signs the new module with it."
+                .to_string()
+        }
         SigningKeyState::Enrolled(_) => {
             "Enabled. The module-signing key is enrolled; the new module is signed with it."
                 .to_string()
@@ -477,6 +635,11 @@ pub fn secure_boot_advice(sb: &SecureBootStatus, key: &SigningKeyState) -> Optio
         SigningKeyState::Untested(path) => format!(
             "Enabled. Could not check whether the module-signing key {path} is enrolled. \
              Set Up Signing on the System tab enrolls it."
+        ),
+        SigningKeyState::Incomplete(k, c) => format!(
+            "Enabled, and the DKMS config names signing key {k} and certificate {c}, which \
+             don't both exist, so the new module will be unsigned. Fix the DKMS config, or use \
+             Set Up Signing on the System tab to create the key there."
         ),
         SigningKeyState::NoKey | SigningKeyState::Unknown => {
             "Enabled, and this machine has no module-signing key, so the new module will be \
@@ -575,6 +738,7 @@ mod tests {
         assert!(!is_driver_package("nvidia-container-toolkit-base"));
         assert!(!is_driver_package("libnvidia-container1"));
         assert!(!is_driver_package("libnvidia-container-tools"));
+        assert!(!is_driver_package("nvidia-container-runtime"));
         assert!(!is_driver_package("libcuda1"));
         assert!(!is_driver_package("green-light"));
     }
@@ -582,10 +746,15 @@ mod tests {
     #[test]
     fn dpkg_output_parsing() {
         let text = "ii |nvidia-driver-595\nrc |nvidia-dkms-570\nii |nvidia-container-toolkit\n\
-                    ii |libnvidia-gl-595\nii |nvidia-driver-595\nii |bash\n";
+                    ii |libnvidia-gl-595\nii |nvidia-driver-595\nii |bash\nhi |nvidia-utils-595\n\
+                    un |nvidia-kernel-dkms\n";
         assert_eq!(
             parse_dpkg_installed(text),
-            vec!["libnvidia-gl-595".to_string(), "nvidia-driver-595".to_string()]
+            vec![
+                "libnvidia-gl-595".to_string(),
+                "nvidia-driver-595".to_string(),
+                "nvidia-utils-595".to_string(),
+            ]
         );
         assert!(parse_dpkg_installed("").is_empty());
     }
@@ -631,17 +800,20 @@ mod tests {
         let on = SecureBootStatus::Enabled;
         let none = SigningKeyState::NoKey;
         let path = "/var/lib/shim-signed/mok/MOK.der".to_string();
-        assert_eq!(secure_boot_advice(&SecureBootStatus::Disabled, &none), None);
-        assert_eq!(secure_boot_advice(&SecureBootStatus::Unknown, &none), None);
-        let enrolled = secure_boot_advice(&on, &SigningKeyState::Enrolled(path.clone())).unwrap();
+        assert_eq!(secure_boot_advice(&SecureBootStatus::Disabled, &none, None, true), None);
+        assert_eq!(secure_boot_advice(&SecureBootStatus::Unknown, &none, None, false), None);
+        let adv = |sb: &SecureBootStatus, key: &SigningKeyState| secure_boot_advice(sb, key, None, true);
+        assert_eq!(adv(&SecureBootStatus::Disabled, &none), None);
+        let enrolled = adv(&on, &SigningKeyState::Enrolled(path.clone())).unwrap();
         assert!(enrolled.contains("is enrolled"));
-        let pending =
-            secure_boot_advice(&on, &SigningKeyState::PendingEnrollment(path.clone())).unwrap();
+        let pending = adv(&on, &SigningKeyState::PendingEnrollment(path.clone())).unwrap();
         assert!(pending.contains("MOK Manager"));
-        let not = secure_boot_advice(&on, &SigningKeyState::NotEnrolled(path.clone())).unwrap();
+        let not = adv(&on, &SigningKeyState::NotEnrolled(path.clone())).unwrap();
         assert!(not.contains(&path) && not.contains("Set Up Signing"));
-        let no_key = secure_boot_advice(&on, &none).unwrap();
+        let no_key = adv(&on, &none).unwrap();
         assert!(no_key.contains("Set Up Signing"));
+        let half = adv(&on, &SigningKeyState::Incomplete("/k".into(), "/c".into())).unwrap();
+        assert!(half.contains("unsigned") && half.contains("/k"));
         // Never send the user to run mokutil by hand, or into firmware settings.
         let all = [
             SigningKeyState::NoKey,
@@ -650,12 +822,34 @@ mod tests {
             SigningKeyState::PendingEnrollment(path.clone()),
             SigningKeyState::Enrolled(path.clone()),
             SigningKeyState::Untested(path),
+            SigningKeyState::Incomplete("/k".into(), "/c".into()),
         ];
         for key in all {
-            let text = secure_boot_advice(&on, &key).unwrap();
-            assert!(!text.contains("mokutil"), "{text}");
-            assert!(!text.to_lowercase().contains("disable"), "{text}");
+            for dkms in [true, false] {
+                let text = secure_boot_advice(&on, &key, None, dkms).unwrap();
+                assert!(!text.contains("mokutil"), "{text}");
+                assert!(!text.to_lowercase().contains("disable"), "{text}");
+            }
         }
+    }
+
+    #[test]
+    fn pkcs11_key_needs_dkms() {
+        let on = SecureBootStatus::Enabled;
+        let enrolled = SigningKeyState::Enrolled("/c.der".into());
+        let token = SigningPair {
+            key: "pkcs11:token=mok".into(),
+            cert: "/c.der".into(),
+            complete: true,
+        };
+        let file = SigningPair { key: "/k.priv".into(), ..token.clone() };
+        let without = secure_boot_advice(&on, &enrolled, Some(&token), false).unwrap();
+        assert!(without.contains("PKCS#11") && without.contains("Turn on DKMS"), "{without}");
+        assert!(!without.contains("signed with it"));
+        let with = secure_boot_advice(&on, &enrolled, Some(&token), true).unwrap();
+        assert!(with.contains("DKMS signs"), "{with}");
+        let plain = secure_boot_advice(&on, &enrolled, Some(&file), false).unwrap();
+        assert!(plain.contains("signed with it"), "{plain}");
     }
 
     #[test]
@@ -690,20 +884,121 @@ mod tests {
     }
 
     #[test]
-    fn cert_candidate_order() {
-        let defaults = signing_cert_candidates(&DkmsSigningConfig::default());
+    fn signing_pair_resolution() {
+        let none = DkmsSigningConfig::default();
+        let files = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        assert_eq!(resolve_signing_pair(&none, files(&[])), None);
+        // A certificate without its key is not a pair: the next complete pair wins.
+        let p = resolve_signing_pair(
+            &none,
+            files(&["/var/lib/shim-signed/mok/MOK.der", DKMS_DEFAULT_KEY, DKMS_DEFAULT_CERT]),
+        )
+        .unwrap();
+        assert_eq!((p.key.as_str(), p.cert.as_str(), p.complete), (DKMS_DEFAULT_KEY, DKMS_DEFAULT_CERT, true));
         assert_eq!(
-            defaults,
-            vec![
-                "/var/lib/shim-signed/mok/MOK.der".to_string(),
-                "/var/lib/dkms/mok.pub".to_string(),
-                "/etc/pki/akmods/certs/public_key.der".to_string(),
-            ]
+            resolve_signing_pair(&none, files(&["/var/lib/shim-signed/mok/MOK.der"])),
+            None
         );
+        let p = resolve_signing_pair(
+            &none,
+            files(&["/var/lib/shim-signed/mok/MOK.priv", "/var/lib/shim-signed/mok/MOK.der"]),
+        )
+        .unwrap();
+        assert_eq!(p.cert, "/var/lib/shim-signed/mok/MOK.der");
+
+        // The DKMS config's pair is used as named, defaults filling a missing half.
         let cfg = DkmsSigningConfig { key: None, cert: Some("/c.der".into()) };
-        assert_eq!(signing_cert_candidates(&cfg), vec!["/c.der".to_string()]);
-        let key_only = DkmsSigningConfig { key: Some("/k".into()), cert: None };
-        assert_eq!(signing_cert_candidates(&key_only), vec![DKMS_DEFAULT_CERT.to_string()]);
+        let p = resolve_signing_pair(&cfg, files(&["/c.der", DKMS_DEFAULT_KEY])).unwrap();
+        assert_eq!((p.key.as_str(), p.cert.as_str(), p.complete), (DKMS_DEFAULT_KEY, "/c.der", true));
+        let p = resolve_signing_pair(&cfg, files(&["/c.der"])).unwrap();
+        assert!(!p.complete);
+        let token = DkmsSigningConfig { key: Some("pkcs11:token=x".into()), cert: Some("/c.der".into()) };
+        let p = resolve_signing_pair(&token, files(&["/c.der"])).unwrap();
+        assert!(p.complete && p.is_pkcs11());
+    }
+
+    #[test]
+    fn private_group_rules() {
+        let passwd = "root:x:0:0::/root:/bin/bash\nalex:x:1000:1000::/home/alex:/bin/bash\n\
+                      bob:x:1001:1001::/home/bob:/bin/bash\n";
+        assert!(group_is_owners_private_group(1000, 1000, passwd, Some("alex:x:1000:")));
+        assert!(group_is_owners_private_group(1000, 1000, passwd, Some("alex:x:1000:alex\n")));
+        assert!(!group_is_owners_private_group(1000, 1000, passwd, Some("alex:x:1000:bob")));
+        assert!(!group_is_owners_private_group(100, 1000, passwd, Some("users:x:100:")));
+        assert!(!group_is_owners_private_group(1000, 1000, passwd, None));
+        let shared = format!("{passwd}carol:x:1002:1000::/home/carol:/bin/bash\n");
+        assert!(!group_is_owners_private_group(1000, 1000, &shared, Some("alex:x:1000:")));
+    }
+
+    #[test]
+    fn run_file_rules() {
+        let passwd = "alex:x:1000:1000::/home/alex:/bin/bash\n";
+        let group = Some("alex:x:1000:");
+        let f = |mode, uid, gid| FileFacts { mode, uid, gid };
+        let p = "/home/alex/Downloads/NVIDIA-Linux-x86_64-595.84.run";
+        assert_eq!(run_file_problem(p, f(0o100644, 1000, 1000), 1000, passwd, group), None);
+        assert_eq!(run_file_problem(p, f(0o100664, 1000, 1000), 1000, passwd, group), None);
+        assert_eq!(run_file_problem(p, f(0o100644, 0, 0), 1000, passwd, None), None);
+        assert!(run_file_problem(p, f(0o100664, 1000, 1000), 1000, passwd, Some("alex:x:1000:bob"))
+            .unwrap()
+            .contains("other members of its group"));
+        assert!(run_file_problem(p, f(0o100646, 1000, 1000), 1000, passwd, group)
+            .unwrap()
+            .contains("every user (mode 646)"));
+        assert!(run_file_problem(p, f(0o100644, 1001, 1001), 1000, passwd, group)
+            .unwrap()
+            .contains("another user"));
+        assert!(run_file_problem("relative.run", f(0o644, 1000, 1000), 1000, passwd, group).is_some());
+        assert!(run_file_problem("/x/driver.bin", f(0o644, 1000, 1000), 1000, passwd, group).is_some());
+    }
+
+    /// The bash array `NAME=('a' 'b' ...)` from the install script.
+    fn script_array(name: &str) -> Vec<String> {
+        let script = include_str!("../scripts/privileged-install.sh");
+        let head = format!("\n{name}=(");
+        let start = script
+            .find(&head)
+            .unwrap_or_else(|| panic!("{name} not found in the install script"))
+            + head.len();
+        let inner = &script[start..start + script[start..].find(')').unwrap()];
+        inner
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| c == '\'' || c == '"').to_string())
+            .collect()
+    }
+
+    fn script_value(name: &str) -> String {
+        let script = include_str!("../scripts/privileged-install.sh");
+        let line = script
+            .lines()
+            .find(|l| l.starts_with(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name} not found in the install script"));
+        line.split_once('=').unwrap().1.trim_matches(|c| c == '\'' || c == '"').to_string()
+    }
+
+    #[test]
+    fn install_script_agrees() {
+        assert_eq!(script_array("DEB_DRIVER_GLOBS"), DEB_DRIVER_GLOBS);
+        assert_eq!(script_array("RPM_DRIVER_GLOBS"), RPM_DRIVER_GLOBS);
+        assert_eq!(script_value("NOT_DRIVER_RE"), "^(nvidia-container|libnvidia-container)");
+        assert_eq!(script_value("APT_BLOCK_FILE"), APT_BLOCK_FILE);
+        let dnf = format!("{}/{}", script_value("DNF_BLOCK_DIR"), "90-green-light-nvidia.conf");
+        assert_eq!(dnf, DNF_BLOCK_FILE);
+        assert_eq!(script_value("DNF_BLOCK_FILE"), "$DNF_BLOCK_DIR/90-green-light-nvidia.conf");
+        let pairs: Vec<(String, String)> = script_array("SIGNING_KEY_PAIRS")
+            .iter()
+            .map(|p| {
+                let p = p.replace("$DKMS_DEFAULT_KEY", DKMS_DEFAULT_KEY)
+                    .replace("$DKMS_DEFAULT_CERT", DKMS_DEFAULT_CERT);
+                let (k, c) = p.split_once('|').unwrap();
+                (k.to_string(), c.to_string())
+            })
+            .collect();
+        let ours: Vec<(String, String)> =
+            SIGNING_KEY_PATHS.iter().map(|(k, c)| (k.to_string(), c.to_string())).collect();
+        assert_eq!(pairs, ours);
+        assert_eq!(script_value("DKMS_DEFAULT_KEY"), DKMS_DEFAULT_KEY);
+        assert_eq!(script_value("DKMS_DEFAULT_CERT"), DKMS_DEFAULT_CERT);
     }
 
     #[test]

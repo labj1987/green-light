@@ -1,17 +1,19 @@
-use crate::preflight::ModuleChoice;
+use crate::preflight::{run_file_problem, FileFacts, ModuleChoice};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-const INSTALL_LOG: &str = "/var/log/green-light.log";
 const PRIVILEGED_SCRIPT: &str = "/usr/lib/green-light/privileged-install.sh";
-const RUN_START_MARKER: &str = "==== NVIDIA driver install started";
+const INSTALL_LOG: &str = "/var/log/green-light.log";
 
 pub struct InstallOptions {
     pub use_dkms: bool,
-    pub hold_packages: bool,
+    /// Keep the package manager from installing the distro's driver over
+    /// this one (`--block-distro-driver`); off removes an earlier block.
+    pub block_distro_driver: bool,
     pub module: ModuleChoice,
     pub run_file: String,
     /// SHA256 (hex) of the run file. When the checksum came from NVIDIA it is
@@ -37,21 +39,142 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Invoke the privileged install script via pkexec and wait for it.
+fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(cmd).args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Refuse, before the password prompt, a .run file the install script would
+/// refuse: a symlink, not a regular file, or changeable by anyone but its
+/// owner (see `run_file_problem`).
+pub fn check_run_file(path: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("Run file not found: {path}"))?;
+    if meta.file_type().is_symlink() {
+        bail!("{path} is a symbolic link; open the file it points to instead.");
+    }
+    if !meta.is_file() {
+        bail!("{path} is not a regular file.");
+    }
+    // The owner of /proc/self is this process's effective uid.
+    let caller = std::fs::metadata("/proc/self").map(|m| m.uid()).context("Could not read /proc/self")?;
+    let facts = FileFacts { mode: meta.mode(), uid: meta.uid(), gid: meta.gid() };
+    let passwd = command_stdout("getent", &["passwd"]).unwrap_or_default();
+    let group = command_stdout("getent", &["group", &facts.gid.to_string()]);
+    match run_file_problem(path, facts, caller, &passwd, group.as_deref()) {
+        Some(problem) => bail!("{problem}"),
+        None => Ok(()),
+    }
+}
+
+/// What a privileged run printed, and how it ended.
+struct ScriptRun {
+    code: Option<i32>,
+    lines: Vec<String>,
+}
+
+/// Run `pkexec <args>`, handing each output line (stdout and stderr, with the
+/// script's "[green-light] " prefix removed) to `on_line` as it arrives.
+fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
+    let mut child = Command::new("pkexec")
+        .args(args)
+        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("Failed to launch pkexec — is polkit installed?")?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        // A write error means the script already exited (e.g. cancelled
+        // authentication); its exit code says why.
+        let _ = writeln!(pipe, "{text}");
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let readers: Vec<_> = [
+        child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+        child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|pipe| {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })
+    })
+    .collect();
+    drop(tx);
+
+    let mut lines = Vec::new();
+    for line in rx {
+        let line = line.strip_prefix("[green-light] ").unwrap_or(&line).to_string();
+        if line.trim().is_empty() {
+            continue;
+        }
+        on_line(&line);
+        lines.push(line);
+    }
+    for r in readers {
+        let _ = r.join();
+    }
+    let status = child.wait().context("Waiting for pkexec failed")?;
+    Ok(ScriptRun { code: status.code(), lines })
+}
+
+/// The first "ERROR:" message of a run, if any: the cause (later ones are
+/// about putting things back).
+fn first_error(lines: &[String]) -> Option<&str> {
+    lines.iter().find_map(|l| l.strip_prefix("ERROR: ")).map(str::trim)
+}
+
+/// What a failed install run means, from the script's exit code (see EXIT
+/// CODES in privileged-install.sh) and pkexec's own 126/127, which the
+/// script never uses.
+fn install_failure(code: Option<i32>, lines: &[String]) -> String {
+    let detail = first_error(lines).map(|e| format!(": {e}")).unwrap_or_default();
+    match code {
+        Some(126) => "Authentication was cancelled; nothing was changed.".to_string(),
+        Some(127) => {
+            "Not authorized, or pkexec could not start the install script; nothing was changed."
+                .to_string()
+        }
+        Some(1) => format!("The install stopped before changing anything{detail}"),
+        Some(2) => format!("The install script refused to start{detail}"),
+        Some(3) => format!(
+            "The install failed{detail}. Everything it had changed was put back, so the next \
+             boot uses the driver this computer had before."
+        ),
+        Some(4) => format!(
+            "The install failed{detail}, and putting the previous driver back failed too. \
+             Don't reboot until a working driver is installed; the Log tab has the details."
+        ),
+        Some(5) => format!(
+            "The driver is installed, but rebuilding the initramfs failed{detail}. Rebuild it \
+             before rebooting; the Log tab has the command."
+        ),
+        Some(c) => format!("The install script exited with code {c}{detail} (see {INSTALL_LOG})"),
+        None => "The install script was killed before it finished.".to_string(),
+    }
+}
+
+/// Invoke the privileged install script via pkexec and wait for it,
+/// passing every line it prints to `on_line` as it runs.
 ///
 /// The install is repo-style: the new driver goes on disk while the
 /// current one keeps running, and the switch happens at the next
 /// reboot. Nothing touches the live session, so a plain blocking call
 /// is safe — the GUI stays up the whole time.
-pub fn run_privileged_install(opts: &InstallOptions) -> Result<()> {
+pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&str)) -> Result<()> {
     let script = PRIVILEGED_SCRIPT;
 
     if !Path::new(script).exists() {
         bail!("Privileged install script not found at {}", script);
     }
-    if !Path::new(&opts.run_file).exists() {
-        bail!("Run file not found: {}", opts.run_file);
-    }
+    check_run_file(&opts.run_file)?;
 
     let sha256 = match &opts.sha256 {
         Some(h) => h.clone(),
@@ -62,30 +185,18 @@ pub fn run_privileged_install(opts: &InstallOptions) -> Result<()> {
     if opts.use_dkms {
         args.push("--dkms".to_string());
     }
-    if opts.hold_packages {
-        args.push("--hold".to_string());
+    if opts.block_distro_driver {
+        args.push("--block-distro-driver".to_string());
     }
     if let Some(arg) = opts.module.installer_arg() {
         args.push(arg.to_string());
     }
 
-    let status = Command::new("pkexec")
-        .args(&args)
-        .status()
-        .context("Failed to launch pkexec — is polkit installed?")?;
-
-    if !status.success() {
-        let code = status.code().unwrap_or(-1);
-        if code == 126 || code == 127 {
-            bail!("Authentication was cancelled.");
-        }
-        bail!(
-            "Install script exited with code {} (see /var/log/green-light.log)",
-            code
-        );
+    let run = run_pkexec(&args, None, &mut on_line)?;
+    if run.code == Some(0) {
+        return Ok(());
     }
-
-    Ok(())
+    bail!("{}", install_failure(run.code, &run.lines))
 }
 
 /// Result of `--setup-signing`: whether it succeeded and the script's
@@ -107,101 +218,89 @@ pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
             PRIVILEGED_SCRIPT
         ));
     }
-
-    let child = Command::new("pkexec")
-        .args([PRIVILEGED_SCRIPT, "--setup-signing"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
-        Ok(c) => c,
-        Err(e) => {
-            return fail(anyhow::Error::new(e).context("Failed to launch pkexec — is polkit installed?"))
-        }
+    let args = [PRIVILEGED_SCRIPT.to_string(), "--setup-signing".to_string()];
+    let run = match run_pkexec(&args, Some(password), &mut |_| {}) {
+        Ok(r) => r,
+        Err(e) => return fail(e),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        // A write error means the script already exited (e.g. cancelled
-        // authentication); its exit code below says why.
-        let _ = writeln!(stdin, "{password}");
-    }
-    let out = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(e) => return fail(anyhow::Error::new(e).context("Waiting for pkexec failed")),
+    let result = match run.code {
+        Some(0) => Ok(()),
+        Some(126) => Err(anyhow::anyhow!("Authentication was cancelled.")),
+        Some(127) => Err(anyhow::anyhow!("Not authorized, or pkexec could not start the script.")),
+        code => Err(anyhow::anyhow!(
+            "Signing setup failed{}",
+            first_error(&run.lines)
+                .map(|e| format!(": {e}"))
+                .unwrap_or_else(|| format!(" (exit code {code:?}; see {INSTALL_LOG})"))
+        )),
     };
-
-    let lines: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .chain(String::from_utf8_lossy(&out.stderr).lines())
-        .map(|l| l.strip_prefix("[green-light] ").unwrap_or(l).to_string())
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-
-    let result = if out.status.success() {
-        Ok(())
-    } else {
-        match out.status.code().unwrap_or(-1) {
-            126 | 127 => Err(anyhow::anyhow!("Authentication was cancelled.")),
-            code => Err(anyhow::anyhow!(
-                "Signing setup exited with code {} (see /var/log/green-light.log)",
-                code
-            )),
-        }
-    };
-    SetupOutcome { result, lines }
-}
-
-/// Lines of the most recent install run in the log that carry its post-install
-/// verification results, warnings, errors, and DKMS build-log excerpts.
-pub fn install_report() -> Vec<String> {
-    std::fs::read_to_string(INSTALL_LOG)
-        .map(|t| extract_report_lines(&t))
-        .unwrap_or_default()
-}
-
-fn extract_report_lines(log: &str) -> Vec<String> {
-    let lines: Vec<&str> = log.lines().collect();
-    let Some(start) = lines.iter().rposition(|l| l.contains(RUN_START_MARKER)) else {
-        return vec![];
-    };
-    lines[start..]
-        .iter()
-        .filter(|l| {
-            l.contains("Verify:") || l.contains("WARNING") || l.contains("ERROR")
-                || l.contains("Build log:")
-        })
-        .map(|l| match l.split_once("[green-light] ") {
-            Some((_, msg)) => msg.to_string(),
-            None => l.to_string(),
-        })
-        .collect()
+    SetupOutcome { result, lines: run.lines }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn report_uses_only_the_last_run() {
-        let log = "2026-10-01 10:00:00 [green-light] ==== NVIDIA driver install started ====\n\
-                   2026-10-01 10:00:01 [green-light] Verify: old run\n\
-                   2026-10-02 09:00:00 [green-light] ==== NVIDIA driver install started ====\n\
-                   2026-10-02 09:00:01 [green-light] Running the NVIDIA installer\n\
-                   2026-10-02 09:00:09 [green-light] Verify: nouveau blacklist present\n\
-                   2026-10-02 09:00:10 [green-light] Verify: WARNING initramfs check failed\n\
-                   2026-10-02 09:00:11 [green-light] ==== Done. ====\n";
-        assert_eq!(
-            extract_report_lines(log),
-            vec![
-                "Verify: nouveau blacklist present".to_string(),
-                "Verify: WARNING initramfs check failed".to_string(),
-            ]
-        );
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
 
     #[test]
-    fn report_empty_without_marker() {
-        assert!(extract_report_lines("nothing here\n").is_empty());
-        assert!(extract_report_lines("").is_empty());
+    fn pkexec_codes_are_not_script_failures() {
+        let out = lines(&["ERROR: something"]);
+        assert!(install_failure(Some(126), &out).contains("cancelled"));
+        assert!(install_failure(Some(127), &out).contains("Not authorized"));
+        for code in [1, 2, 3, 4, 5, 9] {
+            let msg = install_failure(Some(code), &out);
+            assert!(!msg.contains("cancelled") && !msg.contains("Not authorized"), "{code}: {msg}");
+        }
+    }
+
+    #[test]
+    fn failure_messages_carry_the_reason() {
+        let out = lines(&[
+            "==== NVIDIA driver install started ====",
+            "ERROR: /home/a/x.run can be changed by other members of group 100 (mode 664) — refusing.",
+        ]);
+        let msg = install_failure(Some(2), &out);
+        assert!(msg.contains("refused") && msg.contains("other members of group 100"), "{msg}");
+        let out = lines(&[
+            "ERROR: NVIDIA installer exited with code 1",
+            "See /var/log/nvidia-installer.log for details.",
+            "Restoring the previous driver setup…",
+        ]);
+        let msg = install_failure(Some(3), &out);
+        assert!(msg.contains("NVIDIA installer exited with code 1"), "{msg}");
+        assert!(msg.contains("driver this computer had before"), "{msg}");
+        assert!(install_failure(Some(4), &out).contains("Don't reboot"));
+        assert!(install_failure(Some(1), &[]).ends_with("before changing anything"));
+        assert!(install_failure(None, &[]).contains("killed"));
+    }
+
+    #[test]
+    fn first_error_is_the_cause() {
+        let out = lines(&["ok", "ERROR: first  ", "ERROR: second", "Verify: fine"]);
+        assert_eq!(first_error(&out), Some("first"));
+        assert_eq!(first_error(&lines(&["WARNING: x"])), None);
+    }
+
+    #[test]
+    fn run_file_checks_on_real_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("green-light-runfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("NVIDIA-Linux-x86_64-1.0.run");
+        std::fs::write(&file, b"x").unwrap();
+        let path = file.to_str().unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        check_run_file(path).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o646)).unwrap();
+        assert!(check_run_file(path).unwrap_err().to_string().contains("every user"));
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let link = dir.join("link.run");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(check_run_file(link.to_str().unwrap()).unwrap_err().to_string().contains("symbolic link"));
+        assert!(check_run_file(dir.join("missing.run").to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
