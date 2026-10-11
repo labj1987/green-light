@@ -2,6 +2,8 @@ mod download;
 mod install;
 mod preflight;
 mod system;
+#[cfg(test)]
+mod test_http;
 mod ui;
 mod versions;
 
