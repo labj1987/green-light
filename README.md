@@ -57,7 +57,7 @@ The first launch asks for your password once so it can place the install helper 
 
 1. The System tab shows your hardware and current driver state.
 2. On the Browse tab, pick a version and hit Download, or use Open .run File if you already have one.
-3. On the Configure tab, leave DKMS on, optionally enable the apt hold, and hit Install Driver.
+3. On the Configure tab, leave DKMS on, optionally turn on Block Distro Driver Packages, and hit Install Driver.
 4. Enter your password and wait a few minutes while the kernel module builds. The desktop stays up the whole time.
 5. Reboot whenever it suits you. The System tab shows Reboot Required: Yes until you do.
 
@@ -75,15 +75,20 @@ The GUI is optional. The install script is standalone bash and works the same on
 
 ```bash
 wget https://download.nvidia.com/XFree86/Linux-x86_64/595.84/NVIDIA-Linux-x86_64-595.84.run
-sudo ./privileged-install.sh ./NVIDIA-Linux-x86_64-595.84.run --dkms
+wget https://download.nvidia.com/XFree86/Linux-x86_64/595.84/NVIDIA-Linux-x86_64-595.84.run.sha256sum
+sha256sum -c NVIDIA-Linux-x86_64-595.84.run.sha256sum
+sudo ./privileged-install.sh "$PWD/NVIDIA-Linux-x86_64-595.84.run" \
+    "$(cut -d' ' -f1 NVIDIA-Linux-x86_64-595.84.run.sha256sum)" --dkms
 ```
+
+The first two arguments are the absolute path of the `.run` file and its SHA256; the script verifies its own private copy against that hash before running anything. The file must not be writable by other users.
 
 Flags:
 
 | Flag | Effect |
 |---|---|
 | `--dkms` | Register the module with DKMS (recommended) |
-| `--hold` | Pin the driver at its current version — `apt-mark hold` on apt, `dnf versionlock` on Fedora (needs `python3-dnf-plugin-versionlock` installed) |
+| `--block-distro-driver` | Keep the package manager from installing the distribution's NVIDIA driver packages over this driver later: an apt pin on apt, an `excludepkgs` drop-in on dnf5 (not available with dnf4). An install without it removes the block |
 | `--kernel-module-type=open\|proprietary` | Pick the kernel module flavor. Without it, NVIDIA's installer chooses from the detected GPUs (open for Turing and newer) |
 
 Reboot afterward to switch drivers, same as the GUI flow.
@@ -101,7 +106,7 @@ Two files tell you everything:
 - `/var/log/green-light.log` is written by this app's install script, step by step
 - `/var/log/nvidia-installer.log` is NVIDIA's own installer log
 
-If an install fails, the reason is in one of those. The most common cause is missing kernel headers for a brand new kernel, which resolves once your distro publishes them.
+If an install fails, the reason is in one of those, and the Log tab shows the script's output as it runs. The most common cause is missing kernel headers for a brand new kernel, which resolves once your distro publishes them; the script checks for headers and a compiler before it removes anything, and stops without changes if they're missing. If NVIDIA's installer fails after the distro driver packages were removed, the script puts them back (along with the boot configuration and the initramfs), so the next boot uses the driver you had before.
 
 ## Uninstalling
 
@@ -116,6 +121,7 @@ To remove this app, delete the AppImage and optionally the helper files it insta
 ```bash
 sudo rm -rf /usr/lib/green-light
 sudo rm /usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy
+sudo rm -f /etc/apt/preferences.d/green-light-nvidia /etc/dnf/libdnf5.conf.d/90-green-light-nvidia.conf
 ```
 
 ## Building from source
@@ -130,7 +136,7 @@ The output lands in the project directory. `Cargo.lock` is committed, so builds 
 
 ## How the install actually works
 
-The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers and DKMS are present, clears any conflicting distro driver packages, blacklists nouveau, signs the module with your machine's signing key if it has one, and rebuilds the initramfs afterward. All plain bash, all readable.
+The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers, a compiler and DKMS are present (and stops if they aren't), clears any conflicting distro driver packages, blacklists nouveau, signs the module with your machine's signing key if it has one, and rebuilds the initramfs afterward. All plain bash, all readable.
 
 ## Acknowledgements
 
