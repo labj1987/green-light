@@ -26,6 +26,18 @@ DST_POLICY="/usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy"
 
 die() { echo "green-light-setup: $*" >&2; exit 1; }
 
+# pkexec exits 126 for a dismissed password prompt and 127 for a failed
+# authorization, and AppRun reports those as such; never exit with either
+# (a missing command under set -e would), so a failure here reads as one.
+WORK=""
+on_exit() {
+    local rc=$?
+    if [[ -n "$WORK" ]]; then rm -rf "$WORK"; fi
+    if [[ $rc -eq 126 || $rc -eq 127 ]]; then rc=1; fi
+    exit "$rc"
+}
+trap on_exit EXIT
+
 STAGE="${1:-}"
 [[ -n "$STAGE" && -d "$STAGE" ]] || die "usage: green-light-setup <stage-dir>"
 [[ "$BAKED_SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ && "$BAKED_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
@@ -33,7 +45,6 @@ STAGE="${1:-}"
 
 WORK="$(mktemp -d /var/tmp/green-light-setup.XXXXXX)"
 chmod 700 "$WORK"
-trap 'rm -rf "$WORK"' EXIT
 
 for f in privileged-install.sh policy; do
     [[ -f "$STAGE/$f" && ! -L "$STAGE/$f" ]] || die "missing or invalid staged file: $f"

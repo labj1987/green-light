@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # build-appimage.sh — build the Green Light AppImage.
 # Run from the repo root on Ubuntu (the GitHub Actions runner), as an ordinary user: it writes
-# only inside the checkout. Only its from-scratch dependency install below needs root.
+# only inside the checkout, and never changes tracked files. Only its from-scratch dependency
+# install below needs root, which it gets through sudo.
 set -euo pipefail
 
 APP="green-light"
@@ -14,15 +15,17 @@ APPDIR="$BUILD_DIR/AppDir"
 echo "==> Building $APP $VERSION AppImage"
 
 # ── Build dependencies ────────────────────────────────────────────────
-# Only on a machine with no toolchain (this block needs root). In CI the workflow
-# installs the GTK headers and the packaging tools itself, so the guard is false
-# there and nothing below is installed.
+# Only on a machine with no toolchain (this block needs root, through sudo when the
+# script runs as an ordinary user). In CI the workflow installs the GTK headers and the
+# packaging tools itself, so the guard is false there and nothing below is installed.
 if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null; then
     echo "==> Installing build dependencies"
+    AS_ROOT=()
+    if [[ $EUID -ne 0 ]]; then AS_ROOT=(sudo); fi
     # Tolerate an unrelated third-party repo failing to refresh: apt falls back
     # to its cached index for it. Only the install failing should be fatal.
-    apt-get update -qq || true
-    apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
+    "${AS_ROOT[@]}" apt-get update -qq || true
+    "${AS_ROOT[@]}" apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
         pkg-config zsync wget file desktop-file-utils
 fi
 
@@ -43,7 +46,7 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/polkit-1/actions" \
          "$APPDIR/usr/share/metainfo"
 
-cp "target/release/$APP"                    "$APPDIR/usr/bin/"
+cp "${CARGO_TARGET_DIR:-target}/release/$APP" "$APPDIR/usr/bin/"
 cp scripts/privileged-install.sh            "$APPDIR/usr/lib/$APP/"
 chmod 755 "$APPDIR/usr/lib/$APP/privileged-install.sh"
 
@@ -59,10 +62,11 @@ chmod 755 "$APPDIR/usr/lib/$APP/green-light-setup"
 cp data/$APP.desktop                        "$APPDIR/usr/share/applications/"
 cp data/$APP-256.png                        "$APPDIR/usr/share/icons/hicolor/256x256/apps/$APP.png"
 cp data/io.github.labj1987.GreenLight.policy       "$APPDIR/usr/share/polkit-1/actions/"
-# The <releases> list is generated from CHANGELOG.md's version headings, and fails the
-# build if the newest one is not this Cargo.toml version.
-python3 scripts/sync_appdata_releases.py
-cp data/io.github.labj1987.GreenLight.appdata.xml  "$APPDIR/usr/share/metainfo/"
+# The <releases> list is generated from CHANGELOG.md's version headings straight into the
+# AppDir (the tracked copy is left alone; CI checks that it is in step), and fails the build
+# if the newest one is not this Cargo.toml version.
+python3 scripts/sync_appdata_releases.py \
+    --output "$APPDIR/usr/share/metainfo/io.github.labj1987.GreenLight.appdata.xml"
 
 # Top-level AppImage requirements
 cp data/$APP.desktop "$APPDIR/"
@@ -78,7 +82,8 @@ desktop-file-validate "$APPDIR/$APP.desktop"
 # hashes baked into it at build time, so an installed helper can only
 # reinstall the files of its own build (restoring deleted or altered ones,
 # under its own polkit action). For a new build, or the very first run,
-# pkexec runs the staged helper directly; its prompt names the program.
+# pkexec runs the staged helper through bash (the stage directory is in /tmp,
+# which may be mounted noexec); the prompt names the helper's path.
 cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
@@ -112,16 +117,19 @@ if [[ $needs_install -eq 1 ]]; then
         && pkaction --action-id "$SETUP_ACTION" >/dev/null 2>&1; then
         pkexec "$DST_HELPER" "$STAGE" || rc=$?
     else
-        pkexec "$STAGE/green-light-setup" "$STAGE" || rc=$?
+        # $BASH: this script's own interpreter, as the absolute path pkexec needs.
+        pkexec "$BASH" "$STAGE/green-light-setup" "$STAGE" || rc=$?
     fi
     rm -rf "$STAGE"
 
+    # pkexec: 126 = password prompt dismissed, 127 = not authorized or it could
+    # not run the helper. The helper itself never exits with either.
     if [[ $rc -ne 0 ]]; then
-        if [[ $rc -eq 126 || $rc -eq 127 ]]; then
-            echo "Green Light: authorization was cancelled; system components were not updated." >&2
-        else
-            echo "Green Light: installing system components failed (exit $rc)." >&2
-        fi
+        case $rc in
+            126) echo "Green Light: authorization was cancelled; system components were not updated." >&2 ;;
+            127) echo "Green Light: authorization failed, or pkexec could not run the setup helper; system components were not updated." >&2 ;;
+            *)   echo "Green Light: installing system components failed (exit $rc)." >&2 ;;
+        esac
         if [[ ! -f "$DST_SCRIPT" ]]; then
             echo "Green Light: the install feature will not work until setup succeeds — relaunch to retry." >&2
         fi

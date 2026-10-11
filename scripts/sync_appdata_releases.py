@@ -5,8 +5,10 @@ The changelog has one `## <version> — <date>` heading per release, so it is th
 in-tree source of truth (git tags are not reliably present in a shallow CI checkout).
 Also verifies that the newest release is the version in Cargo.toml.
 
-  sync_appdata_releases.py           rewrite the metadata in place
-  sync_appdata_releases.py --check   exit 1 if it is out of date (for CI)
+  sync_appdata_releases.py                 rewrite the metadata in place
+  sync_appdata_releases.py --check         exit 1 if it is out of date (for CI)
+  sync_appdata_releases.py --output PATH   write the up-to-date metadata to PATH and
+                                           leave the tracked file alone (for builds)
 """
 import re
 import sys
@@ -45,7 +47,15 @@ def main() -> int:
         return 1
     current = APPDATA.read_text()
     updated = render(current, rel)
-    if "--check" in sys.argv[1:]:
+    args = sys.argv[1:]
+    if "--output" in args:
+        i = args.index("--output")
+        if i + 1 >= len(args):
+            print("--output needs a path", file=sys.stderr)
+            return 2
+        Path(args[i + 1]).write_text(updated)
+        return 0
+    if "--check" in args:
         if updated != current:
             print("appdata.xml <releases> is out of date; run scripts/sync_appdata_releases.py", file=sys.stderr)
             return 1
