@@ -18,9 +18,23 @@ defaults:
   run:
     shell: bash
 
+# One release run per tag; a second push of the same tag waits rather than racing the first.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # CI's checks (tests, clippy, ShellCheck, the install script tests, changelog/appdata) on the
+  # tagged commit itself, so a tag can't publish code that hasn't passed them.
+  checks:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   build:
+    needs: checks
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     permissions:
       contents: read
     env:
@@ -66,15 +80,6 @@ jobs:
           sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config \
             zsync wget file desktop-file-utils
 
-      - name: cargo test
-        run: cargo test --locked
-
-      - name: Release notes script self-test
-        run: python3 scripts/release_notes.py --self-test
-
-      - name: AppStream releases match the changelog
-        run: python3 scripts/sync_appdata_releases.py --check
-
       - name: Build AppImage
         run: bash build-appimage.sh
 
@@ -99,6 +104,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
