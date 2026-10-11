@@ -1,11 +1,15 @@
-//! A tiny HTTP/1.1 server for tests: canned responses by request path.
+//! A tiny HTTP/1.1 server for tests: canned responses by request path (and,
+//! optionally, a piece of the query string).
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
 pub struct Route {
+    /// Path without the query string.
     pub path: &'static str,
+    /// Text the query string must contain ("" matches any).
+    pub query: &'static str,
     pub status: u16,
     pub body: Vec<u8>,
     /// Content-Length to announce; more than the body simulates a server
@@ -14,7 +18,7 @@ pub struct Route {
 }
 
 pub fn route(path: &'static str, status: u16, body: &[u8]) -> Route {
-    Route { path, status, body: body.to_vec(), announce_len: None }
+    Route { path, query: "", status, body: body.to_vec(), announce_len: None }
 }
 
 /// Serve `routes` on a free local port (anything else is a 404) and return
@@ -35,10 +39,11 @@ pub async fn serve(routes: Vec<Route>) -> String {
                     }
                 }
                 let text = String::from_utf8_lossy(&req);
-                let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let target = text.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let (path, query) = target.split_once('?').unwrap_or((&target, ""));
                 let r = routes
                     .iter()
-                    .find(|r| r.path == path)
+                    .find(|r| r.path == path && query.contains(r.query))
                     .cloned()
                     .unwrap_or_else(|| route("", 404, b"Not found"));
                 let head = format!(

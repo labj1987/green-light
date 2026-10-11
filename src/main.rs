@@ -1,3 +1,4 @@
+mod branches;
 mod download;
 mod install;
 mod preflight;

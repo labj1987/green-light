@@ -31,6 +31,12 @@ them breaks existing installs' policy/settings).
   "no checksum published" and may lead to the Use Unverified question; any
   other failure is an error the UI offers to retry. Checksums are validated
   as 64 hex characters.
+- `branches.rs` — the Browse tab's branch labels, from NVIDIA's own data:
+  the Unix driver page (nvidia.com/en-us/drivers/unix/) carries the driver
+  lookup service URL and its Production / New Feature / Legacy queries;
+  the labels are the branches those return, plus "Older Production" for
+  older production branches released since the current one began. Never
+  hardcode branch numbers; with no data, nothing is labeled.
 - `download.rs` — downloads the `.run` file with progress, cancel,
   retries, and SHA256 verification. Bytes go to `<file>.part`, created mode
   0644 explicitly (the umask would leave it group-writable, which the

@@ -34,6 +34,10 @@ Downloads
   verification is offered only when NVIDIA really publishes no checksum.
 - A failed or cancelled download no longer leaves a partial file behind.
 - A server error while loading the version list shows the error instead of an empty list.
+- The branch labels on the Browse tab (Production, New Feature, Legacy) now come from
+  NVIDIA's own driver data, so they stay right as NVIDIA moves to new branches; the 615
+  drivers were unlabeled. Older production branches NVIDIA still updates are marked
+  Older Production. Without NVIDIA's data the list shows no labels rather than guessing.
 
 Other
 - With Secure Boot on and a signing key kept on a hardware token, the pre-install check now

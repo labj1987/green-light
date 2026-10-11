@@ -867,8 +867,12 @@ pub fn build_ui(app: &Application) {
                         banner.set_revealed(true);
                         selected_label.set_label("Could not load version list");
                     }
-                    Ok(versions) => {
+                    Ok(list) => {
+                        let versions = list.versions;
                         log_fn(format!("Found {} versions", versions.len()));
+                        if let Some(e) = list.branch_error {
+                            log_fn(format!("No branch labels: NVIDIA's branch data is unavailable ({e})"));
+                        }
                         selected_label.set_label("No version selected");
                         state.borrow_mut().versions = versions.clone();
                         let installed = state.borrow().sysinfo.installed_driver.clone();
@@ -1511,8 +1515,8 @@ fn populate_list(
             row.add_css_class("success");
         }
 
-        // Branch badge (Production/New Feature/LTS/Legacy) — omitted rather
-        // than guessed when the version doesn't match a known branch range.
+        // Branch badge (Production/New Feature/Older Production/Legacy), from
+        // NVIDIA's own data; omitted rather than guessed without it.
         if let Some(branch) = ver.branch {
             let badge = Label::new(Some(branch.label()));
             badge.add_css_class("caption");

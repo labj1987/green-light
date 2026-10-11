@@ -2,61 +2,7 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use scraper::{Html, Selector};
 
-/// NVIDIA's Linux driver release branch, classified from the version's major
-/// number. Ranges researched against NVIDIA's driver download page and
-/// endoflife.date/nvidia on 2026-08-12 — re-check before trusting this long
-/// after that date, since NVIDIA rolls these forward roughly every 3 months
-/// (New Feature Branch) to a year+ (Production/LTS Branch):
-///   - New Feature Branch: R610 (610.43.02+) — early-adopter track, quarterly
-///   - Production Branch: R595 (595.45.04+) — the recommended stable track
-///   - Long Term Support Branch: R580 (580.65.06+) — 3 years of security
-///     support, positioned alongside (not superseded by) the newer PB/NFB
-///   - Legacy: the frozen major lines NVIDIA still updates for GPUs the
-///     current unified driver no longer supports (R470 for Kepler, R390 for
-///     Fermi). Every other superseded major (535, 550, 560, 570, etc.) was
-///     itself once a Production or New Feature Branch but isn't a named
-///     "Legacy" line today, so it's deliberately left unclassified below
-///     rather than guessed at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverBranch {
-    NewFeature,
-    Production,
-    LongTermSupport,
-    Legacy,
-}
-
-impl DriverBranch {
-    pub fn label(&self) -> &'static str {
-        match self {
-            DriverBranch::NewFeature => "New Feature",
-            DriverBranch::Production => "Production",
-            DriverBranch::LongTermSupport => "LTS",
-            DriverBranch::Legacy => "Legacy",
-        }
-    }
-
-    /// Adwaita style class giving each branch's badge a distinct tint,
-    /// consistent with the install/version-status badges elsewhere in ui.rs.
-    pub fn css_class(&self) -> &'static str {
-        match self {
-            DriverBranch::NewFeature => "accent",
-            DriverBranch::Production => "success",
-            DriverBranch::LongTermSupport => "warning",
-            DriverBranch::Legacy => "dim-label",
-        }
-    }
-}
-
-fn classify_branch(version: &str) -> Option<DriverBranch> {
-    let major: u32 = version.split('.').next()?.parse().ok()?;
-    match major {
-        610 => Some(DriverBranch::NewFeature),
-        595 => Some(DriverBranch::Production),
-        580 => Some(DriverBranch::LongTermSupport),
-        470 | 390 => Some(DriverBranch::Legacy),
-        _ => None,
-    }
-}
+use crate::branches::{fetch_branches, DriverBranch, UNIX_DRIVERS_PAGE};
 
 #[derive(Debug, Clone)]
 pub struct DriverVersion {
@@ -80,8 +26,27 @@ pub fn version_from_filename(filename: &str) -> Option<String> {
 
 const NVIDIA_BASE: &str = "https://download.nvidia.com/XFree86/Linux-x86_64/";
 
-pub async fn fetch_versions() -> Result<Vec<DriverVersion>> {
-    fetch_versions_from(NVIDIA_BASE).await
+/// The driver versions, and why they carry no branch labels if NVIDIA's
+/// branch data couldn't be had (the list itself is still good then).
+pub struct VersionList {
+    pub versions: Vec<DriverVersion>,
+    pub branch_error: Option<String>,
+}
+
+pub async fn fetch_versions() -> Result<VersionList> {
+    let (versions, branches) =
+        tokio::join!(fetch_versions_from(NVIDIA_BASE), fetch_branches(UNIX_DRIVERS_PAGE));
+    let mut versions = versions?;
+    let branch_error = match branches {
+        Ok(b) => {
+            for v in &mut versions {
+                v.branch = b.classify(&v.version);
+            }
+            None
+        }
+        Err(e) => Some(format!("{e:#}")),
+    };
+    Ok(VersionList { versions, branch_error })
 }
 
 async fn fetch_versions_from(base: &str) -> Result<Vec<DriverVersion>> {
@@ -122,8 +87,7 @@ fn parse_version_listing(html: &str, base: &str) -> Vec<DriverVersion> {
             let version = caps[1].to_string();
             let filename = format!("NVIDIA-Linux-x86_64-{}.run", version);
             let url = format!("{}{}/{}", base, version, filename);
-            let branch = classify_branch(&version);
-            Some(DriverVersion { version, filename, url, branch })
+            Some(DriverVersion { version, filename, url, branch: None })
         })
         .collect();
 
@@ -186,22 +150,6 @@ pub async fn fetch_checksum(version: &DriverVersion) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn classifies_known_branches() {
-        assert_eq!(classify_branch("610.57.04"), Some(DriverBranch::NewFeature));
-        assert_eq!(classify_branch("595.91.07"), Some(DriverBranch::Production));
-        assert_eq!(classify_branch("580.178.04"), Some(DriverBranch::LongTermSupport));
-        assert_eq!(classify_branch("470.256.02"), Some(DriverBranch::Legacy));
-        assert_eq!(classify_branch("390.157"), Some(DriverBranch::Legacy));
-    }
-
-    #[test]
-    fn leaves_unmatched_versions_unlabeled() {
-        assert_eq!(classify_branch("570.211.01"), None);
-        assert_eq!(classify_branch("535.309.01"), None);
-        assert_eq!(classify_branch("96.43.23"), None);
-    }
 
     #[test]
     fn parses_version_from_official_filename() {
@@ -291,7 +239,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_fetch_shows_branch_labels() {
-        let versions = fetch_versions().await.expect("live fetch failed");
+        let list = fetch_versions().await.expect("live fetch failed");
+        assert_eq!(list.branch_error, None);
+        let versions = list.versions;
         assert!(!versions.is_empty());
         let mut seen = std::collections::HashSet::new();
         for v in &versions {
@@ -300,7 +250,7 @@ mod tests {
             }
         }
         println!("branches seen live: {seen:?}");
-        assert!(seen.contains("New Feature") || seen.contains("Production"));
+        assert!(seen.contains("New Feature") && seen.contains("Production"));
         let newest = &versions[0];
         let cs = fetch_checksum(newest).await.expect("live checksum fetch failed");
         println!("{} sha256: {cs:?}", newest.version);
