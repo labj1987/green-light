@@ -35,7 +35,7 @@ T=""
 
 # Real tools the script uses; everything else on PATH is a stub.
 REAL_TOOLS=(bash cat chmod cp cut date flock grep head install ls mkdir mktemp mv nproc rm setsid
-            sleep sort stat sha256sum sync tail touch true getfacl)
+            sleep sort stat sha256sum sync tail touch true env getfacl)
 
 stub() { # <name> <body>   (body runs with "$@" = the stub's arguments)
     printf '#!/bin/bash\necho "%s $*" >> "$GLT/calls"\n%s\n' "$1" "$2" > "$T/bin/$1"
@@ -353,7 +353,8 @@ expect_no_journal
 grep -qE '^[0-9-]+ [0-9:]+ \[green-light [0-9]+\] ==== NVIDIA driver install started ====$' <<<"$OUT" \
     || fail "log lines don't carry the run's PID"
 [[ "$(grep -oE '\[green-light [0-9]+\]' <<<"$OUT" | sort -u | wc -l)" == 1 ]] || fail "more than one PID in one run's lines"
-# SIGPIPE keeps its default for what the script runs (bit 13 of SigIgn).
+# SIGPIPE keeps its default for what the script runs (bit 13 of SigIgn),
+# even when it was already ignored when the script started (as on CI).
 (( (16#$(cut -f2 "$T/make-signals") & (1 << 12)) == 0 )) || fail "make inherited an ignored SIGPIPE"
 expect_no_file "$T/lock-leaked-to-make"
 end

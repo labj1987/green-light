@@ -431,7 +431,12 @@ usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
 # keeps the lock, and with it the "install running" state, after this run;
 # and with SIGTERM/SIGINT at their defaults, whatever this script does with
 # them (it ignores them while putting things back).
-nolock() { ( trap - TERM INT; exec "$@" ) 9>&-; }
+# (env resets dispositions bash can't: a signal already ignored when the
+# script started, like SIGPIPE under some service managers, stays ignored
+# for bash itself.)
+ENV_DEFAULT_SIGNALS=()
+if env --default-signal=PIPE true 2>/dev/null; then ENV_DEFAULT_SIGNALS=(env "--default-signal=PIPE,TERM,INT"); fi
+nolock() { ( trap - TERM INT; exec "${ENV_DEFAULT_SIGNALS[@]}" "$@" ) 9>&-; }
 
 # One install at a time. The app also checks this lock to tell that an
 # install is still running (for example after it was closed and reopened).
