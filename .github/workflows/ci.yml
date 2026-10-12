@@ -59,7 +59,7 @@ jobs:
       - name: Install bubblewrap
         run: |
           sudo apt-get update -qq || true
-          sudo apt-get install -y -qq bubblewrap
+          sudo apt-get install -y -qq bubblewrap acl
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi

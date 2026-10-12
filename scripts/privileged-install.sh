@@ -74,22 +74,33 @@ EXIT_ROLLBACK_FAILED=4
 EXIT_INITRAMFS=5
 
 LOGFILE="/var/log/green-light.log"
+
+# The app reading this script's output can go away mid-install (window
+# closed, app killed), and the terminal it was started from can hang up.
+# Neither may stop an install halfway: SIGPIPE and SIGHUP are ignored (the
+# commands run below inherit that), writes to stdout are best effort, and
+# every line always goes to the log file first.
+trap '' PIPE HUP
+
 log() {
     local msg="[green-light] $*"
-    echo "$msg"
     echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE" 2>/dev/null || true
+    echo "$msg" 2>/dev/null || true
 }
 
 trap 'log "ERROR: step failed near line $LINENO (exit $?) — install aborted"' ERR
 
 # Set once the install starts changing the system (distro packages, boot
 # config); cleared once NVIDIA's installer has succeeded. Any failure in
-# between restores the previous setup (rollback, defined below).
+# between, a SIGTERM or SIGINT included, restores the previous setup
+# (rollback, defined below).
 ROLLBACK_ARMED=0
 PRIV_DIR=""
 on_exit() {
     local rc=$?
     set +e
+    # Putting things back must not be cut short in turn.
+    trap '' TERM INT
     trap - ERR
     if [[ $ROLLBACK_ARMED -eq 1 && $rc -ne 0 ]]; then
         ROLLBACK_ARMED=0
@@ -100,6 +111,11 @@ on_exit() {
     exit "$rc"
 }
 trap on_exit EXIT
+# A signal ends the run through on_exit with a failure code, so the
+# rollback runs. (Bash takes it once the running command has finished, so
+# apt or NVIDIA's installer is never cut off mid-way.)
+trap 'log "ERROR: stopped by SIGTERM"; exit 143' TERM
+trap 'log "ERROR: stopped by SIGINT"; exit 130' INT
 
 # ── Package manager detection (shared by both modes) ───────────────────
 detect_pkg_mgr() {
@@ -331,11 +347,31 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
 fi
 
 # ── Install mode ───────────────────────────────────────────────────────
+# Its own session first: a hangup or Ctrl-C delivered to the app's process
+# group (the terminal it was started from) must not reach the install. Under
+# pkexec this keeps the PID (not a group leader, so setsid doesn't fork);
+# --wait passes the exit code on when it does fork.
+read -r PROC_STAT < /proc/$$/stat
+read -r _ _ _ OWN_SID _ <<<"${PROC_STAT##*) }"
+if [[ "$OWN_SID" != "$$" ]] && command -v setsid >/dev/null 2>&1; then
+    exec setsid --wait "$BASH" "$0" "$@"
+fi
+
 # Logged first, so every message of this run (argument and file errors
 # included) comes after it in the log.
 log "==== NVIDIA driver install started ===="
 
 usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
+
+# One install at a time. The app also checks this lock to tell that an
+# install is still running (for example after it was closed and reopened).
+# Keep the path in step with INSTALL_LOCK in install.rs.
+INSTALL_LOCK="/run/green-light-install.lock"
+exec 9>>"$INSTALL_LOCK"
+if ! flock -n 9; then
+    usage_error "Another Green Light install is still running; wait for it to finish."
+fi
+echo "$$" > "$INSTALL_LOCK"
 
 ORIG_RUN_FILE="${1:-}"
 EXPECT_SHA256="${2:-}"
@@ -364,7 +400,9 @@ for arg in "$@"; do
 done
 
 # Whether <gid> is the private group of the account <uid>: named after it,
-# its primary group, and with no other member (supplementary or primary).
+# its primary group, and with no other member. Supplementary members come
+# from the group entry itself; accounts with it as their primary group are
+# looked for in the account list NSS can enumerate (all local ones).
 group_is_owners_private_group() { # <gid> <uid>
     local entry owner owner_gid gname members name pgid
     entry="$(getent passwd "$2")" || return 1
@@ -377,6 +415,26 @@ group_is_owners_private_group() { # <gid> <uid>
     while IFS=: read -r name _ _ pgid _; do
         if [[ "$pgid" == "$1" && "$name" != "$owner" ]]; then return 1; fi
     done < <(getent passwd || true)
+    return 0
+}
+
+# Who besides the owner an ACL lets write the file, as "user:<name>" /
+# "group:<gid-or-name>" lines; empty when nobody. Without an ACL (or without
+# getfacl to read one) prints "?" when the file has one it can't read.
+acl_writers() { # <file> <owner-uid>
+    local line kind who perms mask="rwx"
+    # ls shows "+" after the mode for a file with an ACL.
+    local mode_str
+    mode_str="$(ls -ldn -- "$1" | cut -d' ' -f1)"
+    [[ "$mode_str" == *+ ]] || return 0
+    if ! command -v getfacl >/dev/null 2>&1; then echo "?"; return 0; fi
+    while IFS= read -r line; do
+        if [[ "$line" == mask::* ]]; then mask="${line#mask::}"; fi
+    done < <(getfacl -cpn -- "$1" 2>/dev/null)
+    while IFS=: read -r kind who perms; do
+        [[ "$kind" == user && -n "$who" && "$who" != "$2" ]] || [[ "$kind" == group && -n "$who" ]] || continue
+        if [[ "${perms:1:1}" == w && "${mask:1:1}" == w ]]; then echo "$kind:$who"; fi
+    done < <(getfacl -cpn -- "$1" 2>/dev/null)
     return 0
 }
 
@@ -395,6 +453,15 @@ fi
 if (( (8#$FILE_MODE) & 8#020 )) && ! group_is_owners_private_group "$FILE_GID" "$FILE_UID"; then
     usage_error "$ORIG_RUN_FILE can be changed by other members of group $FILE_GID (mode $FILE_MODE) — refusing. Remove that permission (chmod go-w) and retry."
 fi
+ACL_WRITERS="$(acl_writers "$ORIG_RUN_FILE" "$FILE_UID")"
+if [[ "$ACL_WRITERS" == "?" ]]; then
+    usage_error "$ORIG_RUN_FILE has an access control list that can't be checked (getfacl is missing) — refusing. Remove it (setfacl -b) and retry."
+fi
+while IFS= read -r who; do
+    [[ -n "$who" ]] || continue
+    if [[ "$who" == group:* ]] && group_is_owners_private_group "${who#group:}" "$FILE_UID"; then continue; fi
+    usage_error "$ORIG_RUN_FILE has an access control list letting $who change it — refusing. Remove it (setfacl -b) and retry."
+done <<<"$ACL_WRITERS"
 
 # ── Detect package manager ─────────────────────────────────────────────
 detect_pkg_mgr
@@ -429,7 +496,7 @@ is_driver_pkg() { # <name[:arch]> <glob>...
 }
 
 # Where --block-distro-driver keeps the distro driver out (keep in step with
-# APT_BLOCK_FILE / DNF_BLOCK_FILE in system.rs, which shows the state).
+# APT_BLOCK_FILE / DNF_BLOCK_FILE in preflight.rs, which shows the state).
 APT_BLOCK_FILE="/etc/apt/preferences.d/green-light-nvidia"
 DNF_BLOCK_DIR="/etc/dnf/libdnf5.conf.d"
 DNF_BLOCK_FILE="$DNF_BLOCK_DIR/90-green-light-nvidia.conf"
@@ -475,6 +542,15 @@ PIN
 
 unblock_distro_driver() { rm -f "$APT_BLOCK_FILE" "$DNF_BLOCK_FILE"; }
 
+# Log the last lines of a build log.
+log_tail() { # <file> <label>
+    log "Build log: last lines of $2"
+    tail -n 15 "$1" 2>/dev/null | while IFS= read -r line; do
+        log "Build log: $line"
+    done
+    return 0
+}
+
 # Log the tail of the newest DKMS build log for the nvidia module, so a failed
 # kernel module build is visible in the log and the app without digging.
 log_dkms_build_tail() {
@@ -484,11 +560,23 @@ log_dkms_build_tail() {
         if [[ -z "$newest" || "$f" -nt "$newest" ]]; then newest="$f"; fi
     done
     if [[ -z "$newest" ]]; then return 0; fi
-    log "Build log: last lines of $newest"
-    tail -n 15 "$newest" 2>/dev/null | while IFS= read -r line; do
-        log "Build log: $line"
-    done
+    log_tail "$newest" "$newest"
+}
+
+# Version of a driver installed from NVIDIA's .run (its installer stays
+# behind as nvidia-uninstall), or nothing.
+installed_run_version() {
+    command -v nvidia-uninstall >/dev/null 2>&1 || return 0
+    local out
+    out="$(nvidia-installer --version 2>/dev/null || true)"
+    if [[ "$out" =~ version[[:space:]]+([0-9]+\.[0-9.]+) ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
     return 0
+}
+
+module_version() { modinfo -k "$KVER" -F version nvidia 2>/dev/null || true; }
+module_signer() { modinfo -k "$KVER" -F signer nvidia 2>/dev/null || true; }
+secure_boot_on() {
+    command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
 }
 
 # ── Step 0: Copy into a root-only directory and verify the copy ───────
@@ -563,6 +651,40 @@ check_build_prereqs() {
 }
 check_build_prereqs
 
+# ── Step 2b: Test-build the kernel module before changing anything ────
+# The most likely way for the install to fail is the kernel module not
+# building for this kernel (a kernel newer than the driver supports). Build
+# it the way DKMS does, from the unpacked installer in the private dir: if
+# that fails, nothing has been changed yet. With the module flavor left to
+# the installer, both flavors are built, since which one it picks depends on
+# the GPUs.
+test_build_modules() {
+    local dir="$PRIV_DIR/unpacked" flavors=() f out="$PRIV_DIR/test-build.log"
+    log "Test-building the NVIDIA kernel module for $KVER before changing anything…"
+    if ! "$RUN_FILE" --extract-only --target "$dir" >>"$LOGFILE" 2>&1; then
+        log "ERROR: Could not unpack the installer to test-build its kernel module. No changes made."
+        exit "$EXIT_FAILED"
+    fi
+    case "$MODULE_TYPE" in
+        open)        flavors=(kernel-open) ;;
+        proprietary) flavors=(kernel) ;;
+        *)           flavors=(kernel-open kernel) ;;
+    esac
+    for f in "${flavors[@]}"; do
+        # Drivers older than 515 have no open flavor.
+        [[ -d "$dir/$f" ]] || continue
+        if ! make -C "$dir/$f" -j"$(nproc)" KERNEL_UNAME="$KVER" modules >"$out" 2>&1; then
+            cat "$out" >> "$LOGFILE" 2>/dev/null || true
+            log "ERROR: The NVIDIA kernel module ($f) doesn't build for kernel $KVER. No changes made."
+            log_tail "$out" "the test build"
+            exit "$EXIT_FAILED"
+        fi
+        log "Test build OK: $f"
+    done
+    rm -rf "$dir" "$out"
+}
+test_build_modules
+
 # ── Step 3: Clear conflicting distro packages ─────────────────────────
 # Removing package files does not affect the running driver — the loaded
 # kernel module and already-mapped libraries keep working, same as
@@ -584,15 +706,44 @@ check_build_prereqs
 #     packages instead" — on a machine that's mid-purge of those exact
 #     packages. Confirmed end to end against a real install.
 #
-# Everything this step and the next change is recorded first, so a failure
-# from here until NVIDIA's installer succeeds puts it all back (rollback).
-PKGS=()       # installed driver packages (name[:arch] / rpm name)
-PKG_SPECS=()  # the same at their installed versions, for reinstalling
+# Everything this step and the next ones change is recorded first, so a
+# failure from here until NVIDIA's installer succeeds puts it all back
+# (rollback), and the rollback is checked against the recorded state.
+PKGS=()       # installed driver packages to remove (name[:arch] / rpm name)
 HELD=()       # apt holds on them
 BACKUPS=()    # "<path>|<saved copy, or empty when it didn't exist>"
 WAS_BLOCKED=0
+INSTALLER_STARTED=0
 BACKUP_DIR="$PRIV_DIR/backup"
+PKGS_BEFORE="$PRIV_DIR/packages-before"
 mkdir -p "$BACKUP_DIR"
+
+# Every installed package as "<key>|<exact spec>": apt "name[:arch]|name[:arch]=version",
+# rpm "name.arch|name-version-release.arch". Comparing two of these gives
+# exactly what a removal took away, reverse dependencies included.
+package_snapshot() {
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        { dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}|${Version}\n' 2>/dev/null || true; } \
+            | while IFS='|' read -r st name ver; do
+                if [[ "${st:1:1}" == "i" ]]; then printf '%s|%s=%s\n' "$name" "$name" "$ver"; fi
+            done
+    else
+        rpm -qa --qf '%{NAME}.%{ARCH}|%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Packages in the "before" snapshot that are no longer installed, as
+# "<key>|<spec>" lines.
+packages_removed() {
+    local -A now=()
+    local key spec
+    while IFS='|' read -r key spec; do now["$key"]=1; done < <(package_snapshot)
+    while IFS='|' read -r key spec; do
+        if [[ -n "$key" && -z "${now[$key]:-}" ]]; then printf '%s|%s\n' "$key" "$spec"; fi
+    done < "$PKGS_BEFORE"
+    return 0
+}
 
 backup_file() { # <path>
     local saved=""
@@ -617,23 +768,89 @@ restore_backups() {
     return "$rc"
 }
 
+# Whether the module signer is one Secure Boot will accept: the one the
+# module had before, or the machine's own enrolled signing key.
+signer_trusted() { # <signer>
+    [[ -n "$1" ]] || return 1
+    [[ "$1" == "$MOD_SIGNER_BEFORE" ]] && return 0
+    resolve_signing_key
+    [[ -n "$SIGN_KEY" && $SIGN_MISSING -eq 0 ]] || return 1
+    [[ "$(cert_subject_cn "$SIGN_CERT")" == "$1" ]] || return 1
+    local der
+    der="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")" || return 1
+    mokutil --test-key "$der" 2>&1 | grep -qiE 'already (enrolled|in )'
+}
+
+# After a rollback: is the driver the machine had before back? Only then may
+# the run claim to have restored it.
+verify_restored() {
+    local ok=1 run_now mod_now signer_now entry
+    run_now="$(installed_run_version)"
+    if [[ -n "$RUN_VER_BEFORE" && "$run_now" != "$RUN_VER_BEFORE" ]]; then
+        log "ERROR: The driver $RUN_VER_BEFORE installed earlier from NVIDIA's .run file was removed by NVIDIA's installer and can't be put back from here."
+        log "       Install a driver (that version or another) with Green Light before rebooting."
+        ok=0
+    fi
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        log "ERROR: The removed package ${entry%%|*} is not installed again."
+        ok=0
+    done < <(packages_removed)
+    mod_now="$(module_version)"
+    if [[ -n "$MOD_VER_BEFORE" ]]; then
+        if [[ -z "$mod_now" ]]; then
+            log "ERROR: There is no nvidia kernel module for $KVER any more (it was $MOD_VER_BEFORE)."
+            ok=0
+        else
+            if [[ "$mod_now" != "$MOD_VER_BEFORE" ]]; then
+                log "The nvidia kernel module for $KVER is now $mod_now (it was $MOD_VER_BEFORE)."
+            fi
+            signer_now="$(module_signer)"
+            if secure_boot_on && ! signer_trusted "$signer_now"; then
+                log "ERROR: Secure Boot is on, and the restored nvidia module for $KVER is ${signer_now:+signed by \"$signer_now\", }not signed by a key it trusts."
+                ok=0
+            fi
+        fi
+    elif [[ -n "$mod_now" ]]; then
+        log "ERROR: An nvidia kernel module ($mod_now) for $KVER is left behind from the failed install."
+        ok=0
+    fi
+    return $(( ok ? 0 : 1 ))
+}
+
 rollback() {
-    local ok=1
+    local ok=1 removed=() specs=() names=() key spec run_now
     log "Restoring the previous driver setup…"
+    # A partial install of the new driver: let its own uninstaller take it
+    # out, so the restored packages don't sit on top of half of it.
+    if [[ $INSTALLER_STARTED -eq 1 ]]; then
+        run_now="$(installed_run_version)"
+        if [[ -n "$run_now" && "$run_now" != "$RUN_VER_BEFORE" ]]; then
+            log "Removing what NVIDIA's installer had already put in place ($run_now)…"
+            nvidia-uninstall --silent >>"$LOGFILE" 2>&1 \
+                || { log "ERROR: nvidia-uninstall could not remove the partial install"; ok=0; }
+        fi
+    fi
     restore_backups || ok=0
-    if [[ ${#PKGS[@]} -gt 0 ]]; then
-        log "Reinstalling the distro packages that were removed: ${PKGS[*]}"
+    while IFS='|' read -r key spec; do
+        [[ -n "$key" ]] || continue
+        removed+=("$key")
+        specs+=("$spec")
+        if [[ "$PKG_MGR" == "apt" ]]; then names+=("$key"); else names+=("${key%.*}"); fi
+    done < <(packages_removed)
+    if [[ ${#removed[@]} -gt 0 ]]; then
+        log "Reinstalling the packages that were removed: ${removed[*]}"
         if [[ "$PKG_MGR" == "apt" ]]; then
-            if ! apt-get install -y --allow-downgrades "${PKG_SPECS[@]}" >>"$LOGFILE" 2>&1; then
-                log "WARNING: The removed versions can't be reinstalled; installing the distro's current ones"
-                apt-get install -y "${PKGS[@]}" >>"$LOGFILE" 2>&1 \
-                    || { log "ERROR: apt-get could not reinstall the distro driver packages"; ok=0; }
+            if ! apt-get install -y --allow-downgrades "${specs[@]}" >>"$LOGFILE" 2>&1; then
+                log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
+                apt-get install -y "${names[@]}" >>"$LOGFILE" 2>&1 \
+                    || { log "ERROR: apt-get could not reinstall the removed packages"; ok=0; }
             fi
         else
-            if ! dnf install -y "${PKG_SPECS[@]}" >>"$LOGFILE" 2>&1; then
-                log "WARNING: The removed versions can't be reinstalled; installing the distro's current ones"
-                dnf install -y "${PKGS[@]}" >>"$LOGFILE" 2>&1 \
-                    || { log "ERROR: dnf could not reinstall the distro driver packages"; ok=0; }
+            if ! dnf install -y "${specs[@]}" >>"$LOGFILE" 2>&1; then
+                log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
+                dnf install -y "${names[@]}" >>"$LOGFILE" 2>&1 \
+                    || { log "ERROR: dnf could not reinstall the removed packages"; ok=0; }
             fi
         fi
     fi
@@ -648,12 +865,13 @@ rollback() {
         log "ERROR: Rebuilding the initramfs failed. Run: ${INITRAMFS_CMD[*]}"
         ok=0
     fi
+    verify_restored || ok=0
     if [[ $ok -eq 1 ]]; then
-        log "Restored the previous driver setup; the next boot uses the driver this computer had before."
+        log "Restored and checked the previous driver setup; the next boot uses the driver this computer had before."
         return 0
     fi
-    log "ERROR: Restoring the previous driver setup did not fully work (see $LOGFILE)."
-    log "       Fix the steps above before rebooting, or the next boot may have no NVIDIA driver."
+    log "ERROR: The previous driver setup could not be fully restored (see above and $LOGFILE)."
+    log "       Don't reboot until a working driver is installed, or the next boot may have no NVIDIA driver."
     return 1
 }
 
@@ -661,10 +879,9 @@ log "Removing distro-managed NVIDIA packages (if any)…"
 if [[ "$PKG_MGR" == "apt" ]]; then
     # Second status letter "i" = installed, whatever the selection (a held
     # package reads "hi"). binary:Package keeps the :i386 of multiarch copies.
-    while IFS='|' read -r st name ver; do
+    while IFS='|' read -r st name _; do
         if [[ "${st:1:1}" == "i" ]] && is_driver_pkg "$name" "${DEB_DRIVER_GLOBS[@]}"; then
             PKGS+=("$name")
-            PKG_SPECS+=("$name=$ver")
         fi
     done < <(dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}|${Version}\n' \
                  "${DEB_DRIVER_GLOBS[@]}" 2>/dev/null || true)
@@ -672,15 +889,15 @@ if [[ "$PKG_MGR" == "apt" ]]; then
         if is_driver_pkg "$name" "${DEB_DRIVER_GLOBS[@]}"; then HELD+=("$name"); fi
     done < <(apt-mark showhold 2>/dev/null || true)
 else
-    while IFS='|' read -r name spec; do
-        if is_driver_pkg "$name" "${RPM_DRIVER_GLOBS[@]}"; then
-            PKGS+=("$name")
-            PKG_SPECS+=("$spec")
-        fi
-    done < <(rpm -qa --qf '%{NAME}|%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' \
-                 "${RPM_DRIVER_GLOBS[@]}" 2>/dev/null || true)
+    while IFS= read -r name; do
+        if is_driver_pkg "$name" "${RPM_DRIVER_GLOBS[@]}"; then PKGS+=("$name"); fi
+    done < <(rpm -qa --qf '%{NAME}\n' "${RPM_DRIVER_GLOBS[@]}" 2>/dev/null || true)
 fi
+package_snapshot > "$PKGS_BEFORE"
 if distro_driver_blocked; then WAS_BLOCKED=1; fi
+RUN_VER_BEFORE="$(installed_run_version)"
+MOD_VER_BEFORE="$(module_version)"
+MOD_SIGNER_BEFORE="$(module_signer)"
 backup_file /etc/modprobe.d/blacklist-nouveau.conf
 backup_file /etc/modprobe.d/nvidia-drm-modeset.conf
 backup_file /usr/lib/nvidia/alternate-install-present
@@ -688,7 +905,7 @@ backup_file /usr/lib/nvidia/alternate-install-present
 ROLLBACK_ARMED=1
 
 # The block (if any) would stop the package manager from touching these
-# packages; it is set again at the end, as asked.
+# packages; it is set again once the driver is installed, as asked.
 unblock_distro_driver
 if [[ "$PKG_MGR" == "apt" ]]; then
     # apt refuses to remove held packages.
@@ -698,6 +915,8 @@ if [[ "$PKG_MGR" == "apt" ]]; then
     # Driver packages only. libcuda*/libcudnn* are deliberately NOT matched:
     # they can belong to a user-installed CUDA toolkit unrelated to the
     # display driver (the driver's own libcuda is in libnvidia-compute-*).
+    # apt also removes what depends on them (Ubuntu's prebuilt module
+    # packages, cuda-drivers, ...); those are recorded through the snapshot.
     if [[ ${#PKGS[@]} -gt 0 ]]; then
         log "  purging: ${PKGS[*]}"
         # No dpkg --force-all fallback: it can leave dpkg in a broken
@@ -727,6 +946,14 @@ else
             exit "$EXIT_FAILED"
         fi
     fi
+fi
+ALSO_REMOVED=()
+while IFS='|' read -r key _; do
+    [[ -n "$key" ]] || continue
+    if [[ " ${PKGS[*]} " != *" ${key} "* && " ${PKGS[*]} " != *" ${key%.*} "* ]]; then ALSO_REMOVED+=("$key"); fi
+done < <(packages_removed)
+if [[ ${#ALSO_REMOVED[@]} -gt 0 ]]; then
+    log "  also removed, as they depend on the driver: ${ALSO_REMOVED[*]}"
 fi
 
 # ── Step 4: On-disk boot config (takes effect at next boot) ───────────
@@ -776,8 +1003,12 @@ if [[ -n "$SIGN_KEY" ]]; then
         fi
     fi
 fi
+# resolve_signing_key may be called again by the rollback's checks.
+INSTALL_SIGN_KEY="$SIGN_KEY"
+INSTALL_SIGN_CERT="$SIGN_CERT"
 
 RC=0
+INSTALLER_STARTED=1
 "$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1 || RC=$?
 if [[ $RC -ne 0 ]]; then
     log "ERROR: NVIDIA installer exited with code $RC"
@@ -788,7 +1019,20 @@ fi
 ROLLBACK_ARMED=0
 log "NVIDIA installer finished successfully"
 
-# ── Step 6: Rebuild initramfs so the blacklist applies at boot ────────
+# ── Step 6: Keep the distro driver from coming back (optional) ────────
+# Right after the install, so every later exit (initramfs failure included)
+# leaves the block as asked.
+if [[ $BLOCK_DISTRO -eq 1 ]]; then
+    if block_distro_driver; then
+        log "Blocked the distro's NVIDIA driver packages: the package manager won't install them over this driver"
+    else
+        log "WARNING: Could not block the distro's NVIDIA driver packages"
+    fi
+elif [[ $WAS_BLOCKED -eq 1 ]]; then
+    log "Removed the block on the distro's NVIDIA driver packages"
+fi
+
+# ── Step 7: Rebuild initramfs so the blacklist applies at boot ────────
 log "Rebuilding initramfs…"
 if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
     log "ERROR: initramfs rebuild failed. The driver is installed but the nouveau"
@@ -796,10 +1040,12 @@ if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
     exit "$EXIT_INITRAMFS"
 fi
 
-# ── Step 6b: Verify the result (report only; never fails the install) ─
+# ── Step 8: Verify the result (report only; never fails the install) ──
 # Everything here is a read-only check whose outcome goes to the log; the app
 # shows the "Verify:" lines after the install finishes.
 log "Verifying the installation…"
+SIGN_KEY="$INSTALL_SIGN_KEY"
+SIGN_CERT="$INSTALL_SIGN_CERT"
 VERIFY_WARNINGS=0
 verify_warn() { log "Verify: WARNING $*"; VERIFY_WARNINGS=$((VERIFY_WARNINGS + 1)); }
 
@@ -852,7 +1098,7 @@ fi
 SB_STATE=""
 if command -v mokutil >/dev/null 2>&1; then SB_STATE="$(mokutil --sb-state 2>/dev/null || true)"; fi
 if [[ -n "$SIGN_KEY" ]]; then
-    MODULE_SIGNER="$(modinfo -k "$KVER" -F signer nvidia 2>/dev/null || true)"
+    MODULE_SIGNER="$(module_signer)"
     EXPECTED_SIGNER="$(cert_subject_cn "$SIGN_CERT")"
     if [[ -z "$MODULE_SIGNER" ]]; then
         verify_warn "the nvidia module for $KVER is unsigned; expected a signature from ${EXPECTED_SIGNER:-$SIGN_CERT}"
@@ -867,7 +1113,7 @@ if [[ -n "$SIGN_KEY" ]]; then
         log "Verify: signing certificate enrollment: ${MOK_TEST:-unknown}"
     fi
 elif grep -qi 'SecureBoot enabled' <<<"$SB_STATE"; then
-    MODULE_SIGNER="$(modinfo -k "$KVER" -F signer nvidia 2>/dev/null || true)"
+    MODULE_SIGNER="$(module_signer)"
     if [[ -n "$MODULE_SIGNER" ]]; then
         log "Verify: Secure Boot is on; nvidia module is signed by: $MODULE_SIGNER"
     else
@@ -879,17 +1125,6 @@ if [[ $VERIFY_WARNINGS -eq 0 ]]; then
     log "Verify: all checks passed"
 else
     log "Verify: $VERIFY_WARNINGS warning(s); see above"
-fi
-
-# ── Step 7: Keep the distro driver from coming back (optional) ────────
-if [[ $BLOCK_DISTRO -eq 1 ]]; then
-    if block_distro_driver; then
-        log "Blocked the distro's NVIDIA driver packages: the package manager won't install them over this driver"
-    else
-        log "WARNING: Could not block the distro's NVIDIA driver packages"
-    fi
-elif [[ $WAS_BLOCKED -eq 1 ]]; then
-    log "Removed the block on the distro's NVIDIA driver packages"
 fi
 
 log "==== Done. Reboot to switch to the new driver. ===="
