@@ -107,13 +107,59 @@ struct ScriptRun {
     lines: Vec<String>,
 }
 
-/// Run `pkexec <args>`, handing each output line (stdout and stderr, with the
-/// script's "[green-light] " prefix removed) to `on_line` as it arrives.
+/// The script's messages in a piece of its log file: the text after
+/// "[green-light] " on each complete line. `partial` carries an unfinished
+/// last line over to the next piece. Other lines (the package manager's and
+/// installers' output, which also goes to the log) are left out.
+fn script_lines(chunk: &str, partial: &mut String) -> Vec<String> {
+    partial.push_str(chunk);
+    let mut out = Vec::new();
+    while let Some(end) = partial.find('\n') {
+        let line: String = partial.drain(..=end).collect();
+        if let Some((_, msg)) = line.trim_end_matches('\n').split_once("[green-light] ") {
+            if !msg.trim().is_empty() {
+                out.push(msg.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Follows a log file from a given offset.
+struct LogTail {
+    path: &'static str,
+    pos: u64,
+    partial: String,
+}
+
+impl LogTail {
+    fn read_new(&mut self) -> Vec<String> {
+        use std::io::{Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(self.path) else { return vec![] };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.pos {
+            self.pos = 0; // rotated or truncated
+        }
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(self.pos)).is_err() || f.read_to_end(&mut buf).is_err() {
+            return vec![];
+        }
+        self.pos += buf.len() as u64;
+        script_lines(&String::from_utf8_lossy(&buf), &mut self.partial)
+    }
+}
+
+/// Run `pkexec <args>` and pass the script's messages to `on_line` as they
+/// come. Without a terminal the script writes nothing to its stdout or
+/// stderr (a pipe to this app, which may be closed mid-install), only to its
+/// log file, so the log is what is followed here. pkexec's own messages
+/// (from before the script starts) come on stderr and are passed on too.
 fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
+    let start = std::fs::metadata(INSTALL_LOG).map(|m| m.len()).unwrap_or(0);
     let mut child = Command::new("pkexec")
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("Failed to launch pkexec — is polkit installed?")?;
@@ -122,41 +168,80 @@ fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str
         // authentication); its exit code says why.
         let _ = writeln!(pipe, "{text}");
     }
-
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    let readers: Vec<_> = [
-        child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
-        child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|pipe| {
-        let tx = tx.clone();
+    let stderr = child.stderr.take().map(|pipe| {
         std::thread::spawn(move || {
-            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
+            BufReader::new(pipe).lines().map_while(Result::ok).collect::<Vec<String>>()
         })
-    })
-    .collect();
-    drop(tx);
+    });
 
+    let mut tail = LogTail { path: INSTALL_LOG, pos: start, partial: String::new() };
     let mut lines = Vec::new();
-    for line in rx {
-        let line = line.strip_prefix("[green-light] ").unwrap_or(&line).to_string();
-        if line.trim().is_empty() {
-            continue;
+    let status = loop {
+        let exited = child.try_wait().context("Waiting for pkexec failed")?;
+        for line in tail.read_new() {
+            on_line(&line);
+            lines.push(line);
         }
-        on_line(&line);
-        lines.push(line);
+        if let Some(status) = exited {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    if let Some(Ok(err_lines)) = stderr.map(|t| t.join()) {
+        for line in err_lines.into_iter().filter(|l| !l.trim().is_empty()) {
+            let line = line.strip_prefix("[green-light] ").unwrap_or(&line).to_string();
+            on_line(&line);
+            lines.push(line);
+        }
     }
-    for r in readers {
-        let _ = r.join();
-    }
-    let status = child.wait().context("Waiting for pkexec failed")?;
     Ok(ScriptRun { code: status.code(), lines })
+}
+
+/// An interrupted install's journal (keep in step with STATE_DIR/JOURNAL in
+/// the script; tested below). Its parent is world-readable, so this can be
+/// seen without root.
+pub const JOURNAL_DIR: &str = "/var/lib/green-light/journal";
+
+/// An install was cut off (power loss, crash) and its changes are waiting to
+/// be rolled back, with no install running now.
+pub fn recovery_pending() -> bool {
+    Path::new(JOURNAL_DIR).exists() && !install_running()
+}
+
+/// How `--recover` ended, when it didn't fail.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recovered {
+    /// Nothing to put back (the cut-off install had already finished).
+    Nothing,
+    /// Rolled back and checked.
+    Restored,
+}
+
+fn recover_result(code: Option<i32>, lines: &[String]) -> Result<Recovered> {
+    let detail = first_error(lines).map(|e| format!(": {e}")).unwrap_or_default();
+    match code {
+        Some(0) => Ok(Recovered::Nothing),
+        Some(3) => Ok(Recovered::Restored),
+        Some(126) => bail!("Authentication was cancelled; nothing was changed."),
+        Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
+        Some(4) => bail!(
+            "The previous driver could not be fully restored{detail}. Don't reboot until a \
+             working driver is installed; the Log tab has the details."
+        ),
+        Some(c) => bail!("Restoring exited with code {c}{detail} (see {INSTALL_LOG})"),
+        None => bail!("Restoring was killed before it finished."),
+    }
+}
+
+/// Roll back an install that was cut off, from its journal (the script's
+/// `--recover`, which the boot unit also runs).
+pub fn run_privileged_recover(mut on_line: impl FnMut(&str)) -> Result<Recovered> {
+    if !Path::new(PRIVILEGED_SCRIPT).exists() {
+        bail!("Privileged install script not found at {}", PRIVILEGED_SCRIPT);
+    }
+    let args = [PRIVILEGED_SCRIPT.to_string(), "--recover".to_string()];
+    let run = run_pkexec(&args, None, &mut on_line)?;
+    recover_result(run.code, &run.lines)
 }
 
 /// The first "ERROR:" message of a run, if any: the cause (later ones are
@@ -310,6 +395,57 @@ mod tests {
         assert!(install_failure(Some(4), &out).contains("Don't reboot"));
         assert!(install_failure(Some(1), &[]).ends_with("before changing anything"));
         assert!(install_failure(None, &[]).contains("killed"));
+    }
+
+    #[test]
+    fn script_lines_from_the_log() {
+        let mut partial = String::new();
+        let got = script_lines(
+            "2026-10-12 10:00:00 [green-light] ==== NVIDIA driver install started ====\n\
+             Reading package lists...\n\
+             2026-10-12 10:00:01 [green-light] Copying installer to priv",
+            &mut partial,
+        );
+        assert_eq!(got, ["==== NVIDIA driver install started ===="]);
+        let got = script_lines("ate directory…\n2026-10-12 10:00:02 [green-light] \n", &mut partial);
+        assert_eq!(got, ["Copying installer to private directory…"]);
+        assert!(partial.is_empty());
+    }
+
+    #[test]
+    fn log_tail_follows_appends() {
+        let path = std::env::temp_dir().join(format!("green-light-tail-{}", std::process::id()));
+        std::fs::write(&path, "old [green-light] before\n").unwrap();
+        let start = std::fs::metadata(&path).unwrap().len();
+        let leaked: &'static str = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
+        let mut tail = LogTail { path: leaked, pos: start, partial: String::new() };
+        assert!(tail.read_new().is_empty());
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap()
+            .write_all(b"t [green-light] one\nt [green-light] tw").unwrap();
+        assert_eq!(tail.read_new(), ["one"]);
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"o\n").unwrap();
+        assert_eq!(tail.read_new(), ["two"]);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn recover_codes() {
+        assert_eq!(recover_result(Some(0), &[]).unwrap(), Recovered::Nothing);
+        assert_eq!(recover_result(Some(3), &[]).unwrap(), Recovered::Restored);
+        let failed = recover_result(Some(4), &lines(&["ERROR: no module"])).unwrap_err().to_string();
+        assert!(failed.contains("Don't reboot") && failed.contains("no module"), "{failed}");
+        assert!(recover_result(Some(126), &[]).unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn journal_matches_the_script() {
+        let script = include_str!("../scripts/privileged-install.sh");
+        assert!(script.contains("\nSTATE_DIR=\"/var/lib/green-light\"\n"));
+        assert!(script.contains("\nJOURNAL=\"$STATE_DIR/journal\"\n"));
+        assert_eq!(JOURNAL_DIR, "/var/lib/green-light/journal");
+        let unit = include_str!("../data/green-light-recover.service");
+        assert!(unit.contains(&format!("ConditionPathExists={JOURNAL_DIR}\n")));
+        assert!(unit.contains(&format!("ExecStart={PRIVILEGED_SCRIPT} --recover\n")));
     }
 
     #[test]

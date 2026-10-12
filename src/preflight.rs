@@ -414,6 +414,10 @@ pub struct SigningPair {
     /// False when the DKMS config names a pair that is (partly) missing; the
     /// script then signs nothing.
     pub complete: bool,
+    /// The private key sits where only root can look (Fedora's
+    /// /etc/pki/akmods/private), so whether it exists is not known here; the
+    /// install checks it.
+    pub key_hidden: bool,
 }
 
 impl SigningPair {
@@ -427,25 +431,30 @@ impl SigningPair {
 /// script: a pair named by the DKMS config is used as named (DKMS's defaults
 /// fill a missing half, and it counts even when its files are missing);
 /// otherwise the first default pair whose key AND certificate both exist.
-/// `exists` says whether a file exists.
+/// `exists` says whether a file exists: `Some(true/false)`, or `None` when
+/// that can't be told without root (a directory only root may search). A
+/// key that can't be seen beside a certificate that exists counts, marked
+/// `key_hidden`, since the script (as root) will find it if it is there.
 pub fn resolve_signing_pair(
     cfg: &DkmsSigningConfig,
-    exists: impl Fn(&str) -> bool,
+    exists: impl Fn(&str) -> Option<bool>,
 ) -> Option<SigningPair> {
-    let key_present = |k: &str| k.starts_with("pkcs11:") || exists(k);
+    let key_state = |k: &str| if k.starts_with("pkcs11:") { Some(true) } else { exists(k) };
     if cfg.key.is_some() || cfg.cert.is_some() {
         let key = cfg.key.clone().unwrap_or_else(|| DKMS_DEFAULT_KEY.to_string());
         let cert = cfg.cert.clone().unwrap_or_else(|| DKMS_DEFAULT_CERT.to_string());
-        let complete = key_present(&key) && exists(&cert);
-        return Some(SigningPair { key, cert, complete });
+        let k = key_state(&key);
+        let complete = k != Some(false) && exists(&cert) == Some(true);
+        return Some(SigningPair { key, cert, complete, key_hidden: k.is_none() });
     }
     SIGNING_KEY_PATHS
         .iter()
-        .find(|(key, cert)| exists(key) && exists(cert))
+        .find(|(key, cert)| exists(cert) == Some(true) && key_state(key) != Some(false))
         .map(|(key, cert)| SigningPair {
             key: key.to_string(),
             cert: cert.to_string(),
             complete: true,
+            key_hidden: key_state(key).is_none(),
         })
 }
 
@@ -866,6 +875,7 @@ mod tests {
             key: "pkcs11:token=mok".into(),
             cert: "/c.der".into(),
             complete: true,
+            key_hidden: false,
         };
         let file = SigningPair { key: "/k.priv".into(), ..token.clone() };
         let without = secure_boot_advice(&on, &enrolled, Some(&token), false).unwrap();
@@ -911,7 +921,7 @@ mod tests {
     #[test]
     fn signing_pair_resolution() {
         let none = DkmsSigningConfig::default();
-        let files = |set: &'static [&'static str]| move |p: &str| set.contains(&p);
+        let files = |set: &'static [&'static str]| move |p: &str| Some(set.contains(&p));
         assert_eq!(resolve_signing_pair(&none, files(&[])), None);
         // A certificate without its key is not a pair: the next complete pair wins.
         let p = resolve_signing_pair(
@@ -939,7 +949,21 @@ mod tests {
         assert!(!p.complete);
         let token = DkmsSigningConfig { key: Some("pkcs11:token=x".into()), cert: Some("/c.der".into()) };
         let p = resolve_signing_pair(&token, files(&["/c.der"])).unwrap();
-        assert!(p.complete && p.is_pkcs11());
+        assert!(p.complete && p.is_pkcs11() && !p.key_hidden);
+
+        // A key in a root-only directory: counted beside its certificate, but
+        // marked as not seen; a missing certificate still rules the pair out.
+        let akmods_key = "/etc/pki/akmods/private/private_key.priv";
+        let akmods_cert = "/etc/pki/akmods/certs/public_key.der";
+        let hidden = move |p: &str| if p == akmods_key { None } else { Some(p == akmods_cert) };
+        let p = resolve_signing_pair(&none, hidden).unwrap();
+        assert_eq!(p.cert, akmods_cert);
+        assert!(p.complete && p.key_hidden);
+        let no_cert = move |p: &str| if p == akmods_key { None } else { Some(false) };
+        assert_eq!(resolve_signing_pair(&none, no_cert), None);
+        let cfg_hidden = DkmsSigningConfig { key: Some("/root/k".into()), cert: Some("/c.der".into()) };
+        let p = resolve_signing_pair(&cfg_hidden, |p| if p == "/root/k" { None } else { Some(p == "/c.der") }).unwrap();
+        assert!(p.complete && p.key_hidden);
     }
 
     #[test]

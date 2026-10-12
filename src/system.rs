@@ -170,7 +170,7 @@ fn command_text(cmd: &str, args: &[&str]) -> Option<String> {
 /// enrollment, or neither. Checked whatever the Secure Boot state. (The
 /// private keys are root-only to read, but their existence can be seen.)
 fn get_signing_key_state() -> (SigningKeyState, Option<SigningPair>) {
-    let pair = resolve_signing_pair(&get_dkms_signing_config(), path_may_exist);
+    let pair = resolve_signing_pair(&get_dkms_signing_config(), file_exists);
     let state = match &pair {
         None => SigningKeyState::NoKey,
         Some(p) if !p.complete => SigningKeyState::Incomplete(p.key.clone(), p.cert.clone()),
@@ -179,15 +179,14 @@ fn get_signing_key_state() -> (SigningKeyState, Option<SigningPair>) {
     (state, pair)
 }
 
-/// Whether `path` is a file, as far as an ordinary user can tell. Private
-/// keys often sit in a directory only root may search (Fedora's
-/// /etc/pki/akmods/private): there "permission denied" means the key can't
-/// be seen, not that it is missing, and the script (root) will see it. The
-/// certificate beside it, which is public, still has to exist.
-fn path_may_exist(path: &str) -> bool {
+/// Whether `path` is a file: `None` when an ordinary user can't tell, as for
+/// a private key in a directory only root may search (Fedora's
+/// /etc/pki/akmods/private).
+fn file_exists(path: &str) -> Option<bool> {
     match std::fs::metadata(path) {
-        Ok(m) => m.is_file(),
-        Err(e) => e.kind() == std::io::ErrorKind::PermissionDenied,
+        Ok(m) => Some(m.is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+        Err(_) => Some(false),
     }
 }
 

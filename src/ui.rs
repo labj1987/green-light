@@ -1,8 +1,8 @@
 use crate::download::{download_run_file, verify_sha256};
 use crate::branches::{fetch_branches, DriverBranch, UNIX_DRIVERS_PAGE};
 use crate::install::{
-    check_run_file, install_running, run_privileged_install, run_privileged_setup_signing,
-    InstallOptions,
+    check_run_file, install_running, recovery_pending, run_privileged_install,
+    run_privileged_recover, run_privileged_setup_signing, InstallOptions, Recovered,
 };
 use crate::preflight::{
     conflict_summary, module_hint, secure_boot_advice, signing_summary, validate_module_choice,
@@ -495,6 +495,15 @@ pub fn build_ui(app: &Application) {
     running_banner.set_revealed(false);
     content.append(&running_banner);
 
+    // An install was cut off (power loss, crash) and left its journal.
+    let recover_banner = Banner::new(
+        "An earlier driver install was cut off before it finished. Restore the driver this \
+         computer had before (this also happens on its own at the next boot).",
+    );
+    recover_banner.set_button_label(Some("Restore Previous Driver"));
+    recover_banner.set_revealed(false);
+    content.append(&recover_banner);
+
     content.append(&stack);
     toast_overlay.set_child(Some(&content));
     window.set_content(Some(&toast_overlay));
@@ -713,8 +722,13 @@ pub fn build_ui(app: &Application) {
                     secureboot_row.set_subtitle(&info.secure_boot.to_string());
 
                     // Module signing: key state, installed module's signer
-                    signing_row.set_subtitle(
-                        &signing_summary(&info.signing_key, &info.module_signature));
+                    let mut signing_text = signing_summary(&info.signing_key, &info.module_signature);
+                    if info.signing_pair.as_ref().is_some_and(|p| p.key_hidden) {
+                        signing_text.push_str(
+                            "\nIts private key is readable only by root, so it is checked during the install.",
+                        );
+                    }
+                    signing_row.set_subtitle(&signing_text);
 
                     // Disk
                     match info.free_disk_bytes {
@@ -1458,17 +1472,84 @@ pub fn build_ui(app: &Application) {
         });
     }
 
+    // Restore Previous Driver: roll back a cut-off install from its journal.
+    {
+        let state = state.clone();
+        let refresh_actions = refresh_actions.clone();
+        let log_fn = log_fn.clone();
+        let stack = stack.clone();
+        let progress = progress.clone();
+        let toast_overlay = toast_overlay.clone();
+        let load_sysinfo = load_sysinfo.clone();
+        let window = window.clone();
+        recover_banner.connect_button_clicked(move |banner| {
+            let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
+                return;
+            };
+            banner.set_revealed(false);
+            stack.set_visible_child_name("log");
+            progress.set_visible(true);
+            progress.set_text(Some("Restoring the previous driver…"));
+            log_fn("Restoring the driver setup from before the interrupted install…".to_string());
+            let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            crate::runtime().spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    run_privileged_recover(|line| {
+                        let _ = line_tx.send(line.to_string());
+                    })
+                })
+                .await;
+                let _ = result_tx.send(result);
+            });
+            let log_fn = log_fn.clone();
+            let progress = progress.clone();
+            let toast_overlay = toast_overlay.clone();
+            let load_sysinfo = load_sysinfo.clone();
+            let window = window.clone();
+            glib::MainContext::default().spawn_local(async move {
+                while let Some(line) = line_rx.recv().await {
+                    log_fn(line);
+                }
+                let result = match result_rx.await {
+                    Ok(Ok(r)) => r.map_err(|e| format!("{e:#}")),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("the restore task ended unexpectedly".to_string()),
+                };
+                guard.release();
+                progress.set_visible(false);
+                match result {
+                    Ok(Recovered::Restored) => {
+                        log_fn("The previous driver setup is back and checked.".to_string());
+                        toast_overlay.add_toast(Toast::new("Previous driver restored"));
+                    }
+                    Ok(Recovered::Nothing) => {
+                        log_fn("Nothing needed putting back: that install had finished.".to_string());
+                        toast_overlay.add_toast(Toast::new("Nothing needed restoring"));
+                    }
+                    Err(e) => {
+                        log_fn(format!("Restoring failed: {e}"));
+                        show_error(&window, "Restoring the previous driver failed", &e);
+                    }
+                }
+                load_sysinfo();
+            });
+        });
+    }
+
     // An install started before this window opened (the app was closed
     // during it) is still running: say so and start nothing until it ends.
     {
         let state = state.clone();
         let refresh_actions = refresh_actions.clone();
         let running_banner = running_banner.clone();
+        let recover_banner = recover_banner.clone();
         let load_sysinfo = load_sysinfo.clone();
         let check = move || {
             if state.borrow().busy.is_some() {
                 return glib::ControlFlow::Continue;
             }
+            recover_banner.set_revealed(recovery_pending());
             let running = install_running();
             if running != state.borrow().external_install {
                 state.borrow_mut().external_install = running;
