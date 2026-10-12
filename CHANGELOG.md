@@ -20,20 +20,27 @@ under 2.3.0.
   the distribution packages it is about to remove.
 - If NVIDIA's installer then fails, or the install is stopped before the installer has run,
   it removes whatever the installer had put in place and reinstalls the removed packages,
-  together with the packages that depend on them, from those saved copies. Only a package
-  it couldn't save is installed from your distribution instead, possibly at a newer version.
-  On Fedora the locally built kernel module is rebuilt. Holds, "installed automatically"
-  marks, the block on distro driver packages and the boot configuration are put back too.
+  together with the packages that depend on them, from those saved copies, which works
+  without a network connection. A package it couldn't save is installed at that exact
+  version from your distribution's repositories if they still have it, otherwise at the
+  version they have now. On Fedora the locally built kernel module is rebuilt. Holds,
+  "installed automatically" marks, the block on distro driver packages and the boot
+  configuration are put back too.
 - It then checks that the driver the computer had before is back, signed for Secure Boot
-  where that is on, and only then reports that the next boot uses it. When it can't confirm
+  where that is on, also for a newer kernel the computer now boots, and only then reports
+  that the next boot uses it. When it can't confirm
   that, for example because NVIDIA's installer had already removed a driver installed
   earlier from NVIDIA's own installer, Green Light says so and tells you not to reboot until
   a working driver is installed.
 - If the computer loses power or the install is killed partway, the previous driver is put
-  back at the next boot, before the login screen. Restore Previous Driver in Green Light
-  does the same without rebooting, and the next install does it first.
+  back at the next boot, before the login screen, with progress on the boot screen. Restore
+  Previous Driver in Green Light does the same without rebooting, and the next install does
+  it first; if that fails again, the next install keeps the original setup as the one to
+  return to. If the driver was changed by other means in the meantime, nothing is touched:
+  Green Light explains and offers to discard the old recovery data.
 - Closing Green Light, closing the terminal it was started from, or logging out no longer
-  interrupts a running install, and shutdown and suspend wait until it is done. A request to
+  interrupts a running install, and while it is changing the system, shutting down or
+  suspending is blocked (an administrator can still force it). A request to
   stop is honoured only where it is safe: before any change it stops cleanly, and once
   NVIDIA's installer has succeeded the install is finished rather than undone. Closing the
   window during an install asks first, and Green Light shows when an install started earlier

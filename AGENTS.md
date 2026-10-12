@@ -60,8 +60,11 @@ them breaks existing installs' policy/settings).
   when the run started (the script writes nothing to pipes), and the
   failure message comes from its exit code and first `ERROR:` line, so it
   always describes this run. `install_running` reads the script's lock;
-  `recovery_pending` sees a journal with no install running, and
-  `run_privileged_recover` runs `--recover`.
+  `recovery_pending` sees a journal with no install running,
+  `recovery_note` reads the script's note, `run_privileged_recover` runs
+  `--recover` and `run_privileged_discard_recovery` `--discard-recovery`;
+  exit 6 comes back as a `StaleRecovery` error (the UI offers Discard and
+  Install).
 - `ui.rs` runs one long operation at a time (`Busy`: download — including
   checksum verification and the unverified/retry questions — install, or
   signing setup); `actions_enabled` derives every button's sensitivity from
@@ -71,7 +74,8 @@ them breaks existing installs' policy/settings).
   shown only after the last streamed output line. Closing the window during
   an install or signing setup asks first; an install from an earlier run
   (lock held) shows a banner and blocks new actions until it ends; a
-  journal with no install running shows the Restore Previous Driver banner. The
+  journal with no install running shows a banner whose action follows the
+  note: Restore Previous Driver, Try Again, or Discard Recovery Data. The
   version list shows at once; branch labels are added to the rows when
   `branches.rs` answers (20 s limit).
 
@@ -116,24 +120,32 @@ copy of that logic.
   the machine:
   - Without a terminal it writes nothing to stdout/stderr (pipes to the app,
     which may be closed: SIGPIPE); everything goes to
-    `/var/log/green-light.log`, which the app follows (`run_pkexec`,
-    `LogTail`). SIGPIPE keeps its default for child commands; SIGHUP is
-    ignored.
+    `/var/log/green-light.log`, each line tagged `[green-light <PID>]`, and
+    the app follows the log showing only its own run's lines
+    (`run_pkexec`, `LogTail`). Run by systemd (the boot unit,
+    `INVOCATION_ID` set) stdout/stderr stay on: they go to the journal and
+    console. SIGPIPE keeps its default for child commands; SIGHUP is ignored.
   - It re-execs into its own transient scope (`systemd-run --scope`, same
-    PID, skipped under a systemd service, guarded by `GREEN_LIGHT_SCOPED`)
-    so logout doesn't kill it, then into its own session (`setsid`).
+    PID; a trial `systemd-run --scope true` first, and without a working
+    one it goes on unscoped with a warning; skipped under a systemd
+    service; guarded by `GREEN_LIGHT_SCOPED`) so logout doesn't kill it,
+    then into its own session (`setsid`).
   - SIGTERM/SIGINT set `STOP_REQUESTED`, honoured only at safe points:
     before anything changes it exits "No changes made"; after the purge and
     before nvidia-installer it rolls back; a signal during nvidia-installer
     is taken when it ends: success finishes the install, failure rolls back.
     The EXIT trap ignores TERM/INT first thing.
-  - While armed, `systemd-inhibit --what=shutdown:sleep --mode=block` holds
-    off shutdown/suspend (`tail --pid=$$` as the held command, so it ends
-    with the script).
-  - `flock` on `/run/green-light-install.lock` (fd 9): one install at a
-    time; the app uses it to see an install that outlived its window. Every
-    long or package-manager command runs through `nolock` (`9>&-`), so
-    background jobs (akmods from an rpm scriptlet, DKMS) don't keep the lock.
+  - While it changes the system (armed, and during any recovery),
+    `systemd-inhibit --what=shutdown:sleep --mode=block` blocks shutdown and
+    suspend requests (an administrator can still force them; `tail
+    --pid=$$` as the held command, so it ends with the script).
+  - `flock` on `/run/green-light-install.lock` (fd 9): one install, recovery
+    or signing setup at a time; logging starts once it is held. The app
+    uses it to see an install that outlived its window. Every long or
+    package-manager command runs through `nolock` (a subshell with fd 9
+    closed and TERM/INT back at their defaults), so background jobs
+    (akmods from an rpm scriptlet, DKMS) neither keep the lock nor inherit
+    the rollback's ignored signals.
 - Order: validate arguments and the .run file (exit 2), copy it into a
   root-only dir and verify the SHA256 on the copy, `--check`, install
   prerequisites (allowed to fail), **check** the module can be built for
@@ -144,35 +156,56 @@ copy of that logic.
   `CONFIG_CC_VERSION_TEXT` when installed), for the chosen flavor or both.
   Any of these failing is "No changes made" (exit 1).
 - **Journal** (`/var/lib/green-light/journal`, root-only, parent 0755 so the
-  app can see it; written as `journal.new`, synced, renamed): before the
-  first change it records a snapshot of every installed package at exact
-  versions, the removal plan (`apt-get -s purge` / `dnf remove --assumeno`
-  listing; only plan ∩ actually-removed is ever reinstalled), which of them
-  were automatically installed, holds, the block state, file backups, the
-  earlier .run version and the module's version and signer, and copies of
-  the packages to be removed (apt's cache or `apt-get download`; `dnf
-  download`; akmods' cached kmod rpm) so the rollback works offline. Phase:
-  `armed` → `installer-started` → `installer-done`; the journal is removed
-  when the installer has succeeded or a rollback has been verified, kept
-  when a rollback fails.
+  app can see it; written as `journal.new`, every file synced, renamed):
+  before the first change it records a snapshot of every installed package
+  at exact versions, the removal plan (`apt-get -s purge` / `dnf remove
+  --assumeno` listing; only plan ∩ actually-removed is ever reinstalled),
+  which of them were automatically installed, holds, the block state, file
+  backups, the earlier .run version, the module's version and signer, the
+  .run version being installed (`TARGET_RUN_VER`, from the file name) and
+  the boot ID, and copies of the packages to be removed (apt's cache or
+  `apt-get download`; `dnf download`; akmods' cached kmod rpm; index
+  written atomically) so the rollback works offline. Phase: `armed` →
+  `installer-started` → `installer-done`; the journal is removed when the
+  installer has succeeded or a rollback has been verified, kept when a
+  rollback fails. `recovery-status` next to it (0644) tells the app why
+  recovery data is waiting (`failed: …` / `refused: …`).
 - **Rollback** (EXIT trap while armed, or recovery): `nvidia-uninstall` if
   the failed installer registered a new .run driver, restore files,
-  reinstall the removed set from the kept copies (else exact versions, else
-  current; dnf with `--skip-unavailable` / `--setopt=strict=0`; akmods'
-  local `kmod-nvidia-<kernel>` never from a repository: `akmods --force
-  --kernels $KVER` rebuilds it synchronously), restore auto marks, holds and
-  block, rebuild the initramfs, then `verify_restored` (earlier .run driver,
-  every removed package, a module for the kernel, and under Secure Boot a
-  signer that is unchanged or the enrolled key). Exit 3 only when that
-  passes, else 4.
-- **Recovery**: a journal left by a cut-off run (power loss, SIGKILL) is
-  rolled back by `--recover` (the app's Restore Previous Driver), at the
-  start of the next install (a failure there is logged and the journal
-  dropped, as the new install replaces it), and at boot by
-  `data/green-light-recover.service` (ConditionPathExists on the journal,
-  before the display manager; `SuccessExitStatus=3`). Phase
-  `installer-done` only clears the journal. Exit codes of `--recover`: 0
-  nothing to put back, 3 restored and verified, 4 failed.
+  reinstall the removed set — dnf: the kept copies alone with
+  `--disablerepo='*'` (works offline with expired metadata), then only what
+  has no copy from the repositories (`--skip-unavailable` /
+  `--setopt=strict=0`); apt: the kept .debs plus exact versions; else
+  current versions; akmods' local `kmod-nvidia-<kernel>` never from a
+  repository — restore auto marks, holds and block. For each kernel that
+  matters — the journal's and, at a boot into a newer one, `uname -r` — it
+  makes sure the module exists (`akmods --force --kernels`, Ubuntu's
+  `linux-modules-nvidia-<branch>-<kernel>` when the setup used prebuilt
+  modules, else `dkms autoinstall -k`) and rebuilds that kernel's
+  initramfs. Then `verify_restored`: the earlier .run driver, every removed
+  package, a module for each of those kernels, and under Secure Boot a
+  signer that is unchanged or the enrolled key. Exit 3 only when that
+  passes, else 4. What the rollback installed is recorded (`reinstalled`).
+- **Recovery**: a journal left by a cut-off run (power loss, SIGKILL) or a
+  failed rollback is handled by `--recover` (the app's Restore Previous
+  Driver), at the start of the next install, and at boot by
+  `data/green-light-recover.service` (ConditionPathExists on the journal;
+  after akmods/dkms, before the display manager; output to journal and
+  console, progress on plymouth via `plymouth display-message`;
+  `SuccessExitStatus=3 6`; `TimeoutStartSec=20min` — a timeout leaves the
+  journal for the next try). Phase `installer-done` only clears the journal.
+  First `journal_stale_reason`: if the driver was changed by other means
+  since (a .run driver that is neither the earlier nor the target one, or
+  driver packages neither in the snapshot nor put back by a rollback),
+  nothing is touched: exit 6, note `refused: …`, until `--discard-recovery`
+  (a mode for the app's Discard Recovery Data, and an install option for its
+  Discard and Install). Exit codes of `--recover`: 0 nothing to put back, 3
+  restored and verified, 4 failed, 6 refused.
+- At the start of an install, a journal whose rollback fails again is
+  carried over: the new journal is built on it (its snapshot, plan, copies,
+  holds, block, backups and driver state stay the baseline; this install's
+  removals are added), so rolling back the new install restores the setup
+  from before the first one. A stale journal stops the install (exit 6).
 - The distro-driver block is set right after nvidia-installer succeeds, so
   every later exit keeps it as asked. Exit 5 = installed but initramfs
   failed. The script never exits 126/127 (pkexec's dismissed / not
@@ -198,12 +231,15 @@ copy of that logic.
   unprivileged in bubblewrap with scratch `/etc`, `/var`, `/boot`, `/run`,
   `/tmp`, `/usr/lib/nvidia` and module tree, and a PATH of stubs that keep a
   fake dpkg/rpm database (purges take reverse dependencies, downloads and
-  reinstalls bring packages and the module back, `$GLT/offline` cuts the
-  network). It covers signals at each stop point, SIGKILL in each journal
-  phase with `--recover` and the boot unit's ExecStart, offline recovery,
-  dnf with an akmods kmod, the lock, ACLs, partial and earlier .run
-  installs, Secure Boot verification, and `systemd-analyze verify` of the
-  unit. Add a case there for every behaviour change. CI runs it.
+  reinstalls bring packages and modules back, `$GLT/offline` cuts the
+  network and makes dnf's metadata fail). It covers signals at each stop
+  point, SIGKILL in each journal phase with `--recover` and the boot unit's
+  ExecStart, offline recovery, a newer boot kernel (prebuilt, DKMS, and
+  missing), stale journals and discarding, carried baselines, dnf with an
+  akmods kmod, the lock (signing setup too), PID-tagged log lines, ACLs,
+  partial and earlier .run installs, Secure Boot verification, inherited
+  signals and fds, and `systemd-analyze verify` of the unit. Add a case
+  there for every behaviour change. CI runs it.
 
 ## Build process
 
@@ -226,7 +262,8 @@ the script itself never has):
    the AppDir (`sync_appdata_releases.py --output`); CI checks the tracked
    copy separately. The setup helper also installs
    `data/green-light-recover.service` to `/etc/systemd/system` and enables it
-   (hash-verified like the rest; AppRun reinstalls when it differs). AppRun
+   (hash-verified like the rest; AppRun reinstalls when it differs or isn't
+   enabled). AppRun
    stages the setup files in a `mktemp -d` dir and,
    on first run, runs the staged helper as `pkexec "$BASH" <helper>` so a
    noexec `/tmp` doesn't matter.
