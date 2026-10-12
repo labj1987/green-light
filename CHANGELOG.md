@@ -5,7 +5,7 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
-## 2.10.0 — 2026-10-11
+## 2.10.0 — 2026-10-12
 
 **Installs that fail safely**
 - Installing a driver downloaded in Green Light, or a `.run` file you downloaded yourself,
@@ -27,8 +27,9 @@ under 2.3.0.
   "installed automatically" marks, the block on distro driver packages and the boot
   configuration are put back too.
 - It then checks that the driver the computer had before is back, signed for Secure Boot
-  where that is on, also for a newer kernel the computer now boots, and only then reports
-  that the next boot uses it. When it can't confirm
+  where that is on, and only then reports that the next boot uses it. If the computer now
+  boots a newer kernel, that kernel gets the driver's module too; when the previous driver
+  had none for it either, Green Light only warns. When it can't confirm
   that, for example because NVIDIA's installer had already removed a driver installed
   earlier from NVIDIA's own installer, Green Light says so and tells you not to reboot until
   a working driver is installed.
@@ -37,7 +38,7 @@ under 2.3.0.
   Previous Driver in Green Light does the same without rebooting, and the next install does
   it first; if that fails again, the next install keeps the original setup as the one to
   return to. If the driver was changed by other means in the meantime, nothing is touched:
-  Green Light explains and offers to discard the old recovery data.
+  Green Light explains, and offers to check again or to discard the old recovery data.
 - Closing Green Light, closing the terminal it was started from, or logging out no longer
   interrupts a running install, and while it is changing the system, shutting down or
   suspending is blocked (an administrator can still force it). A request to

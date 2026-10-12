@@ -75,7 +75,9 @@ them breaks existing installs' policy/settings).
   an install or signing setup asks first; an install from an earlier run
   (lock held) shows a banner and blocks new actions until it ends; a
   journal with no install running shows a banner whose action follows the
-  note: Restore Previous Driver, Try Again, or Discard Recovery Data. The
+  note: Restore Previous Driver, Try Again, or (refused) Retry Recovery /
+  Discard Recovery Data. The note is re-evaluated by every recovery run,
+  so at every boot. The
   version list shows at once; branch labels are added to the rows when
   `branches.rs` answers (20 s limit).
 
@@ -162,8 +164,9 @@ copy of that logic.
   --assumeno` listing; only plan ∩ actually-removed is ever reinstalled),
   which of them were automatically installed, holds, the block state, file
   backups, the earlier .run version, the module's version and signer, the
-  .run version being installed (`TARGET_RUN_VER`, from the file name) and
-  the boot ID, and copies of the packages to be removed (apt's cache or
+  .run version being installed (`TARGET_RUN_VER`, from the verified copy's
+  makeself `label=`, not the file name), the kernels that had an nvidia
+  module (`MOD_KERNELS_BEFORE`) and the boot ID, and copies of the packages to be removed (apt's cache or
   `apt-get download`; `dnf download`; akmods' cached kmod rpm; index
   written atomically) so the rollback works offline. Phase: `armed` →
   `installer-started` → `installer-done`; the journal is removed when the
@@ -184,8 +187,12 @@ copy of that logic.
   modules, else `dkms autoinstall -k`) and rebuilds that kernel's
   initramfs. Then `verify_restored`: the earlier .run driver, every removed
   package, a module for each of those kernels, and under Secure Boot a
-  signer that is unchanged or the enrolled key. Exit 3 only when that
-  passes, else 4. What the rollback installed is recorded (`reinstalled`).
+  signer that is unchanged or the enrolled key; a missing module for another
+  kernel the previous driver didn't cover either (not in
+  `MOD_KERNELS_BEFORE`) is only a warning. Exit 3 only when that passes,
+  else 4. What the rollback installs is recorded after every step
+  (`record_reinstalled`, synced), so an interrupted recovery still knows
+  its own work.
 - **Recovery**: a journal left by a cut-off run (power loss, SIGKILL) or a
   failed rollback is handled by `--recover` (the app's Restore Previous
   Driver), at the start of the next install, and at boot by
@@ -204,8 +211,10 @@ copy of that logic.
 - At the start of an install, a journal whose rollback fails again is
   carried over: the new journal is built on it (its snapshot, plan, copies,
   holds, block, backups and driver state stay the baseline; this install's
-  removals are added), so rolling back the new install restores the setup
-  from before the first one. A stale journal stops the install (exit 6).
+  removals are added; the earlier target joins `KNOWN_TARGETS` and an
+  earlier `installer-started` is kept as `EARLIER_INSTALLER_STARTED`), so
+  rolling back the new install restores the setup from before the first
+  one. A stale journal stops the install (exit 6).
 - The distro-driver block is set right after nvidia-installer succeeds, so
   every later exit keeps it as asked. Exit 5 = installed but initramfs
   failed. The script never exits 126/127 (pkexec's dismissed / not
