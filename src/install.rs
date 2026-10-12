@@ -37,6 +37,9 @@ pub struct InstallOptions {
     /// download) it is computed here so the privileged script can still pin
     /// the exact bytes the user chose against a swap.
     pub sha256: Option<String>,
+    /// Drop recovery data from an earlier interrupted install that no longer
+    /// matches the computer (`--discard-recovery`), as the user chose.
+    pub discard_recovery: bool,
 }
 
 /// Hash a file with SHA256, streaming so a ~300 MB .run isn't held in memory.
@@ -107,55 +110,80 @@ struct ScriptRun {
     lines: Vec<String>,
 }
 
-/// The script's messages in a piece of its log file: the text after
-/// "[green-light] " on each complete line. `partial` carries an unfinished
-/// last line over to the next piece. Other lines (the package manager's and
-/// installers' output, which also goes to the log) are left out.
-fn script_lines(chunk: &str, partial: &mut String) -> Vec<String> {
-    partial.push_str(chunk);
-    let mut out = Vec::new();
-    while let Some(end) = partial.find('\n') {
-        let line: String = partial.drain(..=end).collect();
-        if let Some((_, msg)) = line.trim_end_matches('\n').split_once("[green-light] ") {
-            if !msg.trim().is_empty() {
-                out.push(msg.to_string());
-            }
-        }
-    }
-    out
+/// The messages of the run with PID `pid` in some lines of the script's log
+/// ("<date> <time> [green-light <pid>] <message>"). Other runs' lines (a
+/// second install refused by the lock, for one) and other programs' output,
+/// which also goes to the log, are left out.
+fn script_lines(complete_lines: &[u8], pid: u32) -> Vec<String> {
+    let tag = format!("[green-light {pid}] ");
+    complete_lines
+        .split(|&b| b == b'\n')
+        .filter_map(|line| {
+            let line = String::from_utf8_lossy(line);
+            let (_, msg) = line.split_once(&tag)?;
+            (!msg.trim().is_empty()).then(|| msg.to_string())
+        })
+        .collect()
 }
 
-/// Follows a log file from a given offset.
+/// Follows a log file from a given offset, a whole line at a time (so a
+/// character split across two reads is never cut), across rotation.
 struct LogTail {
-    path: &'static str,
+    path: std::path::PathBuf,
     pos: u64,
-    partial: String,
+    inode: Option<u64>,
+    partial: Vec<u8>,
 }
 
 impl LogTail {
-    fn read_new(&mut self) -> Vec<String> {
+    /// From the current end of `path`.
+    fn at_end(path: impl Into<std::path::PathBuf>) -> Self {
+        let path = path.into();
+        let meta = std::fs::metadata(&path).ok();
+        LogTail {
+            pos: meta.as_ref().map_or(0, |m| m.len()),
+            inode: meta.as_ref().map(|m| m.ino()),
+            partial: Vec::new(),
+            path,
+        }
+    }
+
+    /// Complete new lines (raw bytes, newline-separated).
+    fn read_new_lines(&mut self) -> Vec<u8> {
         use std::io::{Seek, SeekFrom};
-        let Ok(mut f) = std::fs::File::open(self.path) else { return vec![] };
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        if len < self.pos {
-            self.pos = 0; // rotated or truncated
+        let Ok(mut f) = std::fs::File::open(&self.path) else { return vec![] };
+        let Ok(meta) = f.metadata() else { return vec![] };
+        // A new file under the name (rotated), or the old one cut short.
+        if self.inode != Some(meta.ino()) || meta.len() < self.pos {
+            self.inode = Some(meta.ino());
+            self.pos = 0;
+            self.partial.clear();
         }
         let mut buf = Vec::new();
         if f.seek(SeekFrom::Start(self.pos)).is_err() || f.read_to_end(&mut buf).is_err() {
             return vec![];
         }
         self.pos += buf.len() as u64;
-        script_lines(&String::from_utf8_lossy(&buf), &mut self.partial)
+        self.partial.extend_from_slice(&buf);
+        match self.partial.iter().rposition(|&b| b == b'\n') {
+            Some(end) => self.partial.drain(..=end).collect(),
+            None => vec![],
+        }
+    }
+
+    fn read_new(&mut self, pid: u32) -> Vec<String> {
+        script_lines(&self.read_new_lines(), pid)
     }
 }
 
 /// Run `pkexec <args>` and pass the script's messages to `on_line` as they
 /// come. Without a terminal the script writes nothing to its stdout or
 /// stderr (a pipe to this app, which may be closed mid-install), only to its
-/// log file, so the log is what is followed here. pkexec's own messages
-/// (from before the script starts) come on stderr and are passed on too.
+/// log file, so the log is what is followed here: the lines tagged with the
+/// script's PID, which is pkexec's (pkexec execs the script). pkexec's own
+/// messages (from before the script starts) come on stderr.
 fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
-    let start = std::fs::metadata(INSTALL_LOG).map(|m| m.len()).unwrap_or(0);
+    let mut tail = LogTail::at_end(INSTALL_LOG);
     let mut child = Command::new("pkexec")
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -163,6 +191,7 @@ fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str
         .stderr(Stdio::piped())
         .spawn()
         .context("Failed to launch pkexec — is polkit installed?")?;
+    let pid = child.id();
     if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
         // A write error means the script already exited (e.g. cancelled
         // authentication); its exit code says why.
@@ -174,11 +203,10 @@ fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str
         })
     });
 
-    let mut tail = LogTail { path: INSTALL_LOG, pos: start, partial: String::new() };
     let mut lines = Vec::new();
     let status = loop {
         let exited = child.try_wait().context("Waiting for pkexec failed")?;
-        for line in tail.read_new() {
+        for line in tail.read_new(pid) {
             on_line(&line);
             lines.push(line);
         }
@@ -189,12 +217,34 @@ fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str
     };
     if let Some(Ok(err_lines)) = stderr.map(|t| t.join()) {
         for line in err_lines.into_iter().filter(|l| !l.trim().is_empty()) {
-            let line = line.strip_prefix("[green-light] ").unwrap_or(&line).to_string();
             on_line(&line);
             lines.push(line);
         }
     }
     Ok(ScriptRun { code: status.code(), lines })
+}
+
+/// Recovery data from an earlier interrupted install no longer matches the
+/// computer (the script's exit code 6): nothing is done until the user
+/// chooses to discard it.
+#[derive(Debug)]
+pub struct StaleRecovery(pub String);
+
+impl std::fmt::Display for StaleRecovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for StaleRecovery {}
+
+fn stale_recovery(lines: &[String]) -> anyhow::Error {
+    let why = first_error(lines).unwrap_or("its recovery data doesn't match this computer any more");
+    anyhow::Error::new(StaleRecovery(format!(
+        "An earlier install was interrupted, and its recovery data no longer matches this \
+         computer: {why}. Discard that data if the driver this computer has now is the one you \
+         want."
+    )))
 }
 
 /// An interrupted install's journal (keep in step with STATE_DIR/JOURNAL in
@@ -228,8 +278,53 @@ fn recover_result(code: Option<i32>, lines: &[String]) -> Result<Recovered> {
             "The previous driver could not be fully restored{detail}. Don't reboot until a \
              working driver is installed; the Log tab has the details."
         ),
+        Some(6) => Err(stale_recovery(lines)),
         Some(c) => bail!("Restoring exited with code {c}{detail} (see {INSTALL_LOG})"),
         None => bail!("Restoring was killed before it finished."),
+    }
+}
+
+/// Why recovery data is waiting, from the script's note
+/// (`/var/lib/green-light/recovery-status`; keep in step with
+/// RECOVERY_STATUS in the script): "refused: <why>" or "failed: <why>".
+pub const RECOVERY_STATUS: &str = "/var/lib/green-light/recovery-status";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RecoveryNote {
+    /// The data no longer matches the computer; only discarding it helps.
+    Refused(String),
+    /// A restore was tried and failed; trying again may help.
+    Failed(String),
+}
+
+pub fn parse_recovery_note(text: &str) -> Option<RecoveryNote> {
+    let text = text.trim();
+    if let Some(why) = text.strip_prefix("refused: ") {
+        Some(RecoveryNote::Refused(why.to_string()))
+    } else {
+        text.strip_prefix("failed: ").map(|why| RecoveryNote::Failed(why.to_string()))
+    }
+}
+
+pub fn recovery_note() -> Option<RecoveryNote> {
+    std::fs::read_to_string(RECOVERY_STATUS).ok().and_then(|t| parse_recovery_note(&t))
+}
+
+/// Drop recovery data that no longer matches the computer (the script's
+/// `--discard-recovery`).
+pub fn run_privileged_discard_recovery(mut on_line: impl FnMut(&str)) -> Result<()> {
+    if !Path::new(PRIVILEGED_SCRIPT).exists() {
+        bail!("Privileged install script not found at {}", PRIVILEGED_SCRIPT);
+    }
+    let args = [PRIVILEGED_SCRIPT.to_string(), "--discard-recovery".to_string()];
+    let run = run_pkexec(&args, None, &mut on_line)?;
+    match run.code {
+        Some(0) => Ok(()),
+        Some(126) => bail!("Authentication was cancelled; nothing was changed."),
+        code => bail!(
+            "Discarding the recovery data failed (exit code {code:?}){}",
+            first_error(&run.lines).map(|e| format!(": {e}")).unwrap_or_default()
+        ),
     }
 }
 
@@ -308,6 +403,9 @@ pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&st
     if opts.block_distro_driver {
         args.push("--block-distro-driver".to_string());
     }
+    if opts.discard_recovery {
+        args.push("--discard-recovery".to_string());
+    }
     if let Some(arg) = opts.module.installer_arg() {
         args.push(arg.to_string());
     }
@@ -315,6 +413,9 @@ pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&st
     let run = run_pkexec(&args, None, &mut on_line)?;
     if run.code == Some(0) {
         return Ok(());
+    }
+    if run.code == Some(6) {
+        return Err(stale_recovery(&run.lines));
     }
     bail!("{}", install_failure(run.code, &run.lines))
 }
@@ -398,34 +499,68 @@ mod tests {
     }
 
     #[test]
-    fn script_lines_from_the_log() {
-        let mut partial = String::new();
-        let got = script_lines(
-            "2026-10-12 10:00:00 [green-light] ==== NVIDIA driver install started ====\n\
-             Reading package lists...\n\
-             2026-10-12 10:00:01 [green-light] Copying installer to priv",
-            &mut partial,
+    fn script_lines_are_this_runs_only() {
+        let log = "2026-10-12 10:00:00 [green-light 42] ==== NVIDIA driver install started ====\n\
+                   Reading package lists...\n\
+                   2026-10-12 10:00:00 [green-light 77] ERROR: Another Green Light install is still running\n\
+                   2026-10-12 10:00:01 [green-light 42] Copying installer\n\
+                   2026-10-12 10:00:02 [green-light 42] \n";
+        assert_eq!(
+            script_lines(log.as_bytes(), 42),
+            ["==== NVIDIA driver install started ====", "Copying installer"]
         );
-        assert_eq!(got, ["==== NVIDIA driver install started ===="]);
-        let got = script_lines("ate directory…\n2026-10-12 10:00:02 [green-light] \n", &mut partial);
-        assert_eq!(got, ["Copying installer to private directory…"]);
-        assert!(partial.is_empty());
+        assert_eq!(script_lines(log.as_bytes(), 77), ["ERROR: Another Green Light install is still running"]);
     }
 
     #[test]
-    fn log_tail_follows_appends() {
-        let path = std::env::temp_dir().join(format!("green-light-tail-{}", std::process::id()));
-        std::fs::write(&path, "old [green-light] before\n").unwrap();
-        let start = std::fs::metadata(&path).unwrap().len();
-        let leaked: &'static str = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
-        let mut tail = LogTail { path: leaked, pos: start, partial: String::new() };
-        assert!(tail.read_new().is_empty());
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap()
-            .write_all(b"t [green-light] one\nt [green-light] tw").unwrap();
-        assert_eq!(tail.read_new(), ["one"]);
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"o\n").unwrap();
-        assert_eq!(tail.read_new(), ["two"]);
-        std::fs::remove_file(path).unwrap();
+    fn log_tail_keeps_characters_and_follows_rotation() {
+        let dir = std::env::temp_dir().join(format!("green-light-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log");
+        std::fs::write(&path, "t [green-light 5] before\n").unwrap();
+        let mut tail = LogTail::at_end(&path);
+        assert!(tail.read_new(5).is_empty());
+        let append = |bytes: &[u8]| {
+            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(bytes).unwrap()
+        };
+        // "…" is three bytes; the first read ends inside it.
+        let line = "t [green-light 5] Copying…done\n".as_bytes();
+        let cut = line.iter().position(|&b| b == 0xE2).unwrap() + 1;
+        append(&line[..cut]);
+        assert!(tail.read_new(5).is_empty());
+        append(&line[cut..]);
+        assert_eq!(tail.read_new(5), ["Copying…done"]);
+        // Rotated: a new file, already longer than where the old one was read to.
+        std::fs::rename(&path, dir.join("log.1")).unwrap();
+        std::fs::write(&path, "t [green-light 5] after rotation, a long first line here\n").unwrap();
+        assert_eq!(tail.read_new(5), ["after rotation, a long first line here"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_recovery_is_its_own_error() {
+        let e = install_failure_or_stale(Some(6), &lines(&["ERROR: Not restoring: the driver changed"]));
+        assert!(e.downcast_ref::<StaleRecovery>().is_some(), "{e}");
+        assert!(e.to_string().contains("the driver changed"));
+        let e = recover_result(Some(6), &[]).unwrap_err();
+        assert!(e.downcast_ref::<StaleRecovery>().is_some());
+        assert_eq!(
+            parse_recovery_note("refused: the driver changed\n"),
+            Some(RecoveryNote::Refused("the driver changed".into()))
+        );
+        assert_eq!(parse_recovery_note("failed: x"), Some(RecoveryNote::Failed("x".into())));
+        assert_eq!(parse_recovery_note(""), None);
+    }
+
+    fn install_failure_or_stale(code: Option<i32>, lines: &[String]) -> anyhow::Error {
+        if code == Some(6) { stale_recovery(lines) } else { anyhow::anyhow!(install_failure(code, lines)) }
+    }
+
+    #[test]
+    fn recovery_status_matches_the_script() {
+        let script = include_str!("../scripts/privileged-install.sh");
+        assert!(script.contains("\nRECOVERY_STATUS=\"$STATE_DIR/recovery-status\"\n"));
+        assert_eq!(RECOVERY_STATUS, "/var/lib/green-light/recovery-status");
     }
 
     #[test]

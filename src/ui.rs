@@ -1,8 +1,9 @@
 use crate::download::{download_run_file, verify_sha256};
 use crate::branches::{fetch_branches, DriverBranch, UNIX_DRIVERS_PAGE};
 use crate::install::{
-    check_run_file, install_running, recovery_pending, run_privileged_install,
-    run_privileged_recover, run_privileged_setup_signing, InstallOptions, Recovered,
+    check_run_file, install_running, recovery_note, recovery_pending,
+    run_privileged_discard_recovery, run_privileged_install, run_privileged_recover,
+    run_privileged_setup_signing, InstallOptions, Recovered, RecoveryNote, StaleRecovery,
 };
 use crate::preflight::{
     conflict_summary, module_hint, secure_boot_advice, signing_summary, validate_module_choice,
@@ -62,6 +63,8 @@ struct AppState {
     /// An install started by an earlier run of the app is still going.
     external_install: bool,
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The next install may drop stale recovery data (the user said so).
+    discard_recovery_next: bool,
 }
 
 impl Default for AppState {
@@ -80,6 +83,7 @@ impl Default for AppState {
             busy_token: 0,
             external_install: false,
             download_cancel: None,
+            discard_recovery_next: false,
         }
     }
 }
@@ -495,14 +499,14 @@ pub fn build_ui(app: &Application) {
     running_banner.set_revealed(false);
     content.append(&running_banner);
 
-    // An install was cut off (power loss, crash) and left its journal.
-    let recover_banner = Banner::new(
-        "An earlier driver install was cut off before it finished. Restore the driver this \
-         computer had before (this also happens on its own at the next boot).",
-    );
+    // An install was cut off (power loss, crash) and left its journal. The
+    // banner's text and action follow the script's note (see the timer below).
+    let recover_banner = Banner::new(RECOVER_TEXT);
     recover_banner.set_button_label(Some("Restore Previous Driver"));
     recover_banner.set_revealed(false);
     content.append(&recover_banner);
+    // The banner's button discards the data instead of restoring from it.
+    let recover_discards = Rc::new(std::cell::Cell::new(false));
 
     content.append(&stack);
     toast_overlay.set_child(Some(&content));
@@ -1280,7 +1284,8 @@ pub fn build_ui(app: &Application) {
         let refresh_actions = refresh_actions.clone();
         let window = window.clone();
 
-        install_btn.connect_clicked(move |_| {
+        install_btn.connect_clicked(move |install_btn| {
+            let install_btn = install_btn.clone();
             let s = state.borrow();
             if s.busy.is_some() {
                 return;
@@ -1314,8 +1319,10 @@ pub fn build_ui(app: &Application) {
                 module: s.module_choice,
                 run_file: run_file.clone(),
                 sha256: s.expected_checksum.clone(),
+                discard_recovery: s.discard_recovery_next,
             };
             drop(s);
+            state.borrow_mut().discard_recovery_next = false;
 
             let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
                 return;
@@ -1362,6 +1369,7 @@ pub fn build_ui(app: &Application) {
             let progress = progress.clone();
             let load_sysinfo = load_sysinfo.clone();
             let window = window.clone();
+            let state = state.clone();
 
             glib::MainContext::default().spawn_local(async move {
                 while let Some(line) = line_rx.recv().await {
@@ -1380,6 +1388,26 @@ pub fn build_ui(app: &Application) {
                             log_fn("Install completed successfully.".to_string());
                             log_fn("Reboot to switch to the new driver.".to_string());
                             toast_overlay.add_toast(Toast::new("Install complete — reboot to activate"));
+                        }
+                        Ok(Err(e)) if e.downcast_ref::<StaleRecovery>().is_some() => {
+                            log_fn(format!("Install not started: {e}"));
+                            // Only on the user's word: install anyway, dropping that data.
+                            let dialog = libadwaita::AlertDialog::new(
+                                Some("Recovery data from an interrupted install"),
+                                Some(&e.to_string()),
+                            );
+                            dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard and Install")]);
+                            dialog.set_response_appearance("discard", libadwaita::ResponseAppearance::Destructive);
+                            dialog.set_default_response(Some("cancel"));
+                            dialog.set_close_response("cancel");
+                            let state = state.clone();
+                            let install_btn = install_btn.clone();
+                            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
+                                if response == "discard" {
+                                    state.borrow_mut().discard_recovery_next = true;
+                                    install_btn.emit_clicked();
+                                }
+                            });
                         }
                         Ok(Err(e)) => {
                             log_fn(format!("Install failed: {e:#}"));
@@ -1482,22 +1510,34 @@ pub fn build_ui(app: &Application) {
         let toast_overlay = toast_overlay.clone();
         let load_sysinfo = load_sysinfo.clone();
         let window = window.clone();
+        let recover_discards = recover_discards.clone();
         recover_banner.connect_button_clicked(move |banner| {
             let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
                 return;
             };
+            let discard = recover_discards.get();
             banner.set_revealed(false);
             stack.set_visible_child_name("log");
             progress.set_visible(true);
-            progress.set_text(Some("Restoring the previous driver…"));
-            log_fn("Restoring the driver setup from before the interrupted install…".to_string());
+            if discard {
+                progress.set_text(Some("Discarding the recovery data…"));
+                log_fn("Discarding the recovery data of the interrupted install, as chosen…".to_string());
+            } else {
+                progress.set_text(Some("Restoring the previous driver…"));
+                log_fn("Restoring the driver setup from before the interrupted install…".to_string());
+            }
             let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             crate::runtime().spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    run_privileged_recover(|line| {
+                    let send = |line: &str| {
                         let _ = line_tx.send(line.to_string());
-                    })
+                    };
+                    if discard {
+                        run_privileged_discard_recovery(send).map(|()| Recovered::Nothing)
+                    } else {
+                        run_privileged_recover(send)
+                    }
                 })
                 .await;
                 let _ = result_tx.send(result);
@@ -1544,12 +1584,36 @@ pub fn build_ui(app: &Application) {
         let refresh_actions = refresh_actions.clone();
         let running_banner = running_banner.clone();
         let recover_banner = recover_banner.clone();
+        let recover_discards = recover_discards.clone();
         let load_sysinfo = load_sysinfo.clone();
         let check = move || {
             if state.borrow().busy.is_some() {
                 return glib::ControlFlow::Continue;
             }
-            recover_banner.set_revealed(recovery_pending());
+            if recovery_pending() {
+                let (text, button, discards) = match recovery_note() {
+                    Some(RecoveryNote::Refused(why)) => (
+                        format!(
+                            "An earlier driver install was interrupted, but its recovery data no \
+                             longer matches this computer: {why}. Nothing was restored."
+                        ),
+                        "Discard Recovery Data",
+                        true,
+                    ),
+                    Some(RecoveryNote::Failed(why)) => (
+                        format!("Restoring the driver from before an interrupted install failed: {why}."),
+                        "Try Again",
+                        false,
+                    ),
+                    None => (RECOVER_TEXT.to_string(), "Restore Previous Driver", false),
+                };
+                recover_banner.set_title(&text);
+                recover_banner.set_button_label(Some(button));
+                recover_discards.set(discards);
+                recover_banner.set_revealed(true);
+            } else {
+                recover_banner.set_revealed(false);
+            }
             let running = install_running();
             if running != state.borrow().external_install {
                 state.borrow_mut().external_install = running;
@@ -1567,6 +1631,9 @@ pub fn build_ui(app: &Application) {
 
     window.present();
 }
+
+const RECOVER_TEXT: &str = "An earlier driver install was cut off before it finished. Restore \
+     the driver this computer had before (this also happens on its own at the next boot).";
 
 const BLOCK_SUBTITLE: &str =
     "Keep apt or dnf from installing the distribution's NVIDIA driver over this one later";
