@@ -55,10 +55,13 @@ them breaks existing installs' policy/settings).
   with `InstallOptions` (DKMS, distro-driver block, module flavor), and
   `run_privileged_setup_signing` for `--setup-signing` (password on stdin).
   `check_run_file` applies the script's file rule before the password
-  prompt (off the GTK thread), ACLs included. The script's stdout/stderr
-  stream into the Log tab as it runs, and the failure message comes from its
-  exit code and first `ERROR:` line, so it always describes this run.
-  `install_running` reads the script's lock.
+  prompt (off the GTK thread), ACLs included. The script's messages reach
+  the Log tab by following `/var/log/green-light.log` from where it ended
+  when the run started (the script writes nothing to pipes), and the
+  failure message comes from its exit code and first `ERROR:` line, so it
+  always describes this run. `install_running` reads the script's lock;
+  `recovery_pending` sees a journal with no install running, and
+  `run_privileged_recover` runs `--recover`.
 - `ui.rs` runs one long operation at a time (`Busy`: download — including
   checksum verification and the unverified/retry questions — install, or
   signing setup); `actions_enabled` derives every button's sensitivity from
@@ -67,7 +70,8 @@ them breaks existing installs' policy/settings).
   panicking task can't leave the buttons disabled. The install result is
   shown only after the last streamed output line. Closing the window during
   an install or signing setup asks first; an install from an earlier run
-  (lock held) shows a banner and blocks new actions until it ends. The
+  (lock held) shows a banner and blocks new actions until it ends; a
+  journal with no install running shows the Restore Previous Driver banner. The
   version list shows at once; branch labels are added to the rows when
   `branches.rs` answers (20 s limit).
 
@@ -108,48 +112,72 @@ copy of that logic.
 
 ## Install script (`scripts/privileged-install.sh`)
 
-- It must finish (or roll back) whatever happens to the app: it re-execs
-  itself under `setsid` (own session: a terminal hangup or Ctrl-C to the
-  app's process group doesn't reach it), ignores SIGPIPE and SIGHUP (the
-  commands it runs inherit that), and `log()` writes the log file first and
-  stdout only best effort, so a closed app (broken pipe) changes nothing.
-  SIGTERM/SIGINT exit 143/130 through the EXIT trap, so they roll back
-  (bash takes them after the running command, never mid-apt). It holds
-  `flock` on `/run/green-light-install.lock` (one install at a time; the app
-  reads it to show an install that outlived its window).
+- It must finish or roll back whatever happens to the app, the session or
+  the machine:
+  - Without a terminal it writes nothing to stdout/stderr (pipes to the app,
+    which may be closed: SIGPIPE); everything goes to
+    `/var/log/green-light.log`, which the app follows (`run_pkexec`,
+    `LogTail`). SIGPIPE keeps its default for child commands; SIGHUP is
+    ignored.
+  - It re-execs into its own transient scope (`systemd-run --scope`, same
+    PID, skipped under a systemd service, guarded by `GREEN_LIGHT_SCOPED`)
+    so logout doesn't kill it, then into its own session (`setsid`).
+  - SIGTERM/SIGINT set `STOP_REQUESTED`, honoured only at safe points:
+    before anything changes it exits "No changes made"; after the purge and
+    before nvidia-installer it rolls back; a signal during nvidia-installer
+    is taken when it ends: success finishes the install, failure rolls back.
+    The EXIT trap ignores TERM/INT first thing.
+  - While armed, `systemd-inhibit --what=shutdown:sleep --mode=block` holds
+    off shutdown/suspend (`tail --pid=$$` as the held command, so it ends
+    with the script).
+  - `flock` on `/run/green-light-install.lock` (fd 9): one install at a
+    time; the app uses it to see an install that outlived its window. Every
+    long or package-manager command runs through `nolock` (`9>&-`), so
+    background jobs (akmods from an rpm scriptlet, DKMS) don't keep the lock.
 - Order: validate arguments and the .run file (exit 2), copy it into a
   root-only dir and verify the SHA256 on the copy, `--check`, install
   prerequisites (allowed to fail), **check** the module can be built for
-  `uname -r` (`/lib/modules/$KVER/build` with `Makefile` and
-  `include/generated/autoconf.h`, gcc — or clang/ld.lld when autoconf.h says
-  the kernel was built with them —, make, dkms with `--dkms`), then
-  **test-build** it: `--extract-only` into the private dir and
-  `make -C <flavor> KERNEL_UNAME=$KVER modules` as DKMS does, for the chosen
-  flavor or both (kernel-open and kernel) when the installer picks. Any of
-  these failing is "No changes made" (exit 1). Only then the destructive
-  part: unhold, purge, boot config, nvidia-installer.
-- Before the destructive part it records a snapshot of every installed
-  package (name and exact version), the driver packages' apt holds, the
-  distro-driver block, the modprobe files / alternate-install marker, the
-  installed .run driver version (`nvidia-installer --version` when
-  `nvidia-uninstall` is on PATH) and the nvidia module's version and signer
-  for `$KVER`, and sets `ROLLBACK_ARMED`. The removal set is the snapshot
-  minus what is installed afterwards, so apt's/dnf's reverse dependencies
-  (Ubuntu's prebuilt signed module packages, cuda-drivers, ...) are
-  restored too.
-- Any failure from there until nvidia-installer succeeds (a signal or an
-  unexpected `set -e` exit included) runs `rollback` from the EXIT trap:
-  `nvidia-uninstall` if the failed installer left a new .run driver
-  registered, restore the files, reinstall the removal set (exact versions,
-  else current), re-hold, re-block, rebuild the initramfs, then
-  `verify_restored`: the earlier .run driver (if any) still installed, every
-  removed package back, a module for `$KVER` if there was one, and under
-  Secure Boot signed by the earlier signer or the machine's enrolled key.
-  Exit 3 only when that passes; otherwise 4 (the UI says not to reboot). 5 =
-  installed but initramfs failed. The distro-driver block is set right
-  after nvidia-installer succeeds, so every later exit keeps it as asked.
-  The script never exits 126/127 (pkexec's dismissed / not authorized); the
-  EXIT trap maps a stray one to 1. Same for `green-light-setup`.
+  `uname -r` (headers in `/lib/modules/$KVER/build`, the kernel's compiler,
+  make, dkms with `--dkms`), then **test-build** it: `--extract-only` and
+  `make -C <flavor> KERNEL_UNAME=$KVER modules` with the compiler chosen as
+  DKMS does (`LLVM=1` for clang kernels, the gcc named in
+  `CONFIG_CC_VERSION_TEXT` when installed), for the chosen flavor or both.
+  Any of these failing is "No changes made" (exit 1).
+- **Journal** (`/var/lib/green-light/journal`, root-only, parent 0755 so the
+  app can see it; written as `journal.new`, synced, renamed): before the
+  first change it records a snapshot of every installed package at exact
+  versions, the removal plan (`apt-get -s purge` / `dnf remove --assumeno`
+  listing; only plan ∩ actually-removed is ever reinstalled), which of them
+  were automatically installed, holds, the block state, file backups, the
+  earlier .run version and the module's version and signer, and copies of
+  the packages to be removed (apt's cache or `apt-get download`; `dnf
+  download`; akmods' cached kmod rpm) so the rollback works offline. Phase:
+  `armed` → `installer-started` → `installer-done`; the journal is removed
+  when the installer has succeeded or a rollback has been verified, kept
+  when a rollback fails.
+- **Rollback** (EXIT trap while armed, or recovery): `nvidia-uninstall` if
+  the failed installer registered a new .run driver, restore files,
+  reinstall the removed set from the kept copies (else exact versions, else
+  current; dnf with `--skip-unavailable` / `--setopt=strict=0`; akmods'
+  local `kmod-nvidia-<kernel>` never from a repository: `akmods --force
+  --kernels $KVER` rebuilds it synchronously), restore auto marks, holds and
+  block, rebuild the initramfs, then `verify_restored` (earlier .run driver,
+  every removed package, a module for the kernel, and under Secure Boot a
+  signer that is unchanged or the enrolled key). Exit 3 only when that
+  passes, else 4.
+- **Recovery**: a journal left by a cut-off run (power loss, SIGKILL) is
+  rolled back by `--recover` (the app's Restore Previous Driver), at the
+  start of the next install (a failure there is logged and the journal
+  dropped, as the new install replaces it), and at boot by
+  `data/green-light-recover.service` (ConditionPathExists on the journal,
+  before the display manager; `SuccessExitStatus=3`). Phase
+  `installer-done` only clears the journal. Exit codes of `--recover`: 0
+  nothing to put back, 3 restored and verified, 4 failed.
+- The distro-driver block is set right after nvidia-installer succeeds, so
+  every later exit keeps it as asked. Exit 5 = installed but initramfs
+  failed. The script never exits 126/127 (pkexec's dismissed / not
+  authorized); the EXIT trap maps a stray one to 1. Same for
+  `green-light-setup`.
 - File rule: owner root or the caller; never other-writable;
   group-writable only in the owner's private group (named after the
   owner, its primary group, no other members, no other account with it as
@@ -169,11 +197,13 @@ copy of that logic.
 - Tests: `scripts/tests/privileged-install-test.sh` runs the real script
   unprivileged in bubblewrap with scratch `/etc`, `/var`, `/boot`, `/run`,
   `/tmp`, `/usr/lib/nvidia` and module tree, and a PATH of stubs that keep a
-  fake dpkg/rpm database (purges take reverse dependencies, reinstalls bring
-  packages and the module back). It covers signals, a vanished reader
-  (SIGPIPE), the lock, ACLs, partial and earlier .run installs and Secure
-  Boot verification. Add a case there for every behaviour change. CI runs
-  it.
+  fake dpkg/rpm database (purges take reverse dependencies, downloads and
+  reinstalls bring packages and the module back, `$GLT/offline` cuts the
+  network). It covers signals at each stop point, SIGKILL in each journal
+  phase with `--recover` and the boot unit's ExecStart, offline recovery,
+  dnf with an akmods kmod, the lock, ACLs, partial and earlier .run
+  installs, Secure Boot verification, and `systemd-analyze verify` of the
+  unit. Add a case there for every behaviour change. CI runs it.
 
 ## Build process
 
@@ -194,7 +224,10 @@ the script itself never has):
    `AppRun`) and runs `desktop-file-validate` on the desktop file. The
    appdata's `<releases>` are generated from the changelog straight into
    the AppDir (`sync_appdata_releases.py --output`); CI checks the tracked
-   copy separately. AppRun stages the setup files in a `mktemp -d` dir and,
+   copy separately. The setup helper also installs
+   `data/green-light-recover.service` to `/etc/systemd/system` and enables it
+   (hash-verified like the rest; AppRun reinstalls when it differs). AppRun
+   stages the setup files in a `mktemp -d` dir and,
    on first run, runs the staged helper as `pkexec "$BASH" <helper>` so a
    noexec `/tmp` doesn't matter.
 4. Downloads `appimagetool` (pinned 1.9.1) and the type2 runtime it

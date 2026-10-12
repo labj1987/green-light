@@ -13,20 +13,31 @@ under 2.3.0.
   refused (access control lists included), and Green Light says why before asking for your
   password.
 - Before it removes your distribution's NVIDIA driver, the install checks that the kernel
-  headers, compiler and DKMS are there and builds the new driver's kernel module as a test.
-  If either fails, it stops without changing anything.
-- If the install fails after that, or is stopped, it puts back what it changed: the
-  distribution's driver packages at their old versions together with the packages that
-  depend on them, their holds, the block on distro driver packages, and the boot
-  configuration. It removes whatever NVIDIA's installer had already put in place. It then
-  checks that the driver the computer had before is back, signed for Secure Boot where that
-  is on, and only then reports that the next boot uses it.
-- When it can't confirm that, for example because NVIDIA's installer had already removed a
-  driver installed earlier from NVIDIA's own installer, Green Light says so and tells you
-  not to reboot until a working driver is installed.
-- Closing Green Light, or the terminal it was started from, no longer interrupts a running
-  install. Closing the window during an install asks first, and Green Light shows when an
-  install started earlier is still running.
+  headers, compiler and DKMS are there and builds the new driver's kernel module as a test,
+  with the compiler your kernel was built with. If either fails, it stops without changing
+  anything.
+- Before its first change, the install saves what it needs to undo it, including copies of
+  the distribution packages it is about to remove.
+- If NVIDIA's installer then fails, or the install is stopped before the installer has run,
+  it removes whatever the installer had put in place and reinstalls the removed packages,
+  together with the packages that depend on them, from those saved copies. Only a package
+  it couldn't save is installed from your distribution instead, possibly at a newer version.
+  On Fedora the locally built kernel module is rebuilt. Holds, "installed automatically"
+  marks, the block on distro driver packages and the boot configuration are put back too.
+- It then checks that the driver the computer had before is back, signed for Secure Boot
+  where that is on, and only then reports that the next boot uses it. When it can't confirm
+  that, for example because NVIDIA's installer had already removed a driver installed
+  earlier from NVIDIA's own installer, Green Light says so and tells you not to reboot until
+  a working driver is installed.
+- If the computer loses power or the install is killed partway, the previous driver is put
+  back at the next boot, before the login screen. Restore Previous Driver in Green Light
+  does the same without rebooting, and the next install does it first.
+- Closing Green Light, closing the terminal it was started from, or logging out no longer
+  interrupts a running install, and shutdown and suspend wait until it is done. A request to
+  stop is honoured only where it is safe: before any change it stops cleanly, and once
+  NVIDIA's installer has succeeded the install is finished rather than undone. Closing the
+  window during an install asks first, and Green Light shows when an install started earlier
+  is still running.
 - The Log tab shows the install's progress as it happens, and a failed install explains what
   went wrong in a dialog, not just with an exit code.
 
@@ -54,14 +65,15 @@ under 2.3.0.
 - With Secure Boot on and a signing key kept on a hardware token, the pre-install check now
   says to turn on DKMS (NVIDIA's own installer can't sign with such a key) instead of
   promising a signed module.
-- The System tab picks the signing key the same way the install does, also when the key
-  itself is readable only by root (as on Fedora), and shows a key that is only half set up
-  as such.
+- The System tab picks the signing key the same way the install does. When the key itself is
+  readable only by root (as on Fedora), it says so instead of guessing, and it shows a key
+  that is only half set up as such.
 - Pop!_OS's NVIDIA driver metapackages are now removed along with the other distribution
   driver packages, as the pre-install check already said. Held driver packages are listed
   there too, and older NVIDIA container runtime packages are left alone.
 - The first-launch setup works when the temporary folder doesn't allow running programs,
-  and tells a cancelled password prompt apart from a failure.
+  and tells a cancelled password prompt apart from a failure. It also installs the boot-time
+  restore described above.
 
 ## 2.9.0 — 2026-10-08
 

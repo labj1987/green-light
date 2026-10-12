@@ -106,7 +106,7 @@ Two files tell you everything:
 - `/var/log/green-light.log` is written by this app's install script, step by step
 - `/var/log/nvidia-installer.log` is NVIDIA's own installer log
 
-If an install fails, the reason is in one of those, and the Log tab shows the script's output as it runs. The most common cause is missing kernel headers for a brand new kernel, which resolves once your distro publishes them; the script checks for headers and a compiler before it removes anything, and stops without changes if they're missing. Before it removes anything it also test-builds the new driver's kernel module for your kernel. If NVIDIA's installer still fails after the distro driver packages were removed, or the install is stopped, the script removes what the installer had put in place, puts back the removed packages (with the packages that depend on them, at their old versions), holds, block and boot configuration, and checks that the previous driver is back (signed, under Secure Boot) before it says so. If it can't confirm that, it says not to reboot yet. Closing Green Light during an install doesn't interrupt it.
+If an install fails, the reason is in one of those, and the Log tab shows the script's output as it runs. The most common cause is missing kernel headers for a brand new kernel, which resolves once your distro publishes them; the script checks for headers and a compiler before it removes anything, and stops without changes if they're missing. Before it removes anything it also test-builds the new driver's kernel module for your kernel. Before the first change it saves everything needed to undo it, including copies of the packages it is about to remove. If NVIDIA's installer then fails, or the install is stopped before the installer has run, the script removes what the installer had put in place, reinstalls the removed packages (and the packages that depend on them) from those copies, puts back holds, block and boot configuration, and checks that the previous driver is back (signed, under Secure Boot) before it says so; if it can't confirm that, it says not to reboot yet. If the computer loses power or the install is killed partway, the same happens at the next boot (`green-light-recover.service`), or from Restore Previous Driver in the app, or at the start of the next install. Closing Green Light, logging out or a shutdown request don't interrupt an install; shutdown and suspend are held off until it is done.
 
 ## Uninstalling
 
@@ -119,7 +119,9 @@ sudo nvidia-uninstall
 To remove this app, delete the AppImage and optionally the helper files it installed:
 
 ```bash
-sudo rm -rf /usr/lib/green-light
+sudo systemctl disable green-light-recover.service
+sudo rm /etc/systemd/system/green-light-recover.service
+sudo rm -rf /usr/lib/green-light /var/lib/green-light
 sudo rm /usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy
 sudo rm -f /etc/apt/preferences.d/green-light-nvidia /etc/dnf/libdnf5.conf.d/90-green-light-nvidia.conf
 ```
