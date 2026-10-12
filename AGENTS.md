@@ -55,13 +55,21 @@ them breaks existing installs' policy/settings).
   with `InstallOptions` (DKMS, distro-driver block, module flavor), and
   `run_privileged_setup_signing` for `--setup-signing` (password on stdin).
   `check_run_file` applies the script's file rule before the password
-  prompt. The script's stdout/stderr stream into the Log tab as it runs, and
-  the failure message comes from its exit code and first `ERROR:` line, so it
-  always describes this run.
+  prompt (off the GTK thread), ACLs included. The script's stdout/stderr
+  stream into the Log tab as it runs, and the failure message comes from its
+  exit code and first `ERROR:` line, so it always describes this run.
+  `install_running` reads the script's lock.
 - `ui.rs` runs one long operation at a time (`Busy`: download — including
   checksum verification and the unverified/retry questions — install, or
   signing setup); `actions_enabled` derives every button's sensitivity from
-  that.
+  that, and Install also waits for the system info (the block switch starts
+  from it). A `BusyGuard` holds the operation and ends it when dropped, so a
+  panicking task can't leave the buttons disabled. The install result is
+  shown only after the last streamed output line. Closing the window during
+  an install or signing setup asks first; an install from an earlier run
+  (lock held) shows a banner and blocks new actions until it ends. The
+  version list shows at once; branch labels are added to the rows when
+  `branches.rs` answers (20 s limit).
 
 ## Module signing
 
@@ -100,29 +108,55 @@ copy of that logic.
 
 ## Install script (`scripts/privileged-install.sh`)
 
+- It must finish (or roll back) whatever happens to the app: it re-execs
+  itself under `setsid` (own session: a terminal hangup or Ctrl-C to the
+  app's process group doesn't reach it), ignores SIGPIPE and SIGHUP (the
+  commands it runs inherit that), and `log()` writes the log file first and
+  stdout only best effort, so a closed app (broken pipe) changes nothing.
+  SIGTERM/SIGINT exit 143/130 through the EXIT trap, so they roll back
+  (bash takes them after the running command, never mid-apt). It holds
+  `flock` on `/run/green-light-install.lock` (one install at a time; the app
+  reads it to show an install that outlived its window).
 - Order: validate arguments and the .run file (exit 2), copy it into a
   root-only dir and verify the SHA256 on the copy, `--check`, install
-  prerequisites (allowed to fail), then **check** the module can be built
-  for `uname -r` (`/lib/modules/$KVER/build` with `Makefile` and
-  `include/generated/autoconf.h`, gcc — or clang/ld.lld when autoconf.h
-  says the kernel was built with them —, make, dkms with `--dkms`) and
-  abort with "No changes made" (exit 1) if not. Only then the destructive
+  prerequisites (allowed to fail), **check** the module can be built for
+  `uname -r` (`/lib/modules/$KVER/build` with `Makefile` and
+  `include/generated/autoconf.h`, gcc — or clang/ld.lld when autoconf.h says
+  the kernel was built with them —, make, dkms with `--dkms`), then
+  **test-build** it: `--extract-only` into the private dir and
+  `make -C <flavor> KERNEL_UNAME=$KVER modules` as DKMS does, for the chosen
+  flavor or both (kernel-open and kernel) when the installer picks. Any of
+  these failing is "No changes made" (exit 1). Only then the destructive
   part: unhold, purge, boot config, nvidia-installer.
-- Before the destructive part it records the installed driver packages
-  with versions, their apt holds, the distro-driver block, and the
-  modprobe files / alternate-install marker, and sets `ROLLBACK_ARMED`.
-  Any failure from there until nvidia-installer succeeds (including an
-  unexpected `set -e` exit) runs `rollback` from the EXIT trap: restore the
-  files, reinstall the packages (exact versions, else current), re-hold,
-  re-block, rebuild the initramfs. Exit 3 = rolled back, 4 = rollback
-  incomplete (the UI says not to reboot), 5 = installed but initramfs
-  failed. The script never exits 126/127 (pkexec's dismissed / not
-  authorized); the EXIT trap maps a stray one to 1. Same for
-  `green-light-setup`.
+- Before the destructive part it records a snapshot of every installed
+  package (name and exact version), the driver packages' apt holds, the
+  distro-driver block, the modprobe files / alternate-install marker, the
+  installed .run driver version (`nvidia-installer --version` when
+  `nvidia-uninstall` is on PATH) and the nvidia module's version and signer
+  for `$KVER`, and sets `ROLLBACK_ARMED`. The removal set is the snapshot
+  minus what is installed afterwards, so apt's/dnf's reverse dependencies
+  (Ubuntu's prebuilt signed module packages, cuda-drivers, ...) are
+  restored too.
+- Any failure from there until nvidia-installer succeeds (a signal or an
+  unexpected `set -e` exit included) runs `rollback` from the EXIT trap:
+  `nvidia-uninstall` if the failed installer left a new .run driver
+  registered, restore the files, reinstall the removal set (exact versions,
+  else current), re-hold, re-block, rebuild the initramfs, then
+  `verify_restored`: the earlier .run driver (if any) still installed, every
+  removed package back, a module for `$KVER` if there was one, and under
+  Secure Boot signed by the earlier signer or the machine's enrolled key.
+  Exit 3 only when that passes; otherwise 4 (the UI says not to reboot). 5 =
+  installed but initramfs failed. The distro-driver block is set right
+  after nvidia-installer succeeds, so every later exit keeps it as asked.
+  The script never exits 126/127 (pkexec's dismissed / not authorized); the
+  EXIT trap maps a stray one to 1. Same for `green-light-setup`.
 - File rule: owner root or the caller; never other-writable;
   group-writable only in the owner's private group (named after the
   owner, its primary group, no other members, no other account with it as
-  primary group). `run_file_problem` in `preflight.rs` mirrors it.
+  primary group — the last part only sees accounts NSS can enumerate); an
+  ACL (`ls` "+" mark) may not grant write to anyone else, checked with
+  `getfacl` (refused when it can't be checked). `run_file_problem` and
+  `acl_writers` in `preflight.rs` mirror it.
 - `--block-distro-driver` writes an apt pin (`Pin-Priority: -1` on the
   `src:nvidia-graphics-drivers*` and `src:nvidia-settings` source packages
   plus Ubuntu's prebuilt module packages and system76-driver-nvidia) or, on
@@ -133,9 +167,13 @@ copy of that logic.
   state. The container toolkit (`nvidia-container*`, `libnvidia-container*`)
   is never purged or blocked.
 - Tests: `scripts/tests/privileged-install-test.sh` runs the real script
-  unprivileged in bubblewrap with scratch `/etc`, `/var`, `/boot`, `/tmp`
-  and module tree and a PATH of stubs only. Add a case there for every
-  behaviour change. CI runs it.
+  unprivileged in bubblewrap with scratch `/etc`, `/var`, `/boot`, `/run`,
+  `/tmp`, `/usr/lib/nvidia` and module tree, and a PATH of stubs that keep a
+  fake dpkg/rpm database (purges take reverse dependencies, reinstalls bring
+  packages and the module back). It covers signals, a vanished reader
+  (SIGPIPE), the lock, ACLs, partial and earlier .run installs and Secure
+  Boot verification. Add a case there for every behaviour change. CI runs
+  it.
 
 ## Build process
 

@@ -10,24 +10,34 @@ under 2.3.0.
 **Installs that fail safely**
 - Installing a driver downloaded in Green Light, or a `.run` file you downloaded yourself,
   no longer fails because of the file's permissions. A file other users can change is still
-  refused, and Green Light now says why before asking for your password.
-- Before it removes your distribution's NVIDIA driver, the install checks that the new
-  driver's kernel module can be built (kernel headers, compiler, DKMS) and stops without
-  changing anything if it can't.
-- If NVIDIA's installer still fails, the install puts back everything it changed: the
-  distribution's driver packages, their holds and the boot configuration. The next boot uses
-  the driver you had before. If that doesn't work either, Green Light tells you not to
-  reboot yet.
+  refused (access control lists included), and Green Light says why before asking for your
+  password.
+- Before it removes your distribution's NVIDIA driver, the install checks that the kernel
+  headers, compiler and DKMS are there and builds the new driver's kernel module as a test.
+  If either fails, it stops without changing anything.
+- If the install fails after that, or is stopped, it puts back what it changed: the
+  distribution's driver packages at their old versions together with the packages that
+  depend on them, their holds, the block on distro driver packages, and the boot
+  configuration. It removes whatever NVIDIA's installer had already put in place. It then
+  checks that the driver the computer had before is back, signed for Secure Boot where that
+  is on, and only then reports that the next boot uses it.
+- When it can't confirm that, for example because NVIDIA's installer had already removed a
+  driver installed earlier from NVIDIA's own installer, Green Light says so and tells you
+  not to reboot until a working driver is installed.
+- Closing Green Light, or the terminal it was started from, no longer interrupts a running
+  install. Closing the window during an install asks first, and Green Light shows when an
+  install started earlier is still running.
 - The Log tab shows the install's progress as it happens, and a failed install explains what
   went wrong in a dialog, not just with an exit code.
 
-**Block Distro Driver Packages** replaces Hold Package Version, which never held anything.
-When it's on, apt (or dnf5 on Fedora) won't install your distribution's NVIDIA driver over
-the one Green Light installed, for example as a dependency of a CUDA package. The switch
-shows whether the block is in place; install with it off to remove the block. Older dnf
-versions can't do this, so there the switch is greyed out.
+**Block Distro Driver Packages**
+- Replaces Hold Package Version, which never held anything. When it's on, apt (or dnf5 on
+  Fedora) won't install your distribution's NVIDIA driver over the one Green Light
+  installed, for example as a dependency of a CUDA package.
+- The switch shows whether the block is in place; install with it off to remove the block.
+  Older dnf versions can't do this, so there the switch is greyed out.
 
-Downloads
+**Downloads and the version list**
 - Only one download runs at a time, and installing or signing setup waits until it is done.
 - When NVIDIA's checksum can't be fetched (network trouble, a server error), Green Light
   offers to try again instead of saying NVIDIA publishes none. Installing without
@@ -36,15 +46,17 @@ Downloads
 - A server error while loading the version list shows the error instead of an empty list.
 - The branch labels on the Browse tab (Production, New Feature, Legacy) now come from
   NVIDIA's own driver data, so they stay right as NVIDIA moves to new branches; the 615
-  drivers were unlabeled. Older production branches NVIDIA still updates are marked
-  Older Production. Without NVIDIA's data the list shows no labels rather than guessing.
+  drivers were unlabeled. Older production branches NVIDIA still updates are marked Older
+  Production. The list shows up without waiting for the labels, and without NVIDIA's data it
+  shows no labels rather than guessing.
 
-Other
+**Other**
 - With Secure Boot on and a signing key kept on a hardware token, the pre-install check now
   says to turn on DKMS (NVIDIA's own installer can't sign with such a key) instead of
   promising a signed module.
-- The System tab picks the signing key the same way the install does, and shows a key that
-  is only half set up as such.
+- The System tab picks the signing key the same way the install does, also when the key
+  itself is readable only by root (as on Fedora), and shows a key that is only half set up
+  as such.
 - Pop!_OS's NVIDIA driver metapackages are now removed along with the other distribution
   driver packages, as the pre-install check already said. Held driver packages are listed
   there too, and older NVIDIA container runtime packages are left alone.
