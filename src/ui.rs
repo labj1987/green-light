@@ -1511,11 +1511,13 @@ pub fn build_ui(app: &Application) {
         let load_sysinfo = load_sysinfo.clone();
         let window = window.clone();
         let recover_discards = recover_discards.clone();
-        recover_banner.connect_button_clicked(move |banner| {
+        let banner = recover_banner.clone();
+        let dialog_window = window.clone();
+        // Restore (false) or discard (true) the recovery data.
+        let run_op: Rc<dyn Fn(bool)> = Rc::new(move |discard: bool| {
             let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
                 return;
             };
-            let discard = recover_discards.get();
             banner.set_revealed(false);
             stack.set_visible_child_name("log");
             progress.set_visible(true);
@@ -1575,6 +1577,37 @@ pub fn build_ui(app: &Application) {
                 load_sysinfo();
             });
         });
+        // Data that no longer matched the computer when last checked: the
+        // user picks between trying again (it is checked again, and restored
+        // if the reason has gone) and discarding it.
+        recover_banner.connect_button_clicked(move |_| {
+            if !recover_discards.get() {
+                run_op(false);
+                return;
+            }
+            let dialog = libadwaita::AlertDialog::new(
+                Some("Recovery data from an interrupted install"),
+                Some(
+                    "When it was last checked, this data no longer matched the computer. Retry \
+                     Recovery checks again and restores the previous driver if it matches now. \
+                     Discard Recovery Data drops it for good, keeping the driver as it is.",
+                ),
+            );
+            dialog.add_responses(&[
+                ("cancel", "Cancel"),
+                ("discard", "Discard Recovery Data"),
+                ("retry", "Retry Recovery"),
+            ]);
+            dialog.set_response_appearance("discard", libadwaita::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("retry"));
+            dialog.set_close_response("cancel");
+            let run_op = run_op.clone();
+            dialog.choose(Some(&dialog_window), gio::Cancellable::NONE, move |response| match response.as_str() {
+                "retry" => run_op(false),
+                "discard" => run_op(true),
+                _ => {}
+            });
+        });
     }
 
     // An install started before this window opened (the app was closed
@@ -1597,7 +1630,7 @@ pub fn build_ui(app: &Application) {
                             "An earlier driver install was interrupted, but its recovery data no \
                              longer matches this computer: {why}. Nothing was restored."
                         ),
-                        "Discard Recovery Data",
+                        "Retry or Discard…",
                         true,
                     ),
                     Some(RecoveryNote::Failed(why)) => (

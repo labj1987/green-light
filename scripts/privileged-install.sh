@@ -806,6 +806,14 @@ verify_restored() {
         mod_now="$(module_version "$k")"
         if [[ -n "$MOD_VER_BEFORE" ]]; then
             if [[ -z "$mod_now" ]]; then
+                # Another kernel that the previous driver had no module for
+                # either (a .run driver without DKMS never builds one; a
+                # prebuilt package for it may not be reachable): not this
+                # restore's failure, but worth knowing.
+                if [[ "$k" != "$KVER" ]] && ! printf '%s\n' "${MOD_KERNELS_BEFORE[@]}" | grep -qxF -- "$k"; then
+                    log "WARNING: There is no nvidia kernel module for $k, which the previous driver didn't have one for either; start $KVER, or install a driver for $k."
+                    continue
+                fi
                 log "ERROR: There is no nvidia kernel module for $k (there was $MOD_VER_BEFORE for $KVER)."
                 ok=0
                 continue
@@ -835,7 +843,7 @@ rollback() {
     log "Restoring the previous driver setup…"
     # A partial install of the new driver: let its own uninstaller take it
     # out, so the restored packages don't sit on top of half of it.
-    if [[ $INSTALLER_STARTED -eq 1 ]]; then
+    if [[ $INSTALLER_STARTED -eq 1 || ${EARLIER_INSTALLER_STARTED:-0} -eq 1 ]]; then
         run_now="$(installed_run_version)"
         if [[ -n "$run_now" && "$run_now" != "$RUN_VER_BEFORE" ]]; then
             log "Removing what NVIDIA's installer had already put in place ($run_now)…"
@@ -865,10 +873,12 @@ rollback() {
         if [[ "$PKG_MGR" == "apt" ]]; then
             # Local .deb files need no network; apt only reads its lists.
             if ! nolock apt-get install -y --allow-downgrades "${files[@]}" "${specs[@]}" >>"$LOGFILE" 2>&1; then
+                record_reinstalled
                 log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
                 nolock apt-get install -y "${names[@]}" >>"$LOGFILE" 2>&1 \
                     || { log "ERROR: apt-get could not reinstall the removed packages"; ok=0; }
             fi
+            record_reinstalled
             if [[ ${#auto[@]} -gt 0 ]]; then
                 nolock apt-mark auto "${auto[@]}" >>"$LOGFILE" 2>&1 || log "WARNING: Could not mark ${auto[*]} as automatically installed"
             fi
@@ -882,14 +892,17 @@ rollback() {
                 && ! nolock dnf install -y --disablerepo='*' "${files[@]}" >>"$LOGFILE" 2>&1; then
                 local_failed=1
             fi
+            record_reinstalled
             if [[ ${#specs[@]} -gt 0 || $local_failed -eq 1 ]]; then
                 local again=("${specs[@]}")
                 if [[ $local_failed -eq 1 ]]; then again+=("${files[@]}"); fi
                 if ! nolock dnf install -y "$tolerant" "${again[@]}" >>"$LOGFILE" 2>&1; then
+                    record_reinstalled
                     log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
                     nolock dnf install -y "$tolerant" "${names[@]}" >>"$LOGFILE" 2>&1 \
                         || { log "ERROR: dnf could not reinstall the removed packages"; ok=0; }
                 fi
+                record_reinstalled
             fi
             if [[ ${#auto[@]} -gt 0 ]]; then
                 local mark=(mark remove)
@@ -903,6 +916,7 @@ rollback() {
         while IFS= read -r k; do
             if [[ "$k" == "$KVER" && $kmod_cached -eq 1 ]]; then continue; fi
             ensure_module "$k" "${keys[@]}"
+            record_reinstalled
         done < <(restore_kernels)
     fi
     if [[ ${#HELD[@]} -gt 0 ]]; then
@@ -919,12 +933,7 @@ rollback() {
         fi
     done < <(restore_kernels)
     verify_restored || ok=0
-    # What this rollback installed is its own doing, not a change made
-    # since by something else (see journal_stale_reason).
-    if [[ -d "$JOURNAL" ]]; then
-        { cat "$JOURNAL/reinstalled" 2>/dev/null; driver_package_specs; } | sort -u > "$JOURNAL/.reinstalled.new" \
-            && durable "$JOURNAL/.reinstalled.new" && mv -f "$JOURNAL/.reinstalled.new" "$JOURNAL/reinstalled"
-    fi
+    record_reinstalled
     if [[ $ok -eq 1 ]]; then
         log "Restored and checked the previous driver setup; the next boot uses the driver this computer had before."
         return 0
@@ -932,6 +941,17 @@ rollback() {
     log "ERROR: The previous driver setup could not be fully restored (see above and $LOGFILE)."
     log "       Don't reboot until a working driver is installed, or the next boot may have no NVIDIA driver."
     return 1
+}
+
+# Note what a rollback step installed, at once and durably: an interrupted
+# recovery must still recognise its own work as its own (see
+# journal_stale_reason).
+record_reinstalled() {
+    [[ -d "$JOURNAL" ]] || return 0
+    { cat "$JOURNAL/reinstalled" 2>/dev/null; driver_package_specs; } | sort -u > "$JOURNAL/.reinstalled.new" \
+        && durable "$JOURNAL/.reinstalled.new" && mv -f "$JOURNAL/.reinstalled.new" "$JOURNAL/reinstalled" \
+        && durable "$JOURNAL"
+    return 0
 }
 
 # Exact specs of the driver packages installed now.
@@ -956,7 +976,11 @@ journal_stale_reason() {
     local run_now spec
     local -A known=()
     run_now="$(installed_run_version)"
-    if [[ -n "$run_now" && "$run_now" != "$RUN_VER_BEFORE" && "$run_now" != "${TARGET_RUN_VER:-}" ]]; then
+    local t known_target=0
+    for t in "${TARGET_RUN_VER:-}" "${KNOWN_TARGETS[@]}"; do
+        if [[ -n "$t" && "$run_now" == "$t" ]]; then known_target=1; fi
+    done
+    if [[ -n "$run_now" && "$run_now" != "$RUN_VER_BEFORE" && $known_target -eq 0 ]]; then
         printf '%s' "the driver installed now from NVIDIA's installer ($run_now) is neither the one from before (${RUN_VER_BEFORE:-none}) nor the one that install was putting in (${TARGET_RUN_VER:-unknown})"
         return 0
     fi
@@ -1007,6 +1031,9 @@ CARRIED=0
 if [[ -d "$JOURNAL" ]]; then
     PHASE="$(cat "$JOURNAL/phase" 2>/dev/null || echo armed)"
     TARGET_RUN_VER=""
+    KNOWN_TARGETS=()
+    EARLIER_INSTALLER_STARTED=0
+    MOD_KERNELS_BEFORE=()
     if [[ "$PHASE" == "installer-done" ]]; then
         log "An earlier install had finished NVIDIA's installer before it was cut off; nothing to put back."
         journal_clear
@@ -1075,6 +1102,9 @@ if [[ $RECOVER_RC -eq $EXIT_ROLLBACK_FAILED ]]; then
     # until this install replaces it with one built on it.
     log "WARNING: The earlier setup could not be fully restored; this install keeps its recovery data as the starting point to restore."
     CARRIED=1
+    # That install's driver, and whether its installer had run, stay known.
+    if [[ -n "${TARGET_RUN_VER:-}" ]]; then KNOWN_TARGETS+=("$TARGET_RUN_VER"); fi
+    if [[ "$PHASE" == "installer-started" ]]; then EARLIER_INSTALLER_STARTED=1; fi
 fi
 
 # ── Install mode ───────────────────────────────────────────────────────
@@ -1361,12 +1391,25 @@ if distro_driver_blocked; then WAS_BLOCKED=1; fi
 RUN_VER_BEFORE="$(installed_run_version)"
 MOD_VER_BEFORE="$(module_version)"
 MOD_SIGNER_BEFORE="$(module_signer)"
+# Every kernel that had an nvidia module under the previous setup.
+MOD_KERNELS_BEFORE=()
+for kdir in /lib/modules/*/; do
+    kdir="${kdir%/}"
+    if [[ -n "$(module_version "${kdir##*/}")" ]]; then MOD_KERNELS_BEFORE+=("${kdir##*/}"); fi
+done
 
 # Write the journal: built under a temporary name and renamed into place.
 # What the run is putting in and in which boot, so recovery can tell a
 # journal that no longer describes the computer.
+# The version comes from the verified copy itself (its makeself header's
+# label, "NVIDIA Accelerated Graphics Driver for Linux-x86_64 595.84"), not
+# the file name, which a download may have changed.
 TARGET_RUN_VER=""
-if [[ "${ORIG_RUN_FILE##*/}" =~ ^NVIDIA-Linux-[^-]+-([0-9]+\.[0-9.]+)\.run$ ]]; then TARGET_RUN_VER="${BASH_REMATCH[1]}"; fi
+RUN_LABEL="$(head -c 65536 "$RUN_FILE" | grep -a -m1 '^label=' || true)"
+if [[ "$RUN_LABEL" =~ [[:space:]]([0-9]+\.[0-9]+(\.[0-9]+)?)\"[[:space:]]*$ ]]; then TARGET_RUN_VER="${BASH_REMATCH[1]}"; fi
+if [[ -z "$TARGET_RUN_VER" ]]; then
+    log "WARNING: The installer's version can't be read from it; if this install is cut off, recovering it may need Discard Recovery Data"
+fi
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 mkdir -p "$STATE_DIR"
 chmod 755 "$STATE_DIR"
@@ -1380,7 +1423,7 @@ if [[ $CARRIED -eq 1 ]]; then
         { cat "$JOURNAL.new/planned"; planned_removals "${PKGS[@]}"; } | sort -u > "$PRIV_DIR/planned"
         cp -- "$PRIV_DIR/planned" "$JOURNAL.new/planned"
     fi
-    declare -p KVER TARGET_RUN_VER BOOT_ID >> "$JOURNAL.new/state"
+    declare -p KVER TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED >> "$JOURNAL.new/state"
 else
     mkdir -m 700 "$JOURNAL.new" "$JOURNAL.new/backup"
     package_snapshot > "$JOURNAL.new/packages-before"
@@ -1401,8 +1444,11 @@ else
     backup_file /etc/modprobe.d/blacklist-nouveau.conf
     backup_file /etc/modprobe.d/nvidia-drm-modeset.conf
     backup_file /usr/lib/nvidia/alternate-install-present
+    KNOWN_TARGETS=()
+    EARLIER_INSTALLER_STARTED=0
     declare -p PKG_MGR KVER HELD BACKUPS WAS_BLOCKED RUN_VER_BEFORE MOD_VER_BEFORE MOD_SIGNER_BEFORE \
-        TARGET_RUN_VER BOOT_ID > "$JOURNAL.new/state"
+        MOD_KERNELS_BEFORE TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED \
+        > "$JOURNAL.new/state"
     : > "$JOURNAL.new/cache-index"
 fi
 printf 'armed\n' > "$JOURNAL.new/phase"

@@ -182,6 +182,7 @@ for f in $(cat "$GLT/fail-build" 2>/dev/null); do [[ "$2" == */$f ]] && { echo "
     # offline-at-installer: the network goes away while it runs.
     cat > "$RUN" <<'FAKE'
 #!/bin/bash
+label="NVIDIA Accelerated Graphics Driver for Linux-x86_64 595.84"
 echo "installer $*" >> "$GLT/calls"
 case "$1" in
   --check) exit 0 ;;
@@ -821,15 +822,28 @@ expect_call "update-initramfs -u -k $KVER2"
 expect_no_journal
 end
 
-begin "recovery into a newer kernel without its module is not called a success"
+begin "a newer kernel the previous driver had a module for must get one back"
+mkdir -p "$T/modules/$KVER2"
+echo 595.84 > "$T/mod-version.$KVER2"
+cut_off_during_purge
+rm -f "$T/mod-version.$KVER2"
+echo "$KVER2" > "$T/uname"
+touch "$T/offline"
+recover
+expect_rc 4
+expect_out "There is no nvidia kernel module for $KVER2 (there was"
+expect_journal
+end
+
+begin "a newer kernel the previous driver never covered is a warning, not a failure"
 cut_off_during_purge
 mkdir -p "$T/modules/$KVER2"
 echo "$KVER2" > "$T/uname"
 touch "$T/offline"
 recover
-expect_rc 4
-expect_out "There is no nvidia kernel module for $KVER2"
-expect_journal
+expect_rc 3
+expect_out "WARNING: There is no nvidia kernel module for $KVER2, which the previous driver didn't have one for either"
+expect_no_journal
 end
 
 begin "recovery into a newer kernel builds a DKMS module for it"
@@ -850,6 +864,73 @@ recover
 expect_rc 3
 expect_call "dkms autoinstall -k $KVER2"
 grep -q 595.84 "$T/mod-version.$KVER2" || fail "no module for $KVER2"
+end
+
+begin "a renamed .run still counts as this install's driver after a cut-off"
+RENAMED="$T/home/NVIDIA-Linux-x86_64-595.84 (1).run"
+mv "$RUN" "$RENAMED"
+RUN="$RENAMED"
+echo 30 > "$T/installer-wait"
+echo partial > "$T/installer-mode"
+start_script
+kill_hard "$(wait_for script-pid)" "$(wait_for installer-pid)"
+grep -q 'TARGET_RUN_VER="595.84"' "$T/var/lib/green-light/journal/state" || fail "target version not recorded"
+echo 595.84 > "$T/run-version"
+printf '#!/bin/bash\necho "nvidia-uninstall $*" >> "$GLT/calls"\nrm -f "$GLT/run-version" "$GLT/bin/nvidia-uninstall"\n' > "$T/bin/nvidia-uninstall"
+chmod 755 "$T/bin/nvidia-uninstall"
+recover
+expect_rc 3
+expect_call "nvidia-uninstall --silent"
+end
+
+begin "an interrupted recovery recognises what it had already reinstalled"
+touch "$T/no-download" "$T/fail-exact-reinstall"
+cut_off_during_purge
+# The recovery installs current versions, then is cut off while it
+# rebuilds the initramfs.
+echo 30 > "$T/initramfs-wait"
+sandbox "$T/bin/bash" "$SCRIPT" --recover > /dev/null 2>&1 &
+BG=$!
+for _ in $(seq 150); do grep -q "^update-initramfs" "$T/calls" && break; sleep 0.1; done
+for p in $(pgrep -f "$SCRIPT --recover" || true); do kill -KILL "$p" 2>/dev/null || true; done
+wait "$BG" 2>/dev/null || true
+rm -f "$T/initramfs-wait"
+grep -q 'nvidia-driver-595=current' "$T/var/lib/green-light/journal/reinstalled" \
+    || fail "the reinstall was not recorded before the cut"
+recover
+expect_rc 3
+expect_no_out "Not restoring from the recovery data"
+end
+
+begin "a carried journal keeps the earlier install's driver and installer state"
+echo 30 > "$T/installer-wait"
+echo partial > "$T/installer-mode"
+start_script
+kill_hard "$(wait_for script-pid)" "$(wait_for installer-pid)"
+rm -f "$T/script-pid" "$T/installer-pid"
+echo 595.84 > "$T/run-version"
+# Its uninstaller fails at first, so restoring fails and the journal is carried.
+printf '#!/bin/bash\necho "nvidia-uninstall $*" >> "$GLT/calls"\n[[ -e "$GLT/uninstall-works" ]] || exit 1\nrm -f "$GLT/run-version" "$GLT/bin/nvidia-uninstall"\n' > "$T/bin/nvidia-uninstall"
+chmod 755 "$T/bin/nvidia-uninstall"
+# A second install, of another driver, is cut off in turn.
+RUN2="$T/home/NVIDIA-Linux-x86_64-600.0.run"
+sed 's/Linux-x86_64 595.84"/Linux-x86_64 600.0"/' "$RUN" > "$RUN2"
+chmod 644 "$RUN2"
+echo fail > "$T/installer-mode"
+LOG_BEFORE="$(log_size)"
+sandbox "$T/bin/bash" "$SCRIPT" "$RUN2" "$(sha "$RUN2")" > /dev/null 2>&1 &
+BG=$!
+kill_hard "$(wait_for script-pid)" "$(wait_for installer-pid)"
+OUT="$(tail -c +"$((LOG_BEFORE + 1))" "$T/var/log/green-light.log")"
+expect_out "keeps its recovery data as the starting point"
+STATE="$T/var/lib/green-light/journal/state"
+grep -q 'KNOWN_TARGETS=(\[0\]="595.84")' "$STATE" || fail "earlier target not kept"
+grep -q 'EARLIER_INSTALLER_STARTED="1"' "$STATE" || fail "earlier installer state not kept"
+touch "$T/uninstall-works"
+recover
+expect_rc 3
+expect_no_out "Not restoring from the recovery data"
+expect_no_file "$T/run-version"
 end
 
 begin "a journal left behind is dealt with before the next install"
