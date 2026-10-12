@@ -1,6 +1,8 @@
 use crate::download::{download_run_file, verify_sha256};
+use crate::branches::{fetch_branches, DriverBranch, UNIX_DRIVERS_PAGE};
 use crate::install::{
-    check_run_file, run_privileged_install, run_privileged_setup_signing, InstallOptions,
+    check_run_file, install_running, run_privileged_install, run_privileged_setup_signing,
+    InstallOptions,
 };
 use crate::preflight::{
     conflict_summary, module_hint, secure_boot_advice, signing_summary, validate_module_choice,
@@ -55,6 +57,10 @@ struct AppState {
     sysinfo: SystemInfo,
     sysinfo_loaded: bool,
     busy: Option<Busy>,
+    /// Counts started operations, so a BusyGuard only ever ends its own.
+    busy_token: u64,
+    /// An install started by an earlier run of the app is still going.
+    external_install: bool,
     download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -71,6 +77,8 @@ impl Default for AppState {
             sysinfo: SystemInfo::default(),
             sysinfo_loaded: false,
             busy: None,
+            busy_token: 0,
+            external_install: false,
             download_cancel: None,
         }
     }
@@ -86,12 +94,65 @@ struct ActionsEnabled {
 }
 
 fn actions_enabled(s: &AppState) -> ActionsEnabled {
-    let idle = s.busy.is_none();
+    let idle = s.busy.is_none() && !s.external_install;
     ActionsEnabled {
         download: idle && s.selected_version.is_some(),
         open_file: idle,
-        install: idle && s.downloaded_path.is_some(),
+        // The install options (the distro-driver block above all) start from
+        // the machine's state, so not before that has been read.
+        install: idle && s.sysinfo_loaded && s.downloaded_path.is_some(),
         setup_signing: idle && s.sysinfo_loaded && s.sysinfo.signing_key.setup_needed(),
+    }
+}
+
+/// Holds the one running operation. Dropping it ends the operation, so a
+/// task that panics (and whose callback therefore never runs) can't leave
+/// every button disabled; `release` ends it early. It only ever ends its own
+/// operation, never one started after it.
+struct BusyGuard {
+    state: Rc<RefCell<AppState>>,
+    refresh: Rc<dyn Fn()>,
+    token: u64,
+}
+
+impl BusyGuard {
+    /// Start `kind`, unless something is already running.
+    fn start(state: &Rc<RefCell<AppState>>, refresh: &Rc<dyn Fn()>, kind: Busy) -> Option<Rc<Self>> {
+        let token = {
+            let mut s = state.borrow_mut();
+            if s.busy.is_some() || s.external_install {
+                return None;
+            }
+            s.busy_token += 1;
+            s.busy = Some(kind);
+            s.busy_token
+        };
+        refresh();
+        Some(Rc::new(Self { state: state.clone(), refresh: refresh.clone(), token }))
+    }
+
+    fn release(&self) {
+        let Ok(mut s) = self.state.try_borrow_mut() else {
+            // Called while the state is borrowed: finish on the next idle.
+            let (state, refresh, token) = (self.state.clone(), self.refresh.clone(), self.token);
+            glib::idle_add_local_once(move || {
+                BusyGuard { state, refresh, token }.release();
+            });
+            return;
+        };
+        if s.busy.is_none() || s.busy_token != self.token {
+            return;
+        }
+        s.busy = None;
+        s.download_cancel = None;
+        drop(s);
+        (self.refresh)();
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -426,6 +487,13 @@ pub fn build_ui(app: &Application) {
     let reboot_banner = Banner::new("A reboot is required to activate the new driver.");
     reboot_banner.set_revealed(false);
     content.append(&reboot_banner);
+
+    let running_banner = Banner::new(
+        "A driver install started earlier is still running. Don't reboot until it finishes; \
+         its progress is in /var/log/green-light.log.",
+    );
+    running_banner.set_revealed(false);
+    content.append(&running_banner);
 
     content.append(&stack);
     toast_overlay.set_child(Some(&content));
@@ -782,12 +850,9 @@ pub fn build_ui(app: &Application) {
                 if validate_mok_password(&password, &password).is_err() {
                     return;
                 }
-                if state.borrow().busy.is_some() {
+                let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Signing) else {
                     return;
-                }
-
-                state.borrow_mut().busy = Some(Busy::Signing);
-                refresh_actions();
+                };
                 stack.set_visible_child_name("log");
                 log_fn("Setting up module signing…".to_string());
 
@@ -797,8 +862,7 @@ pub fn build_ui(app: &Application) {
                             .await
                     },
                     move |outcome| {
-                        state.borrow_mut().busy = None;
-                        refresh_actions();
+                        guard.release();
                         match outcome {
                             Ok(outcome) => {
                                 for line in &outcome.lines {
@@ -867,16 +931,44 @@ pub fn build_ui(app: &Application) {
                         banner.set_revealed(true);
                         selected_label.set_label("Could not load version list");
                     }
-                    Ok(list) => {
-                        let versions = list.versions;
+                    Ok(versions) => {
                         log_fn(format!("Found {} versions", versions.len()));
-                        if let Some(e) = list.branch_error {
-                            log_fn(format!("No branch labels: NVIDIA's branch data is unavailable ({e})"));
-                        }
                         selected_label.set_label("No version selected");
                         state.borrow_mut().versions = versions.clone();
                         let installed = state.borrow().sysinfo.installed_driver.clone();
                         populate_list(&list_box, &versions, &search_entry.text(), installed.as_deref());
+
+                        // The branch labels come separately and may be slow or
+                        // unavailable; the list is usable without them.
+                        let list_box = list_box.clone();
+                        let state = state.clone();
+                        let log_fn = log_fn.clone();
+                        spawn_async(
+                            async {
+                                tokio::time::timeout(
+                                    BRANCH_LABEL_TIMEOUT,
+                                    fetch_branches(UNIX_DRIVERS_PAGE),
+                                )
+                                .await
+                            },
+                            move |result| match result {
+                                Ok(Ok(branches)) => {
+                                    {
+                                        let mut s = state.borrow_mut();
+                                        for v in &mut s.versions {
+                                            v.branch = branches.classify(&v.version);
+                                        }
+                                    }
+                                    add_branch_badges(&list_box, &state.borrow().versions);
+                                }
+                                Ok(Err(e)) => log_fn(format!(
+                                    "No branch labels: NVIDIA's branch data is unavailable ({e:#})"
+                                )),
+                                Err(_) => log_fn(
+                                    "No branch labels: NVIDIA's branch data took too long".to_string(),
+                                ),
+                            },
+                        );
                     }
                 }
             });
@@ -947,31 +1039,28 @@ pub fn build_ui(app: &Application) {
         stack: stack.clone(),
         toast: toast_overlay.clone(),
         window: window.clone(),
+        guard: None,
     };
     {
         let dl_ui = dl_ui.clone();
         download_btn.connect_clicked(move |_| {
-            let ui = dl_ui.clone();
+            let mut ui = dl_ui.clone();
             let (ver, free) = {
                 let s = ui.state.borrow();
-                if s.busy.is_some() {
-                    return;
-                }
                 (s.selected_version.clone(), s.sysinfo.free_disk_bytes)
             };
             let Some(ver) = ver else { return };
+            let Some(guard) = BusyGuard::start(&ui.state, &ui.refresh_actions, Busy::Download) else {
+                return;
+            };
+            ui.guard = Some(guard);
 
             if free.is_some_and(|f| f < MIN_DISK_BYTES) {
                 ui.toast.add_toast(Toast::new("Low disk space — install may fail"));
             }
 
             let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            {
-                let mut s = ui.state.borrow_mut();
-                s.busy = Some(Busy::Download);
-                s.download_cancel = Some(cancel_flag.clone());
-            }
-            (ui.refresh_actions)();
+            ui.state.borrow_mut().download_cancel = Some(cancel_flag.clone());
             ui.cancel_btn.set_visible(true);
             ui.progress.set_visible(true);
             ui.progress.set_fraction(0.0);
@@ -1112,17 +1201,30 @@ pub fn build_ui(app: &Application) {
             dialog.open(Some(&window.clone()), gio::Cancellable::NONE, move |result| {
                 let Some(path) = result.ok().and_then(|f| f.path()) else { return };
                 // The install script refuses symlinks; use the file itself.
-                let path = std::fs::canonicalize(&path).unwrap_or(path);
-                let path_str = path.to_string_lossy().to_string();
-                if let Err(e) = check_run_file(&path_str) {
-                    log_fn(format!("Can't use {path_str}: {e}"));
-                    show_error(&window, "This file can't be installed", &e.to_string());
-                    return;
-                }
-                log_fn(format!("Opened local file: {}", path_str));
-                { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
-                update_config_tab();
-                stack.set_visible_child_name("configure");
+                // The checks run commands (getent, getfacl): not on this thread.
+                spawn_async(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let path = std::fs::canonicalize(&path).unwrap_or(path);
+                            let path_str = path.to_string_lossy().to_string();
+                            let checked = check_run_file(&path_str);
+                            (path_str, checked)
+                        })
+                        .await
+                    },
+                    move |checked| {
+                        let Ok((path_str, checked)) = checked else { return };
+                        if let Err(e) = checked {
+                            log_fn(format!("Can't use {path_str}: {e}"));
+                            show_error(&window, "This file can't be installed", &e.to_string());
+                            return;
+                        }
+                        log_fn(format!("Opened local file: {}", path_str));
+                        { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
+                        update_config_tab();
+                        stack.set_visible_child_name("configure");
+                    },
+                );
             });
         });
     }
@@ -1201,8 +1303,9 @@ pub fn build_ui(app: &Application) {
             };
             drop(s);
 
-            state.borrow_mut().busy = Some(Busy::Install);
-            refresh_actions();
+            let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
+                return;
+            };
             progress.set_visible(true);
             progress.set_text(Some("Installing… the desktop stays up; this takes a few minutes"));
             stack.set_visible_child_name("log");
@@ -1224,38 +1327,40 @@ pub fn build_ui(app: &Application) {
                 });
             }
 
-            // The script's output, line by line as it runs, into the Log tab.
+            // The script's output goes into the Log tab line by line as it
+            // runs; the result is shown only after the last line (the sender
+            // is dropped when the install call returns, before the result is
+            // sent).
             let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            {
-                let log_fn = log_fn.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    while let Some(line) = line_rx.recv().await {
-                        log_fn(line);
-                    }
-                });
-            }
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            crate::runtime().spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    run_privileged_install(&opts, |line| {
+                        let _ = line_tx.send(line.to_string());
+                    })
+                })
+                .await;
+                let _ = result_tx.send(result);
+            });
 
             let log_fn = log_fn.clone();
             let toast_overlay = toast_overlay.clone();
             let progress = progress.clone();
             let load_sysinfo = load_sysinfo.clone();
-            let state = state.clone();
-            let refresh_actions = refresh_actions.clone();
             let window = window.clone();
 
-            spawn_async(
-                async move {
-                    tokio::task::spawn_blocking(move || {
-                        run_privileged_install(&opts, |line| {
-                            let _ = line_tx.send(line.to_string());
-                        })
-                    })
-                    .await
-                },
-                move |result| {
-                    state.borrow_mut().busy = None;
-                    refresh_actions();
-                    progress.set_visible(false);
+            glib::MainContext::default().spawn_local(async move {
+                while let Some(line) = line_rx.recv().await {
+                    log_fn(line);
+                }
+                let result: Result<anyhow::Result<()>, String> = match result_rx.await {
+                    Ok(Ok(r)) => Ok(r),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err("the install task ended unexpectedly".to_string()),
+                };
+                guard.release();
+                progress.set_visible(false);
+                {
                     match result {
                         Ok(Ok(())) => {
                             log_fn("Install completed successfully.".to_string());
@@ -1272,8 +1377,8 @@ pub fn build_ui(app: &Application) {
                     }
                     // A failed install may have changed (or put back) packages too.
                     load_sysinfo();
-                },
-            );
+                }
+            });
         });
     }
 
@@ -1318,6 +1423,67 @@ pub fn build_ui(app: &Application) {
     // Clear log
     { let lv = log_view.clone(); clear_btn.connect_clicked(move |_| { lv.buffer().set_text(""); }); }
 
+    // Closing the window doesn't stop a running install (it carries on, or
+    // puts the previous driver back, on its own), but the user must not take
+    // the closed window as "done" and reboot.
+    {
+        let state = state.clone();
+        let allow_close = Rc::new(std::cell::Cell::new(false));
+        window.connect_close_request(move |w| {
+            let busy = state.borrow().busy;
+            if allow_close.get() || !matches!(busy, Some(Busy::Install) | Some(Busy::Signing)) {
+                return glib::Propagation::Proceed;
+            }
+            let dialog = libadwaita::AlertDialog::new(
+                Some("The install is still running"),
+                Some(
+                    "Closing Green Light doesn't stop it: the install finishes, or puts the \
+                     previous driver back, on its own. Its progress is in \
+                     /var/log/green-light.log. Don't reboot until that log says it is done.",
+                ),
+            );
+            dialog.add_responses(&[("keep", "Keep Open"), ("close", "Close Anyway")]);
+            dialog.set_response_appearance("close", libadwaita::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("keep"));
+            dialog.set_close_response("keep");
+            let allow_close = allow_close.clone();
+            let window = w.clone();
+            dialog.choose(Some(w), gio::Cancellable::NONE, move |response| {
+                if response == "close" {
+                    allow_close.set(true);
+                    window.close();
+                }
+            });
+            glib::Propagation::Stop
+        });
+    }
+
+    // An install started before this window opened (the app was closed
+    // during it) is still running: say so and start nothing until it ends.
+    {
+        let state = state.clone();
+        let refresh_actions = refresh_actions.clone();
+        let running_banner = running_banner.clone();
+        let load_sysinfo = load_sysinfo.clone();
+        let check = move || {
+            if state.borrow().busy.is_some() {
+                return glib::ControlFlow::Continue;
+            }
+            let running = install_running();
+            if running != state.borrow().external_install {
+                state.borrow_mut().external_install = running;
+                running_banner.set_revealed(running);
+                refresh_actions();
+                if !running {
+                    load_sysinfo();
+                }
+            }
+            glib::ControlFlow::Continue
+        };
+        check();
+        glib::timeout_add_seconds_local(2, check);
+    }
+
     window.present();
 }
 
@@ -1347,17 +1513,17 @@ struct DownloadUi {
     stack: gtk4::Stack,
     toast: ToastOverlay,
     window: ApplicationWindow,
+    /// The running download; shared by every step of it (verification,
+    /// questions), so it ends when the last of them is done.
+    guard: Option<Rc<BusyGuard>>,
 }
 
 impl DownloadUi {
     /// The download is over, whichever way it went.
     fn end(&self) {
-        {
-            let mut s = self.state.borrow_mut();
-            s.busy = None;
-            s.download_cancel = None;
+        if let Some(guard) = &self.guard {
+            guard.release();
         }
-        (self.refresh_actions)();
     }
 
     /// Make the file the one to install.
@@ -1515,18 +1681,43 @@ fn populate_list(
             row.add_css_class("success");
         }
 
-        // Branch badge (Production/New Feature/Older Production/Legacy), from
-        // NVIDIA's own data; omitted rather than guessed without it.
         if let Some(branch) = ver.branch {
-            let badge = Label::new(Some(branch.label()));
-            badge.add_css_class("caption");
-            badge.add_css_class("pill");
-            badge.add_css_class(branch.css_class());
-            badge.set_valign(Align::Center);
-            row.add_suffix(&badge);
+            add_branch_badge(&row, branch);
         }
 
         list_box.append(&row);
+    }
+}
+
+/// How long the branch labels may take before the list goes without them.
+const BRANCH_LABEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Branch badge (Production/New Feature/Older Production/Legacy), from
+/// NVIDIA's own data; omitted rather than guessed without it.
+fn add_branch_badge(row: &ActionRow, branch: DriverBranch) {
+    let badge = Label::new(Some(branch.label()));
+    badge.add_css_class("caption");
+    badge.add_css_class("pill");
+    badge.add_css_class(branch.css_class());
+    badge.set_valign(Align::Center);
+    row.add_suffix(&badge);
+    row.set_widget_name("badged");
+}
+
+/// Badges for rows already shown, once the labels have arrived; the list
+/// isn't rebuilt, so the selection stays.
+fn add_branch_badges(list_box: &ListBox, versions: &[DriverVersion]) {
+    let mut child = list_box.first_child();
+    while let Some(c) = child {
+        child = c.next_sibling();
+        let Ok(row) = c.downcast::<ActionRow>() else { continue };
+        if row.widget_name() == "badged" {
+            continue;
+        }
+        let title = row.title();
+        if let Some(branch) = versions.iter().find(|v| v.version == title).and_then(|v| v.branch) {
+            add_branch_badge(&row, branch);
+        }
     }
 }
 
@@ -1572,11 +1763,39 @@ mod tests {
             assert_eq!(actions_enabled(&s), none, "{busy:?}");
         }
         s.busy = None;
+        s.external_install = true;
+        assert_eq!(actions_enabled(&s), none, "install from an earlier run");
+        s.external_install = false;
+        // Before system info is in, no install: its options aren't known yet.
+        s.sysinfo_loaded = false;
+        let early = actions_enabled(&s);
+        assert!(!early.install && early.download && early.open_file);
         s.selected_version = None;
         s.downloaded_path = None;
-        s.sysinfo_loaded = false;
         let idle = actions_enabled(&s);
         assert!(!idle.download && !idle.install && !idle.setup_signing && idle.open_file);
+    }
+
+    #[test]
+    fn busy_guard_ends_only_its_own_operation() {
+        let state = Rc::new(RefCell::new(AppState::default()));
+        let refreshed = Rc::new(std::cell::Cell::new(0));
+        let r = refreshed.clone();
+        let refresh: Rc<dyn Fn()> = Rc::new(move || r.set(r.get() + 1));
+        let first = BusyGuard::start(&state, &refresh, Busy::Download).unwrap();
+        assert!(BusyGuard::start(&state, &refresh, Busy::Install).is_none());
+        // Dropped without running its callback, as after a panic: ends it.
+        drop(first);
+        assert_eq!(state.borrow().busy, None);
+        let second = BusyGuard::start(&state, &refresh, Busy::Install).unwrap();
+        // A stale guard of the finished operation must not end the new one.
+        let stale = BusyGuard { state: state.clone(), refresh: refresh.clone(), token: 1 };
+        drop(stale);
+        assert_eq!(state.borrow().busy, Some(Busy::Install));
+        second.release();
+        assert_eq!(state.borrow().busy, None);
+        drop(second);
+        assert!(refreshed.get() >= 3);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use scraper::{Html, Selector};
 
-use crate::branches::{fetch_branches, DriverBranch, UNIX_DRIVERS_PAGE};
+use crate::branches::DriverBranch;
 
 #[derive(Debug, Clone)]
 pub struct DriverVersion {
@@ -26,27 +26,10 @@ pub fn version_from_filename(filename: &str) -> Option<String> {
 
 const NVIDIA_BASE: &str = "https://download.nvidia.com/XFree86/Linux-x86_64/";
 
-/// The driver versions, and why they carry no branch labels if NVIDIA's
-/// branch data couldn't be had (the list itself is still good then).
-pub struct VersionList {
-    pub versions: Vec<DriverVersion>,
-    pub branch_error: Option<String>,
-}
-
-pub async fn fetch_versions() -> Result<VersionList> {
-    let (versions, branches) =
-        tokio::join!(fetch_versions_from(NVIDIA_BASE), fetch_branches(UNIX_DRIVERS_PAGE));
-    let mut versions = versions?;
-    let branch_error = match branches {
-        Ok(b) => {
-            for v in &mut versions {
-                v.branch = b.classify(&v.version);
-            }
-            None
-        }
-        Err(e) => Some(format!("{e:#}")),
-    };
-    Ok(VersionList { versions, branch_error })
+/// The driver versions, without branch labels: those come from a separate
+/// and slower source (`branches.rs`), which the UI applies when it answers.
+pub async fn fetch_versions() -> Result<Vec<DriverVersion>> {
+    fetch_versions_from(NVIDIA_BASE).await
 }
 
 async fn fetch_versions_from(base: &str) -> Result<Vec<DriverVersion>> {
@@ -239,10 +222,14 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_fetch_shows_branch_labels() {
-        let list = fetch_versions().await.expect("live fetch failed");
-        assert_eq!(list.branch_error, None);
-        let versions = list.versions;
+        let mut versions = fetch_versions().await.expect("live fetch failed");
         assert!(!versions.is_empty());
+        let branches = crate::branches::fetch_branches(crate::branches::UNIX_DRIVERS_PAGE)
+            .await
+            .expect("live branch fetch failed");
+        for v in &mut versions {
+            v.branch = branches.classify(&v.version);
+        }
         let mut seen = std::collections::HashSet::new();
         for v in &versions {
             if let Some(b) = v.branch {

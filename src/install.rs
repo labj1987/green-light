@@ -1,4 +1,4 @@
-use crate::preflight::{run_file_problem, FileFacts, ModuleChoice};
+use crate::preflight::{acl_writers, group_is_owners_private_group, run_file_problem, FileFacts, ModuleChoice};
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -7,6 +7,22 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const PRIVILEGED_SCRIPT: &str = "/usr/lib/green-light/privileged-install.sh";
+/// Held (flock) by the install script for as long as it runs; keep in step
+/// with INSTALL_LOCK in the script (tested below).
+pub const INSTALL_LOCK: &str = "/run/green-light-install.lock";
+
+/// Whether an install is running right now, e.g. one started before the app
+/// was closed and opened again.
+pub fn install_running() -> bool {
+    lock_held(Path::new(INSTALL_LOCK))
+}
+
+fn lock_held(path: &Path) -> bool {
+    match std::fs::File::open(path) {
+        Ok(f) => matches!(f.try_lock_shared(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
+    }
+}
 const INSTALL_LOG: &str = "/var/log/green-light.log";
 
 pub struct InstallOptions {
@@ -61,10 +77,28 @@ pub fn check_run_file(path: &str) -> Result<()> {
     let facts = FileFacts { mode: meta.mode(), uid: meta.uid(), gid: meta.gid() };
     let passwd = command_stdout("getent", &["passwd"]).unwrap_or_default();
     let group = command_stdout("getent", &["group", &facts.gid.to_string()]);
-    match run_file_problem(path, facts, caller, &passwd, group.as_deref()) {
-        Some(problem) => bail!("{problem}"),
-        None => Ok(()),
+    if let Some(problem) = run_file_problem(path, facts, caller, &passwd, group.as_deref()) {
+        bail!("{problem}");
     }
+    // An ACL can let others write the file whatever its mode says ("ls"
+    // marks a file with one by a "+" after the mode).
+    let mode = command_stdout("ls", &["-ldn", "--", path]).unwrap_or_default();
+    if !mode.split_whitespace().next().unwrap_or("").ends_with('+') {
+        return Ok(());
+    }
+    let Some(acl) = command_stdout("getfacl", &["-cpn", "--", path]) else {
+        bail!("{path} has an access control list that can't be checked (getfacl is missing). Remove it (setfacl -b) and try again.");
+    };
+    for who in acl_writers(&acl, facts.uid) {
+        if let Some(gid) = who.strip_prefix("group:").and_then(|g| g.parse::<u32>().ok()) {
+            let group = command_stdout("getent", &["group", &gid.to_string()]);
+            if group_is_owners_private_group(gid, facts.uid, &passwd, group.as_deref()) {
+                continue;
+            }
+        }
+        bail!("{path} has an access control list letting {who} change it. Remove it (setfacl -b) and try again.");
+    }
+    Ok(())
 }
 
 /// What a privileged run printed, and how it ended.
@@ -145,8 +179,9 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
         Some(1) => format!("The install stopped before changing anything{detail}"),
         Some(2) => format!("The install script refused to start{detail}"),
         Some(3) => format!(
-            "The install failed{detail}. Everything it had changed was put back, so the next \
-             boot uses the driver this computer had before."
+            "The install failed{detail}. Everything it had changed was put back, and the \
+             driver this computer had before was checked to be in place again: the next boot \
+             uses it."
         ),
         Some(4) => format!(
             "The install failed{detail}, and putting the previous driver back failed too. \
@@ -275,6 +310,21 @@ mod tests {
         assert!(install_failure(Some(4), &out).contains("Don't reboot"));
         assert!(install_failure(Some(1), &[]).ends_with("before changing anything"));
         assert!(install_failure(None, &[]).contains("killed"));
+    }
+
+    #[test]
+    fn lock_matches_the_script_and_is_detected() {
+        let script = include_str!("../scripts/privileged-install.sh");
+        assert!(script.contains(&format!("\nINSTALL_LOCK=\"{INSTALL_LOCK}\"\n")));
+        let path = std::env::temp_dir().join(format!("green-light-lock-{}", std::process::id()));
+        let holder = std::fs::File::create(&path).unwrap();
+        assert!(!lock_held(&path));
+        holder.lock().unwrap();
+        assert!(lock_held(&path));
+        holder.unlock().unwrap();
+        assert!(!lock_held(&path));
+        assert!(!lock_held(Path::new("/nonexistent/green-light.lock")));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

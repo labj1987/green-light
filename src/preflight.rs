@@ -278,6 +278,31 @@ pub fn group_is_owners_private_group(gid: u32, uid: u32, passwd: &str, group: Op
         && !entries.iter().any(|e| e.2 == gid && e.0 != owner)
 }
 
+/// Who besides the owner (`owner_uid`) an ACL lets write a file, from
+/// `getfacl -cpn` output: "user:<uid>" and "group:<gid>" entries with write
+/// permission that the mask doesn't take away. Mirrors `acl_writers` in the
+/// install script.
+pub fn acl_writers(getfacl: &str, owner_uid: u32) -> Vec<String> {
+    let mask_w = getfacl
+        .lines()
+        .find_map(|l| l.strip_prefix("mask::"))
+        .is_none_or(|m| m.as_bytes().get(1) == Some(&b'w'));
+    getfacl
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, ':');
+            let (kind, who, perms) = (f.next()?, f.next()?, f.next()?);
+            let other = match kind {
+                "user" => !who.is_empty() && who != owner_uid.to_string(),
+                "group" => !who.is_empty(),
+                _ => false,
+            };
+            (other && perms.as_bytes().get(1) == Some(&b'w') && mask_w)
+                .then(|| format!("{kind}:{who}"))
+        })
+        .collect()
+}
+
 /// Why the install script would refuse this .run file, checked the way the
 /// script checks it, so the reason shows before the password prompt: an
 /// absolute `.run` path, owned by root or the caller, and writable by nobody
@@ -928,6 +953,17 @@ mod tests {
         assert!(!group_is_owners_private_group(1000, 1000, passwd, None));
         let shared = format!("{passwd}carol:x:1002:1000::/home/carol:/bin/bash\n");
         assert!(!group_is_owners_private_group(1000, 1000, &shared, Some("alex:x:1000:")));
+    }
+
+    #[test]
+    fn acl_entries_that_allow_writing() {
+        let acl = "user::rw-\nuser:1001:rw-\nuser:1000:rw-\ngroup::r--\ngroup:27:rw-\n\
+                   group:44:r--\nmask::rw-\nother::r--\n";
+        assert_eq!(acl_writers(acl, 1000), ["user:1001", "group:27"]);
+        // The mask takes write away from named entries.
+        let masked = acl.replace("mask::rw-", "mask::r--");
+        assert!(acl_writers(&masked, 1000).is_empty());
+        assert!(acl_writers("user::rw-\ngroup::r--\nother::r--\n", 1000).is_empty());
     }
 
     #[test]
