@@ -1,20 +1,33 @@
 # Installed by Green Light's first-launch setup. Runs only when an install
-# was cut off (power loss, crash) and left its journal behind: it puts the
-# previous NVIDIA driver back before the login screen starts, or clears the
-# journal when NVIDIA's installer had already finished.
+# was cut off (power loss, crash) or its rollback failed, leaving its
+# journal behind: it puts the previous NVIDIA driver back before the login
+# screen starts (or clears the journal when NVIDIA's installer had already
+# finished). Progress shows on the boot splash and console and goes to the
+# system journal and /var/log/green-light.log.
 [Unit]
 Description=Green Light: restore the previous NVIDIA driver after an interrupted install
 Documentation=https://github.com/labj1987/green-light
 ConditionPathExists=/var/lib/green-light/journal
 RequiresMountsFor=/var/lib/green-light /var/log
+# After the services that build missing modules at boot, so they don't work
+# on the package database at the same time; before anything graphical.
+After=akmods.service dkms.service
 Before=display-manager.service systemd-user-sessions.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/lib/green-light/privileged-install.sh --recover
-# 3: rolled back and checked. 4 (could not fully restore) stays a failure.
-SuccessExitStatus=3
-TimeoutStartSec=45min
+StandardOutput=journal+console
+StandardError=journal+console
+# 3: rolled back and checked. 6: the recovery data no longer matches the
+# computer and was left alone (Green Light explains and offers to discard
+# it). 4 (could not fully restore) stays a failure.
+SuccessExitStatus=3 6
+# Reinstalling from the kept copies and rebuilding modules for two kernels
+# takes minutes, not hours. A timeout stops it part-way, which is safe: the
+# journal is only removed after a checked restore, so the next boot (or
+# Restore Previous Driver) picks up where it stopped.
+TimeoutStartSec=20min
 
 [Install]
 WantedBy=multi-user.target

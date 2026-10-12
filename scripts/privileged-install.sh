@@ -40,6 +40,9 @@
 #   4  as 3, but putting it back failed too: the machine needs attention
 #      before a reboot
 #   5  the driver is installed, but rebuilding the initramfs failed
+#   6  recovery data from an earlier interrupted install no longer matches
+#      this computer (its driver was changed by other means since): nothing
+#      done; "--discard-recovery" drops that data
 #
 # MODULE SIGNING
 # --------------
@@ -72,6 +75,7 @@ EXIT_USAGE=2
 EXIT_ROLLED_BACK=3
 EXIT_ROLLBACK_FAILED=4
 EXIT_INITRAMFS=5
+EXIT_RECOVERY_REFUSED=6
 
 LOGFILE="/var/log/green-light.log"
 
@@ -81,14 +85,21 @@ LOGFILE="/var/log/green-light.log"
 # app follows the log file instead. SIGPIPE keeps its default for the
 # commands run below. SIGHUP is ignored (a closing terminal must not stop an
 # install; the commands inherit that, which they should).
-if [[ ! -t 1 ]]; then exec >/dev/null; fi
-if [[ ! -t 2 ]]; then exec 2>>"$LOGFILE"; fi
+# (Run by systemd, the boot unit, stdout and stderr go to the journal and
+# the console, which don't go away; keep them.)
+if [[ ! -t 1 && -z "${INVOCATION_ID:-}" ]]; then exec >/dev/null; fi
+if [[ ! -t 2 && -z "${INVOCATION_ID:-}" ]]; then exec 2>>"$LOGFILE"; fi
 trap '' HUP
 
+# Each log line carries this run's PID: the app shows only the lines of the
+# run it started (its pkexec child has this PID).
+PLYMOUTH=0
 log() {
     local msg="[green-light] $*"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') $msg" >> "$LOGFILE" 2>/dev/null || true
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [green-light $$] $*" >> "$LOGFILE" 2>/dev/null || true
     echo "$msg" 2>/dev/null || true
+    # At boot, on the splash screen as well.
+    if [[ $PLYMOUTH -eq 1 ]]; then plymouth display-message --text="Green Light: $*" 2>/dev/null || true; fi
 }
 
 trap 'log "ERROR: step failed near line $LINENO (exit $?) — install aborted"' ERR
@@ -111,6 +122,7 @@ on_exit() {
         else
             # Kept: the next install, Restore Previous Driver or the boot
             # unit tries again.
+            recovery_note "failed: the previous driver could not be fully restored; see $LOGFILE"
             rc=$EXIT_ROLLBACK_FAILED
         fi
     elif [[ ${JOURNAL_OURS:-0} -eq 1 ]]; then
@@ -295,6 +307,12 @@ cert_subject_cn() { # <cert>
 # The one-time password arrives on stdin and never appears in argv or a log.
 if [[ "${1:-}" == "--setup-signing" ]]; then
     trap 'log "ERROR: step failed near line $LINENO (exit $?) — signing setup aborted"' ERR
+    # Not alongside an install (same lock as the install part below).
+    exec 9>>/run/green-light-install.lock
+    if ! flock -n 9; then
+        log "ERROR: A Green Light install is running; set up signing once it has finished."
+        exit 1
+    fi
     MOK_PASSWORD=""
     IFS= read -r MOK_PASSWORD || true
     log "==== Module signing setup started ===="
@@ -367,8 +385,16 @@ fi
 #   privileged-install.sh --recover                       roll back an install
 #     that was cut off (power loss, SIGKILL) from its journal; also what the
 #     green-light-recover.service boot unit runs.
+#   privileged-install.sh --discard-recovery              drop recovery data
+#     that no longer matches the computer. As an install option it does the
+#     same before installing.
 MODE="install"
 if [[ "${1:-}" == "--recover" ]]; then MODE="recover"; fi
+if [[ "${1:-}" == "--discard-recovery" ]]; then MODE="discard"; fi
+DISCARD_RECOVERY=0
+for arg in "$@"; do
+    if [[ "$arg" == "--discard-recovery" ]]; then DISCARD_RECOVERY=1; fi
+done
 
 # Out of the user's session: logging out (or the session being torn down)
 # stops every process in the session's scope, which would cut the install
@@ -376,11 +402,16 @@ if [[ "${1:-}" == "--recover" ]]; then MODE="recover"; fi
 # the command in the same process, so the exit code still reaches pkexec.
 # (Not when systemd started it as a service, the boot unit: that is already
 # its own unit, and its process must stay the service's.)
+# A trial scope first: when systemd-run can't make one, the run goes on in
+# the session's scope rather than failing.
 if [[ -z "${GREEN_LIGHT_SCOPED:-}" && -z "${INVOCATION_ID:-}" && -d /run/systemd/system ]] \
     && command -v systemd-run >/dev/null 2>&1; then
     export GREEN_LIGHT_SCOPED=1
-    exec systemd-run --scope --quiet --collect --unit="green-light-install-$$" \
-        --description="Green Light driver install" -- "$BASH" "$0" "$@"
+    if systemd-run --scope --quiet --collect true >/dev/null 2>&1; then
+        exec systemd-run --scope --quiet --collect --unit="green-light-install-$$" \
+            --description="Green Light driver install" -- "$BASH" "$0" "$@"
+    fi
+    log "WARNING: systemd-run could not give the install a scope of its own; logging out during it would stop it"
 fi
 
 # Its own session: a hangup or Ctrl-C delivered to the app's process group
@@ -393,20 +424,14 @@ if [[ "$OWN_SID" != "$$" ]] && command -v setsid >/dev/null 2>&1; then
     exec setsid --wait "$BASH" "$0" "$@"
 fi
 
-# Logged first, so every message of this run (argument and file errors
-# included) comes after it in the log.
-if [[ "$MODE" == "recover" ]]; then
-    log "==== Green Light recovery started ===="
-else
-    log "==== NVIDIA driver install started ===="
-fi
-
 usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
 
 # Run a command without the lock's file descriptor, so nothing it leaves
 # running in the background (akmods from an rpm scriptlet, a DKMS build)
-# keeps the lock, and with it the "install running" state, after this run.
-nolock() { "$@" 9>&-; }
+# keeps the lock, and with it the "install running" state, after this run;
+# and with SIGTERM/SIGINT at their defaults, whatever this script does with
+# them (it ignores them while putting things back).
+nolock() { ( trap - TERM INT; exec "$@" ) 9>&-; }
 
 # One install at a time. The app also checks this lock to tell that an
 # install is still running (for example after it was closed and reopened).
@@ -417,6 +442,14 @@ if ! flock -n 9; then
     usage_error "Another Green Light install is still running; wait for it to finish."
 fi
 echo "$$" > "$INSTALL_LOCK"
+
+# Logged once this is the only run, so every message of this run (argument
+# and file errors included) comes after it in the log.
+case "$MODE" in
+    recover) log "==== Green Light recovery started ====" ;;
+    discard) log "==== Green Light: discarding recovery data ====" ;;
+    *)       log "==== NVIDIA driver install started ====" ;;
+esac
 
 # ── Shared helpers ─────────────────────────────────────────────────────
 
@@ -521,8 +554,8 @@ installed_run_version() {
     return 0
 }
 
-module_version() { modinfo -k "$KVER" -F version nvidia 2>/dev/null || true; }
-module_signer() { modinfo -k "$KVER" -F signer nvidia 2>/dev/null || true; }
+module_version() { modinfo -k "${1:-$KVER}" -F version nvidia 2>/dev/null || true; }
+module_signer() { modinfo -k "${1:-$KVER}" -F signer nvidia 2>/dev/null || true; }
 secure_boot_on() {
     command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
 }
@@ -571,6 +604,7 @@ journal_clear() {
         rm -rf "$JOURNAL"
         durable "$STATE_DIR"
     fi
+    rm -f "$STATE_DIR/recovery-status"
     return 0
 }
 
@@ -632,11 +666,13 @@ packages_removed() {
 # reinstalled without the network: from apt's or akmods' cache when there,
 # else downloaded at the exact version. "cache-index" maps keys to files.
 cache_planned_packages() {
-    local key spec name ver file got
+    local key spec name ver file got index="$JOURNAL/.cache-index.new"
     mkdir -p "$JOURNAL/cache"
-    : > "$JOURNAL/cache-index"
+    cp -- "$JOURNAL/cache-index" "$index" 2>/dev/null || : > "$index"
     while IFS='|' read -r key spec; do
         grep -qxF -- "$key" "$JOURNAL/planned" || continue
+        # Already kept (carried over from an earlier install's journal).
+        grep -q "^${key//./\\.}|" "$index" && continue
         got=""
         if [[ "$PKG_MGR" == "apt" ]]; then
             name="${key%%:*}"; ver="${spec#*=}"
@@ -657,14 +693,16 @@ cache_planned_packages() {
             fi
         fi
         if [[ -n "$got" ]]; then
-            printf '%s|%s\n' "$key" "$got" >> "$JOURNAL/cache-index"
+            printf '%s|%s\n' "$key" "$got" >> "$index"
         elif [[ "$PKG_MGR" == "dnf" && "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then
             log "  $key was built here by akmods; it is rebuilt if needed"
         else
             log "WARNING: Could not keep a copy of $spec; putting it back would need the package source"
         fi
     done < "$JOURNAL/packages-before"
-    durable "$JOURNAL/cache" "$JOURNAL/cache-index"
+    durable "$JOURNAL/cache"/* "$JOURNAL/cache" "$index"
+    mv -f "$index" "$JOURNAL/cache-index"
+    durable "$JOURNAL"
 }
 
 backup_file() { # <path>
@@ -703,10 +741,54 @@ signer_trusted() { # <signer>
     mokutil --test-key "$der" 2>&1 | grep -qiE 'already (enrolled|in )'
 }
 
+# Kernels whose module matters after a rollback: the one the journal was
+# written for, and the one running now if that is another (a recovery at
+# boot after a newer kernel was installed in the meantime).
+restore_kernels() {
+    local boot
+    boot="$(uname -r)"
+    printf '%s\n' "$KVER"
+    if [[ "$boot" != "$KVER" && -d "/lib/modules/$boot" ]]; then printf '%s\n' "$boot"; fi
+}
+
+initramfs_for() { # <kernel>
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        nolock update-initramfs -u -k "$1"
+    else
+        nolock dracut --force --kver "$1"
+    fi
+}
+
+# Make sure the restored driver has its module for <kernel> when the
+# packages alone don't bring it: akmods for akmod-nvidia, DKMS for DKMS
+# packages, Ubuntu's prebuilt package for that kernel when the setup used
+# prebuilt ones. Sets nothing; verify_restored checks the result.
+ensure_module() { # <kernel> <restored keys...>
+    local k="$1" key branch=""
+    shift
+    [[ -n "$(module_version "$k")" ]] && return 0
+    for key in "$@"; do
+        if [[ "$key" =~ ^linux-modules-nvidia-([0-9]+(-server)?(-open)?)- ]]; then branch="${BASH_REMATCH[1]}"; fi
+    done
+    if [[ "$PKG_MGR" == "dnf" ]] && command -v akmods >/dev/null 2>&1 \
+        && printf '%s\n' "$@" | grep -q '^akmod-nvidia\.'; then
+        log "Building the restored driver's kernel module for $k with akmods…"
+        nolock akmods --force --kernels "$k" >>"$LOGFILE" 2>&1 || log "WARNING: akmods could not build the kernel module for $k"
+    elif [[ -n "$branch" ]]; then
+        log "Installing Ubuntu's prebuilt NVIDIA module package for $k…"
+        nolock apt-get install -y "linux-modules-nvidia-$branch-$k" >>"$LOGFILE" 2>&1 \
+            || log "WARNING: Could not install linux-modules-nvidia-$branch-$k"
+    elif command -v dkms >/dev/null 2>&1; then
+        log "Building the restored driver's kernel module for $k with DKMS…"
+        nolock dkms autoinstall -k "$k" >>"$LOGFILE" 2>&1 || log "WARNING: DKMS could not build the kernel module for $k"
+    fi
+    return 0
+}
+
 # After a rollback: is the driver the machine had before back? Only then may
 # the run claim to have restored it.
 verify_restored() {
-    local ok=1 run_now mod_now signer_now entry
+    local ok=1 run_now mod_now signer_now entry k
     run_now="$(installed_run_version)"
     if [[ -n "$RUN_VER_BEFORE" && "$run_now" != "$RUN_VER_BEFORE" ]]; then
         log "ERROR: The driver $RUN_VER_BEFORE installed earlier from NVIDIA's .run file was removed by NVIDIA's installer and can't be put back from here."
@@ -720,34 +802,36 @@ verify_restored() {
         log "ERROR: The removed package $entry is not installed again."
         ok=0
     done < <(packages_removed)
-    mod_now="$(module_version)"
-    if [[ -n "$MOD_VER_BEFORE" ]]; then
-        if [[ -z "$mod_now" ]]; then
-            log "ERROR: There is no nvidia kernel module for $KVER any more (it was $MOD_VER_BEFORE)."
-            ok=0
-        else
-            if [[ "$mod_now" != "$MOD_VER_BEFORE" ]]; then
-                log "The nvidia kernel module for $KVER is now $mod_now (it was $MOD_VER_BEFORE)."
+    while IFS= read -r k; do
+        mod_now="$(module_version "$k")"
+        if [[ -n "$MOD_VER_BEFORE" ]]; then
+            if [[ -z "$mod_now" ]]; then
+                log "ERROR: There is no nvidia kernel module for $k (there was $MOD_VER_BEFORE for $KVER)."
+                ok=0
+                continue
             fi
-            signer_now="$(module_signer)"
+            if [[ "$mod_now" != "$MOD_VER_BEFORE" ]]; then
+                log "The nvidia kernel module for $k is now $mod_now (it was $MOD_VER_BEFORE)."
+            fi
+            signer_now="$(module_signer "$k")"
             # Unchanged (unsigned before and after included) is restored as
             # it was; a changed signer must be one Secure Boot trusts.
             if secure_boot_on && [[ "$signer_now" != "$MOD_SIGNER_BEFORE" ]] && ! signer_trusted "$signer_now"; then
-                log "ERROR: Secure Boot is on, and the restored nvidia module for $KVER is ${signer_now:+signed by \"$signer_now\", }not signed by a key it trusts (it was ${MOD_SIGNER_BEFORE:-unsigned})."
+                log "ERROR: Secure Boot is on, and the nvidia module for $k is ${signer_now:+signed by \"$signer_now\", }not signed by a key it trusts (it was ${MOD_SIGNER_BEFORE:-unsigned})."
                 ok=0
             fi
+        elif [[ -n "$mod_now" ]]; then
+            log "ERROR: An nvidia kernel module ($mod_now) for $k is left behind from the failed install."
+            ok=0
         fi
-    elif [[ -n "$mod_now" ]]; then
-        log "ERROR: An nvidia kernel module ($mod_now) for $KVER is left behind from the failed install."
-        ok=0
-    fi
+    done < <(restore_kernels)
     return $(( ok ? 0 : 1 ))
 }
 
 rollback() {
-    local ok=1 key spec file run_now akmod=0 kmod_cached=0
+    local ok=1 key spec file run_now k kmod_cached=0 local_failed=0
     local -A cached=()
-    local files=() specs=() names=() auto=()
+    local files=() specs=() names=() auto=() keys=()
     log "Restoring the previous driver setup…"
     # A partial install of the new driver: let its own uninstaller take it
     # out, so the restored packages don't sit on top of half of it.
@@ -763,10 +847,10 @@ rollback() {
     while IFS='|' read -r key file; do [[ -n "$key" ]] && cached["$key"]="$file"; done < "$JOURNAL/cache-index"
     while IFS='|' read -r key spec; do
         [[ -n "$key" ]] || continue
-        if [[ "$PKG_MGR" == "dnf" && "${key%.*}" == akmod-nvidia ]]; then akmod=1; fi
+        keys+=("$key")
         if [[ -n "${cached[$key]:-}" ]]; then
             files+=("${cached[$key]}")
-            if [[ "$PKG_MGR" == "dnf" && "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then kmod_cached=1; fi
+            if [[ "$PKG_MGR" == "dnf" && "${key%.*}" == "kmod-nvidia-$KVER" ]]; then kmod_cached=1; fi
         elif [[ "$PKG_MGR" == "dnf" && "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then
             continue   # exists in no repository; akmods rebuilds it below
         else
@@ -779,6 +863,7 @@ rollback() {
         log "Reinstalling the packages that were removed: ${names[*]}"
         [[ ${#files[@]} -gt 0 ]] && log "  from the copies kept before the install: ${#files[@]} of them"
         if [[ "$PKG_MGR" == "apt" ]]; then
+            # Local .deb files need no network; apt only reads its lists.
             if ! nolock apt-get install -y --allow-downgrades "${files[@]}" "${specs[@]}" >>"$LOGFILE" 2>&1; then
                 log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
                 nolock apt-get install -y "${names[@]}" >>"$LOGFILE" 2>&1 \
@@ -790,24 +875,35 @@ rollback() {
         else
             local tolerant
             tolerant="$(dnf_tolerant)"
-            if ! nolock dnf install -y "$tolerant" "${files[@]}" "${specs[@]}" >>"$LOGFILE" 2>&1; then
-                log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
-                nolock dnf install -y "$tolerant" "${names[@]}" >>"$LOGFILE" 2>&1 \
-                    || { log "ERROR: dnf could not reinstall the removed packages"; ok=0; }
+            # The kept copies alone, with every repository off: that works
+            # offline, where loading repository metadata would fail. Only
+            # what has no copy needs a repository.
+            if [[ ${#files[@]} -gt 0 ]] \
+                && ! nolock dnf install -y --disablerepo='*' "${files[@]}" >>"$LOGFILE" 2>&1; then
+                local_failed=1
+            fi
+            if [[ ${#specs[@]} -gt 0 || $local_failed -eq 1 ]]; then
+                local again=("${specs[@]}")
+                if [[ $local_failed -eq 1 ]]; then again+=("${files[@]}"); fi
+                if ! nolock dnf install -y "$tolerant" "${again[@]}" >>"$LOGFILE" 2>&1; then
+                    log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
+                    nolock dnf install -y "$tolerant" "${names[@]}" >>"$LOGFILE" 2>&1 \
+                        || { log "ERROR: dnf could not reinstall the removed packages"; ok=0; }
+                fi
             fi
             if [[ ${#auto[@]} -gt 0 ]]; then
                 local mark=(mark remove)
                 if command -v dnf5 >/dev/null 2>&1; then mark=(mark dependency); fi
                 nolock dnf "${mark[@]}" "${auto[@]%.*}" >>"$LOGFILE" 2>&1 || log "WARNING: Could not mark ${auto[*]} as installed as dependencies"
             fi
-            # akmod-nvidia builds its kernel module in the background from
-            # its scriptlet; build it now, so it can be checked.
-            if [[ $akmod -eq 1 && $kmod_cached -eq 0 ]] && command -v akmods >/dev/null 2>&1; then
-                log "Building the restored driver's kernel module with akmods…"
-                nolock akmods --force --kernels "$KVER" >>"$LOGFILE" 2>&1 \
-                    || { log "ERROR: akmods could not build the kernel module for $KVER"; ok=0; }
-            fi
         fi
+        # akmod-nvidia builds its module in the background from its rpm
+        # scriptlet, DKMS packages for the running kernel only: build what
+        # is missing now, for every kernel that matters, so it can be checked.
+        while IFS= read -r k; do
+            if [[ "$k" == "$KVER" && $kmod_cached -eq 1 ]]; then continue; fi
+            ensure_module "$k" "${keys[@]}"
+        done < <(restore_kernels)
     fi
     if [[ ${#HELD[@]} -gt 0 ]]; then
         nolock apt-mark hold "${HELD[@]}" >>"$LOGFILE" 2>&1 \
@@ -816,11 +912,19 @@ rollback() {
     if [[ $WAS_BLOCKED -eq 1 ]]; then
         block_distro_driver || { log "ERROR: Could not restore the block on the distro driver packages"; ok=0; }
     fi
-    if ! nolock "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
-        log "ERROR: Rebuilding the initramfs failed. Run: ${INITRAMFS_CMD[*]}"
-        ok=0
-    fi
+    while IFS= read -r k; do
+        if ! initramfs_for "$k" >>"$LOGFILE" 2>&1; then
+            log "ERROR: Rebuilding the initramfs for $k failed."
+            ok=0
+        fi
+    done < <(restore_kernels)
     verify_restored || ok=0
+    # What this rollback installed is its own doing, not a change made
+    # since by something else (see journal_stale_reason).
+    if [[ -d "$JOURNAL" ]]; then
+        { cat "$JOURNAL/reinstalled" 2>/dev/null; driver_package_specs; } | sort -u > "$JOURNAL/.reinstalled.new" \
+            && durable "$JOURNAL/.reinstalled.new" && mv -f "$JOURNAL/.reinstalled.new" "$JOURNAL/reinstalled"
+    fi
     if [[ $ok -eq 1 ]]; then
         log "Restored and checked the previous driver setup; the next boot uses the driver this computer had before."
         return 0
@@ -830,49 +934,147 @@ rollback() {
     return 1
 }
 
+# Exact specs of the driver packages installed now.
+driver_package_specs() {
+    local key spec
+    while IFS='|' read -r key spec; do
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            is_driver_pkg "$key" "${DEB_DRIVER_GLOBS[@]}" && printf '%s\n' "$spec"
+        else
+            is_driver_pkg "${key%.*}" "${RPM_DRIVER_GLOBS[@]}" && printf '%s\n' "$spec"
+        fi
+    done < <(package_snapshot)
+    return 0
+}
+
+# Why a journal no longer describes this computer, or nothing when it does.
+# It is stale when the NVIDIA driver was changed by something else after the
+# run that wrote it: another driver from NVIDIA's installer than the one
+# from before or the one that run was putting in, or distribution driver
+# packages that were neither there before nor put back by a rollback.
+journal_stale_reason() {
+    local run_now spec
+    local -A known=()
+    run_now="$(installed_run_version)"
+    if [[ -n "$run_now" && "$run_now" != "$RUN_VER_BEFORE" && "$run_now" != "${TARGET_RUN_VER:-}" ]]; then
+        printf '%s' "the driver installed now from NVIDIA's installer ($run_now) is neither the one from before (${RUN_VER_BEFORE:-none}) nor the one that install was putting in (${TARGET_RUN_VER:-unknown})"
+        return 0
+    fi
+    while IFS='|' read -r _ spec; do known["$spec"]=1; done < "$JOURNAL/packages-before"
+    while IFS= read -r spec; do [[ -n "$spec" ]] && known["$spec"]=1; done < <(cat "$JOURNAL/reinstalled" 2>/dev/null)
+    while IFS= read -r spec; do
+        if [[ -z "${known[$spec]:-}" ]]; then
+            printf '%s' "the distribution driver package $spec was installed after it"
+            return 0
+        fi
+    done < <(driver_package_specs)
+    return 0
+}
+
+# A note for the app (the journal itself is root-only): why recovery data is
+# waiting, or nothing. Keep in step with RECOVERY_STATUS in install.rs.
+RECOVERY_STATUS="$STATE_DIR/recovery-status"
+recovery_note() { # <text>, or nothing to remove the note
+    if [[ -z "${1:-}" ]]; then rm -f "$RECOVERY_STATUS"; return 0; fi
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$1" > "$RECOVERY_STATUS.new" && chmod 644 "$RECOVERY_STATUS.new" \
+        && mv -f "$RECOVERY_STATUS.new" "$RECOVERY_STATUS"
+}
+
+# Hold off shutdown and suspend while the system is being changed. The held
+# command follows this process (tail --pid), so the inhibitor also ends if
+# the run is killed.
+start_inhibitor() {
+    [[ -z "$INHIBIT_PID" && -d /run/systemd/system ]] || return 0
+    command -v systemd-inhibit >/dev/null 2>&1 || return 0
+    ( trap - TERM INT; exec systemd-inhibit --what=shutdown:sleep --mode=block --who="Green Light" \
+        --why="Changing the NVIDIA driver; stopping now could leave the computer without one" \
+        tail --pid=$$ -f /dev/null ) 9>&- &
+    INHIBIT_PID=$!
+}
+
 # ── Recovery from a journal ────────────────────────────────────────────
-# A journal left behind means an install was cut off. Before NVIDIA's
-# installer had succeeded, its changes are rolled back; after, it only has
-# to be cleared. Runs as "--recover", and at the start of every install.
+# A journal left behind means an install was cut off, or its rollback
+# failed. Before NVIDIA's installer had succeeded, its changes are rolled
+# back; after, it only has to be cleared. Runs as "--recover", from the
+# boot unit, and at the start of every install. A journal that no longer
+# describes this computer (the driver was changed by other means since) is
+# left alone until "--discard-recovery" drops it.
 # (Top level, not a function: sourcing the state must set globals.)
 RECOVER_RC=0
+CARRIED=0
+# shellcheck source=/dev/null  # the state is written by this script, root-only
 if [[ -d "$JOURNAL" ]]; then
     PHASE="$(cat "$JOURNAL/phase" 2>/dev/null || echo armed)"
+    TARGET_RUN_VER=""
     if [[ "$PHASE" == "installer-done" ]]; then
         log "An earlier install had finished NVIDIA's installer before it was cut off; nothing to put back."
         journal_clear
+        recovery_note ""
+    elif [[ $DISCARD_RECOVERY -eq 1 ]]; then
+        log "Discarding the recovery data of an earlier interrupted install, as asked."
+        journal_clear
+        recovery_note ""
+    elif ! source "$JOURNAL/state" 2>/dev/null; then
+        log "ERROR: The recovery data of an earlier interrupted install can't be read."
+        recovery_note "refused: its recovery data can't be read"
+        RECOVER_RC=$EXIT_RECOVERY_REFUSED
     else
-        log "An earlier install was cut off ($PHASE); putting the driver setup it changed back first…"
-        # shellcheck source=/dev/null  # written by this script, root-only
-        source "$JOURNAL/state"
         set_kernel "$KVER"
-        INSTALLER_STARTED=0
-        if [[ "$PHASE" == "installer-started" ]]; then INSTALLER_STARTED=1; fi
-        PRIV_DIR="$(mktemp -d /var/tmp/green-light-recover.XXXXXX)"
-        chmod 700 "$PRIV_DIR"
-        if [[ "$PKG_MGR" == "apt" ]]; then
-            nolock dpkg --configure -a >>"$LOGFILE" 2>&1 || log "WARNING: dpkg --configure -a reported a problem"
-        fi
-        if rollback; then
-            journal_clear
-            RECOVER_RC=$EXIT_ROLLED_BACK
+        STALE="$(journal_stale_reason)"
+        if [[ -n "$STALE" ]]; then
+            log "ERROR: Not restoring from the recovery data of an earlier interrupted install (boot ${BOOT_ID:-unknown}): $STALE."
+            log "       The driver was changed by other means since; discard that recovery data if the driver now is the one you want."
+            recovery_note "refused: $STALE"
+            RECOVER_RC=$EXIT_RECOVERY_REFUSED
         else
-            RECOVER_RC=$EXIT_ROLLBACK_FAILED
+            log "An earlier install was cut off ($PHASE); putting the driver setup it changed back first…"
+            if [[ -n "${INVOCATION_ID:-}" ]] && command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+                PLYMOUTH=1
+            fi
+            INSTALLER_STARTED=0
+            if [[ "$PHASE" == "installer-started" ]]; then INSTALLER_STARTED=1; fi
+            PRIV_DIR="$(mktemp -d /var/tmp/green-light-recover.XXXXXX)"
+            chmod 700 "$PRIV_DIR"
+            start_inhibitor
+            if [[ "$PKG_MGR" == "apt" ]]; then
+                nolock dpkg --configure -a >>"$LOGFILE" 2>&1 || log "WARNING: dpkg --configure -a reported a problem"
+            fi
+            if rollback; then
+                journal_clear
+                recovery_note ""
+                RECOVER_RC=$EXIT_ROLLED_BACK
+            else
+                recovery_note "failed: the previous driver could not be fully restored; see $LOGFILE"
+                RECOVER_RC=$EXIT_ROLLBACK_FAILED
+            fi
+            rm -rf "$PRIV_DIR"
+            PRIV_DIR=""
+            PLYMOUTH=0
         fi
-        rm -rf "$PRIV_DIR"
-        PRIV_DIR=""
     fi
 fi
-if [[ "$MODE" == "recover" ]]; then
-    if [[ ! -d "$JOURNAL" && $RECOVER_RC -eq 0 ]]; then log "Nothing to recover."; fi
+if [[ "$MODE" != "install" ]]; then
+    if [[ "$MODE" == "discard" ]]; then
+        log "Recovery data discarded."
+    elif [[ ! -d "$JOURNAL" && $RECOVER_RC -eq 0 ]]; then
+        log "Nothing to recover."
+    fi
     log "==== Recovery done ===="
     exit "$RECOVER_RC"
 fi
+if [[ $RECOVER_RC -eq $EXIT_RECOVERY_REFUSED ]]; then
+    log "ERROR: Recovery data from an earlier interrupted install is waiting and doesn't match this computer any more; discard it to install. No changes made."
+    exit "$EXIT_RECOVERY_REFUSED"
+fi
 if [[ $RECOVER_RC -eq $EXIT_ROLLBACK_FAILED ]]; then
-    # The new install replaces what couldn't be put back; keeping the old
-    # journal would make every later run try (and fail) again.
-    log "WARNING: The earlier setup could not be fully restored; the install now replaces it."
-    journal_clear
+    # Its packages-before, plan and kept copies still describe the good
+    # setup from before that install: they become this install's baseline,
+    # so a rollback of this install puts that setup back.
+    # The journal stays where it is (the boot unit and the app still see it)
+    # until this install replaces it with one built on it.
+    log "WARNING: The earlier setup could not be fully restored; this install keeps its recovery data as the starting point to restore."
+    CARRIED=1
 fi
 
 # ── Install mode ───────────────────────────────────────────────────────
@@ -896,6 +1098,7 @@ for arg in "$@"; do
     case "$arg" in
         --dkms)                USE_DKMS=1 ;;
         --block-distro-driver) BLOCK_DISTRO=1 ;;
+        --discard-recovery)    ;;  # handled before the recovery above
         --kernel-module-type=open|--kernel-module-type=proprietary)
             MODULE_TYPE="${arg#--kernel-module-type=}" ;;
         *) usage_error "Unknown argument: $arg" ;;
@@ -1129,7 +1332,8 @@ stop_point_unchanged
 # (see above), so a failure, a stop or a cut-off run can put it all back,
 # checked against the recorded state.
 PKGS=()       # installed driver packages to remove (name[:arch] / rpm name)
-HELD=()       # apt holds on them
+HELD=()       # apt holds on them (in the baseline: what the rollback restores)
+UNHOLD=()     # apt holds on them now (what this run lifts)
 BACKUPS=()    # "<path>|<saved copy number, or empty when it didn't exist>"
 WAS_BLOCKED=0
 INSTALLER_STARTED=0
@@ -1147,6 +1351,7 @@ if [[ "$PKG_MGR" == "apt" ]]; then
     while IFS= read -r name; do
         if is_driver_pkg "$name" "${DEB_DRIVER_GLOBS[@]}"; then HELD+=("$name"); fi
     done < <(nolock apt-mark showhold 2>/dev/null || true)
+    UNHOLD=("${HELD[@]}")
 else
     while IFS= read -r name; do
         if is_driver_pkg "$name" "${RPM_DRIVER_GLOBS[@]}"; then PKGS+=("$name"); fi
@@ -1158,56 +1363,74 @@ MOD_VER_BEFORE="$(module_version)"
 MOD_SIGNER_BEFORE="$(module_signer)"
 
 # Write the journal: built under a temporary name and renamed into place.
+# What the run is putting in and in which boot, so recovery can tell a
+# journal that no longer describes the computer.
+TARGET_RUN_VER=""
+if [[ "${ORIG_RUN_FILE##*/}" =~ ^NVIDIA-Linux-[^-]+-([0-9]+\.[0-9.]+)\.run$ ]]; then TARGET_RUN_VER="${BASH_REMATCH[1]}"; fi
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 mkdir -p "$STATE_DIR"
 chmod 755 "$STATE_DIR"
 rm -rf "$JOURNAL.new"
-mkdir -m 700 "$JOURNAL.new" "$JOURNAL.new/backup"
-package_snapshot > "$JOURNAL.new/packages-before"
-if [[ ${#PKGS[@]} -gt 0 ]]; then
-    planned_removals "${PKGS[@]}" > "$JOURNAL.new/planned"
+if [[ $CARRIED -eq 1 ]]; then
+    # An earlier install's rollback failed: its record of the setup before
+    # it (packages, plan, copies, holds, block, files, driver and module)
+    # stays the baseline; this install's own removals are added to it.
+    cp -a "$JOURNAL" "$JOURNAL.new"
+    if [[ ${#PKGS[@]} -gt 0 ]]; then
+        { cat "$JOURNAL.new/planned"; planned_removals "${PKGS[@]}"; } | sort -u > "$PRIV_DIR/planned"
+        cp -- "$PRIV_DIR/planned" "$JOURNAL.new/planned"
+    fi
+    declare -p KVER TARGET_RUN_VER BOOT_ID >> "$JOURNAL.new/state"
 else
-    : > "$JOURNAL.new/planned"
+    mkdir -m 700 "$JOURNAL.new" "$JOURNAL.new/backup"
+    package_snapshot > "$JOURNAL.new/packages-before"
+    if [[ ${#PKGS[@]} -gt 0 ]]; then
+        planned_removals "${PKGS[@]}" > "$JOURNAL.new/planned"
+    else
+        : > "$JOURNAL.new/planned"
+    fi
+    # Packages of the plan that were installed only as dependencies, so they
+    # are marked that way again when put back.
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        { nolock apt-mark showauto 2>/dev/null || true; } | grep -xF -f "$JOURNAL.new/planned" > "$JOURNAL.new/auto" || true
+    else
+        { nolock dnf repoquery --installed --qf '%{name}.%{arch}\n' 2>/dev/null || true; } > "$PRIV_DIR/all-installed"
+        { nolock dnf repoquery --installed --userinstalled --qf '%{name}.%{arch}\n' 2>/dev/null || true; } > "$PRIV_DIR/user-installed"
+        grep -xF -f "$JOURNAL.new/planned" "$PRIV_DIR/all-installed" | grep -vxF -f "$PRIV_DIR/user-installed" > "$JOURNAL.new/auto" || true
+    fi
+    backup_file /etc/modprobe.d/blacklist-nouveau.conf
+    backup_file /etc/modprobe.d/nvidia-drm-modeset.conf
+    backup_file /usr/lib/nvidia/alternate-install-present
+    declare -p PKG_MGR KVER HELD BACKUPS WAS_BLOCKED RUN_VER_BEFORE MOD_VER_BEFORE MOD_SIGNER_BEFORE \
+        TARGET_RUN_VER BOOT_ID > "$JOURNAL.new/state"
+    : > "$JOURNAL.new/cache-index"
 fi
-# Packages of the plan that were installed only as dependencies, so they
-# are marked that way again when put back.
-if [[ "$PKG_MGR" == "apt" ]]; then
-    { nolock apt-mark showauto 2>/dev/null || true; } | grep -xF -f "$JOURNAL.new/planned" > "$JOURNAL.new/auto" || true
-else
-    { nolock dnf repoquery --installed --qf '%{name}.%{arch}\n' 2>/dev/null || true; } > "$PRIV_DIR/all-installed"
-    { nolock dnf repoquery --installed --userinstalled --qf '%{name}.%{arch}\n' 2>/dev/null || true; } > "$PRIV_DIR/user-installed"
-    grep -xF -f "$JOURNAL.new/planned" "$PRIV_DIR/all-installed" | grep -vxF -f "$PRIV_DIR/user-installed" > "$JOURNAL.new/auto" || true
-fi
-backup_file /etc/modprobe.d/blacklist-nouveau.conf
-backup_file /etc/modprobe.d/nvidia-drm-modeset.conf
-backup_file /usr/lib/nvidia/alternate-install-present
-declare -p PKG_MGR KVER HELD BACKUPS WAS_BLOCKED RUN_VER_BEFORE MOD_VER_BEFORE MOD_SIGNER_BEFORE \
-    > "$JOURNAL.new/state"
 printf 'armed\n' > "$JOURNAL.new/phase"
-: > "$JOURNAL.new/cache-index"
-durable "$JOURNAL.new"/* "$JOURNAL.new/backup" "$JOURNAL.new"
+shopt -s nullglob
+durable "$JOURNAL.new"/* "$JOURNAL.new"/backup/* "$JOURNAL.new"/cache/* "$JOURNAL.new/backup" "$JOURNAL.new"
+shopt -u nullglob
 rm -rf "$JOURNAL"
 mv "$JOURNAL.new" "$JOURNAL"
 durable "$STATE_DIR"
-JOURNAL_OURS=1
+# A journal made by this run may go when it ends before changing anything;
+# a carried one still describes an unrestored setup and stays.
+if [[ $CARRIED -eq 0 ]]; then JOURNAL_OURS=1; fi
+# What a rollback restores: the baseline (the carried one, if any).
+# shellcheck source=/dev/null  # written by this script, root-only
+source "$JOURNAL/state"
 # From here a leftover journal means "roll this back" (phase: armed).
 if [[ -s "$JOURNAL/planned" ]]; then
     log "Keeping copies of the packages the install removes, so they can be put back offline…"
     cache_planned_packages
 fi
 if [[ $STOP_REQUESTED -eq 1 ]]; then
-    journal_clear
+    if [[ $CARRIED -eq 0 ]]; then journal_clear; fi
     stop_point_unchanged
 fi
 
 # Keep the machine from shutting down or suspending until the driver is in
-# place or put back. The inhibitor follows this process (tail --pid), so it
-# also ends if the run is killed.
-if [[ -d /run/systemd/system ]] && command -v systemd-inhibit >/dev/null 2>&1; then
-    systemd-inhibit --what=shutdown:sleep --mode=block --who="Green Light" \
-        --why="Installing the NVIDIA driver; stopping now could leave the computer without one" \
-        tail --pid=$$ -f /dev/null 9>&- &
-    INHIBIT_PID=$!
-fi
+# place or put back.
+start_inhibitor
 
 ROLLBACK_ARMED=1
 
@@ -1216,8 +1439,8 @@ ROLLBACK_ARMED=1
 unblock_distro_driver
 if [[ "$PKG_MGR" == "apt" ]]; then
     # apt refuses to remove held packages.
-    if [[ ${#HELD[@]} -gt 0 ]]; then
-        nolock apt-mark unhold "${HELD[@]}" >>"$LOGFILE" 2>&1
+    if [[ ${#UNHOLD[@]} -gt 0 ]]; then
+        nolock apt-mark unhold "${UNHOLD[@]}" >>"$LOGFILE" 2>&1
     fi
     # Driver packages only. libcuda*/libcudnn* are deliberately NOT matched:
     # they can belong to a user-installed CUDA toolkit unrelated to the

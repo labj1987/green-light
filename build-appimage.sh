@@ -109,6 +109,11 @@ for pair in "$SRC_SCRIPT:$DST_SCRIPT" "$SRC_POLICY:$DST_POLICY" "$SRC_HELPER:$DS
         needs_install=1
     fi
 done
+# The boot-time recovery unit must also be enabled (the setup helper does it).
+if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1 \
+    && ! systemctl is-enabled --quiet green-light-recover.service 2>/dev/null; then
+    needs_install=1
+fi
 
 if [[ $needs_install -eq 1 ]]; then
     STAGE="$(mktemp -d)"

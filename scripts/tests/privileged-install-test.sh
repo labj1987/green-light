@@ -8,8 +8,9 @@
 # dpkg-query, dnf, rpm, modinfo, NVIDIA's installer, ...) plus the handful
 # of real tools the script needs. The stubs keep a small fake package
 # database, so removals, reverse dependencies, downloads and reinstalls
-# behave like the real thing. Nothing on the real system is read or
-# written, and nothing runs as root.
+# behave like the real thing; $GLT/offline cuts the network (and, for dnf,
+# makes loading repository metadata fail). Nothing on the real system is
+# read or written, and nothing runs as root.
 #
 # Usage: scripts/tests/privileged-install-test.sh   (needs bwrap)
 set -euo pipefail
@@ -23,6 +24,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/gl-script-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 KVER="6.99.0-test"
+KVER2="7.0.0-newer"
 ME_UID="$(id -u)"
 ME_GID="$(id -g)"
 PASS=0
@@ -33,7 +35,7 @@ T=""
 
 # Real tools the script uses; everything else on PATH is a stub.
 REAL_TOOLS=(bash cat chmod cp cut date flock grep head install ls mkdir mktemp mv nproc rm setsid
-            sleep stat sha256sum sync tail touch getfacl)
+            sleep sort stat sha256sum sync tail touch true getfacl)
 
 stub() { # <name> <body>   (body runs with "$@" = the stub's arguments)
     printf '#!/bin/bash\necho "%s $*" >> "$GLT/calls"\n%s\n' "$1" "$2" > "$T/bin/$1"
@@ -44,8 +46,7 @@ unstub() { rm -f "$T/bin/$1"; }
 # A fresh sandbox: an apt machine with headers, gcc, make and dkms, and the
 # distro driver 595.84: nvidia-driver-595, a held i386 library, and Ubuntu's
 # prebuilt module package that depends on the driver and provides the
-# module (installed automatically). Secure Boot off; the package archive is
-# reachable unless $GLT/offline exists.
+# module (installed automatically). Secure Boot off; online.
 new_case() {
     T="$WORK/case-$((PASS + FAIL))"   # no case name: a ":" would split PATH
     mkdir -p "$T"/{bin,etc/modprobe.d,etc/apt/preferences.d,etc/dnf,etc/dkms,var/log,var/tmp,var/lib} \
@@ -53,8 +54,9 @@ new_case() {
              "$T/modules/$KVER/build/include/generated"
     local tool
     for tool in "${REAL_TOOLS[@]}"; do
-        if command -v "$tool" >/dev/null 2>&1; then
-            ln -s "$(readlink -f "$(command -v "$tool")")" "$T/bin/$tool"
+        # type -P: the program, also for names that are shell builtins (true).
+        if type -P "$tool" >/dev/null 2>&1; then
+            ln -s "$(readlink -f "$(type -P "$tool")")" "$T/bin/$tool"
         fi
     done
     touch "$T/modules/$KVER/build/Makefile"
@@ -70,12 +72,13 @@ new_case() {
     echo 'nvidia-driver-595 linux-modules-nvidia-595-generic' > "$T/revdeps"
     printf 'libnvidia-gl-595:i386\nnvidia-container-toolkit\nbash\n' > "$T/held"
     echo 'linux-modules-nvidia-595-generic' > "$T/auto-pkgs"
-    # The module on disk for $KVER comes with this package.
+    # The module on disk for $KVER comes with this package; for another
+    # kernel K, mod-version.K / mod-signer.K.
     echo 'linux-modules-nvidia-595-generic' > "$T/mod-pkg"
     echo '595.84' > "$T/mod-version"
     echo 'Canonical Ltd. Kernel Module Signing' > "$T/mod-signer"
 
-    stub uname 'echo '"$KVER"
+    stub uname 'cat "$GLT/uname" 2>/dev/null || echo '"$KVER"
     stub getent 'case "$1" in
   passwd) if [[ -n "${2:-}" ]]; then grep -E "^[^:]*:[^:]*:$2:" "$GLT/passwd" || exit 2; else cat "$GLT/passwd"; fi ;;
   group) grep -E "^[^:]*:[^:]*:$2:" "$GLT/group" || exit 2 ;;
@@ -85,14 +88,20 @@ esac'
     # purge: drop the packages and their dependents (and, with
     # $GLT/remove-unrelated, something no plan includes); -s purge: list
     # them; download: a .deb in the current directory; install: package
-    # names, name=version or .deb paths. Removing/adding the module package
-    # removes/restores the module.
+    # names, name=version or .deb paths (linux-modules-nvidia-595-<kernel>
+    # brings that kernel's module). Removing/adding the module package
+    # removes/restores the module. $GLT/fail-reinstall-times: how many
+    # driver reinstalls fail before they work.
     stub apt-get 'if [[ "$1" == -s ]]; then shift; sim=1; else sim=0; fi
 cmd="$1"; shift
+grep -E "^SigIgn" /proc/self/status > "$GLT/apt-signals"
 mod_off() { if [[ -f "$GLT/mod-version" ]]; then mv "$GLT/mod-version" "$GLT/mod-version.off"; mv "$GLT/mod-signer" "$GLT/mod-signer.off" 2>/dev/null; fi; }
 mod_on() { if [[ -f "$GLT/mod-version.off" ]]; then mv "$GLT/mod-version.off" "$GLT/mod-version"; mv "$GLT/mod-signer.off" "$GLT/mod-signer" 2>/dev/null; fi; }
 add() { # <name> <version>
   echo "ii |$1|$2" >> "$GLT/dpkg"
+  if [[ "$1" == linux-modules-nvidia-595-[0-9]* ]]; then
+    k="${1#linux-modules-nvidia-595-}"; echo 595.84 > "$GLT/mod-version.$k"; echo "Canonical Ltd. Kernel Module Signing" > "$GLT/mod-signer.$k"
+  fi
   if grep -qx "$1" "$GLT/mod-pkg"; then
     mod_on
     # A current version from the archive: rebuilt by DKMS, unsigned.
@@ -119,6 +128,10 @@ case "$cmd" in
   install)
     if [[ "$*" == *nvidia* || "$*" == *.deb* ]]; then
       [[ -e "$GLT/fail-reinstall" ]] && exit 100
+      if [[ -s "$GLT/fail-reinstall-times" ]]; then
+        n="$(cat "$GLT/fail-reinstall-times")"
+        if [[ "$n" -gt 0 ]]; then echo $((n - 1)) > "$GLT/fail-reinstall-times"; exit 100; fi
+      fi
       for p in "$@"; do
         [[ "$p" == -* || "$p" == /* ]] && continue
         [[ -e "$GLT/offline" ]] && exit 100
@@ -142,14 +155,21 @@ exit 0'
     stub update-initramfs 'if [[ -e "$GLT/initramfs-wait" ]]; then sleep "$(cat "$GLT/initramfs-wait")"; fi
 if [[ -e "$GLT/fail-initramfs" ]]; then exit 1; fi; touch "/boot/initrd.img-$3"'
     stub lsinitramfs 'echo usr/lib/modprobe.d/blacklist-nouveau.conf'
-    stub dkms 'if [[ "$1" == status ]]; then echo "nvidia/595.84, '"$KVER"', x86_64: installed"; fi'
+    # dkms: status; autoinstall -k K builds the module for K when the
+    # restored packages include DKMS sources ($GLT/dkms-builds).
+    stub dkms 'case "$1" in
+  status) echo "nvidia/595.84, '"$KVER"', x86_64: installed" ;;
+  autoinstall) [[ -e "$GLT/dkms-builds" ]] && { echo 595.84 > "$GLT/mod-version.$3"; : > "$GLT/mod-signer.$3"; } ;;
+esac'
     stub mokutil 'case "$1" in --sb-state) cat "$GLT/sb" 2>/dev/null || echo "SecureBoot disabled" ;; esac'
-    stub modinfo 'field="$4"; [[ -f "$GLT/mod-version" ]] || exit 1
-case "$field" in version) cat "$GLT/mod-version" ;; signer) cat "$GLT/mod-signer" 2>/dev/null ;; esac'
+    stub modinfo 'k="$2"; field="$4"; v="$GLT/mod-version"; sg="$GLT/mod-signer"
+if [[ "$k" != '"$KVER"' ]]; then v="$GLT/mod-version.$k"; sg="$GLT/mod-signer.$k"; fi
+[[ -f "$v" ]] || exit 1
+case "$field" in version) cat "$v" ;; signer) cat "$sg" 2>/dev/null ;; esac'
     stub nvidia-installer 'if [[ "$1" == --version ]]; then echo "nvidia-installer:  version $(cat "$GLT/run-version")"; fi'
     stub gcc 'exit 0'
-    # The test build: records the signal dispositions it inherited and fails
-    # for a flavor named in $GLT/fail-build.
+    # The test build: records the signal dispositions and descriptors it
+    # inherited, and fails for a flavor named in $GLT/fail-build.
     stub make 'grep -E "^Sig(Ign)" /proc/self/status > "$GLT/make-signals"
 [[ -e /proc/self/fd/9 ]] && touch "$GLT/lock-leaked-to-make"
 if [[ -e "$GLT/build-wait" ]]; then sleep "$(cat "$GLT/build-wait")"; fi
@@ -158,7 +178,8 @@ for f in $(cat "$GLT/fail-build" 2>/dev/null); do [[ "$2" == */$f ]] && { echo "
     RUN="$T/home/NVIDIA-Linux-x86_64-595.84.run"
     # The fake installer. installer-mode: ok (default), fail, partial (puts
     # its files in place, then fails), removes-old (takes out an earlier .run
-    # driver, then fails); installer-wait: seconds to run first.
+    # driver, then fails); installer-wait: seconds to run first;
+    # offline-at-installer: the network goes away while it runs.
     cat > "$RUN" <<'FAKE'
 #!/bin/bash
 echo "installer $*" >> "$GLT/calls"
@@ -168,6 +189,7 @@ case "$1" in
 esac
 echo "$PPID" > "$GLT/script-pid"
 echo "$$" > "$GLT/installer-pid"
+if [[ -e "$GLT/offline-at-installer" ]]; then touch "$GLT/offline"; fi
 if [[ -e "$GLT/installer-wait" ]]; then sleep "$(cat "$GLT/installer-wait")"; fi
 new_run() {
     echo 595.84 > "$GLT/run-version"; echo 595.84 > "$GLT/mod-version"; : > "$GLT/mod-signer"
@@ -193,6 +215,12 @@ previous_run_driver() {
     echo 580.1 > "$T/mod-version"
     : > "$T/mod-signer"
     stub nvidia-uninstall 'rm -f "$GLT/run-version" "$GLT/mod-version" "$GLT/bin/nvidia-uninstall"'
+}
+
+# Another driver installed by other means after an interrupted install.
+other_driver_installed_since() {
+    echo 600.1 > "$T/run-version"
+    stub nvidia-uninstall 'rm -f "$GLT/run-version" "$GLT/bin/nvidia-uninstall"'
 }
 
 # bwrap arguments for /usr/lib: the host's, except nvidia/ and modules/,
@@ -224,11 +252,13 @@ sandbox() {
         --bind "$T/var/cache" /var/cache \
         --bind "$T/boot" /boot "${USR_LIB_ARGS[@]}" \
         --bind "$T/nvidia" /usr/lib/nvidia --bind "$T/modules" /usr/lib/modules \
-        --bind "$T" "$T" "${SANDBOX_EXTRA[@]}" \
+        --bind "$T" "$T" \
         --clearenv --setenv PATH "$T/bin" --setenv GLT "$T" --setenv PKEXEC_UID "$ME_UID" \
-        --setenv LANG C.UTF-8 \
+        --setenv LANG C.UTF-8 "${SANDBOX_EXTRA[@]}" \
         "$@"
 }
+
+log_size() { if [[ -f "$T/var/log/green-light.log" ]]; then wc -c < "$T/var/log/green-light.log"; else echo 0; fi; }
 
 # Run the script in the sandbox. Sets RC and OUT (the script prints nothing
 # without a terminal, so OUT is this run's part of the log file).
@@ -241,7 +271,6 @@ run_script() {
 }
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
-log_size() { if [[ -f "$T/var/log/green-light.log" ]]; then wc -c < "$T/var/log/green-light.log"; else echo 0; fi; }
 run_default() { run_script "$RUN" "$(sha "$RUN")" "$@"; }
 
 # Start the script in the background; wait for it with wait_script.
@@ -317,9 +346,12 @@ expect_call "update-initramfs -u -k $KVER"
 expect_file "$T/etc/modprobe.d/blacklist-nouveau.conf"
 expect_no_file "$T/etc/apt/preferences.d/green-light-nvidia"
 expect_out "Verify: all checks passed"
-expect_out "==== NVIDIA driver install started"
 expect_no_journal
 [[ ! -s "$T/stdout" ]] || fail "wrote to stdout/stderr without a terminal: $(cat "$T/stdout")"
+# Every line of the run carries its PID, and only that one.
+grep -qE '^[0-9-]+ [0-9:]+ \[green-light [0-9]+\] ==== NVIDIA driver install started ====$' <<<"$OUT" \
+    || fail "log lines don't carry the run's PID"
+[[ "$(grep -oE '\[green-light [0-9]+\]' <<<"$OUT" | sort -u | wc -l)" == 1 ]] || fail "more than one PID in one run's lines"
 # SIGPIPE keeps its default for what the script runs (bit 13 of SigIgn).
 (( (16#$(cut -f2 "$T/make-signals") & (1 << 12)) == 0 )) || fail "make inherited an ignored SIGPIPE"
 expect_no_file "$T/lock-leaked-to-make"
@@ -476,6 +508,9 @@ expect_file "$T/nvidia/alternate-install-present"
 [[ "$(grep -c "^update-initramfs" "$T/calls")" == 1 ]] || fail "initramfs not rebuilt once on rollback"
 expect_out "Restored and checked the previous driver setup"
 expect_no_journal
+# The rollback ignores SIGTERM itself; what it runs must not inherit that
+# (bit 15 of SigIgn).
+(( (16#$(cut -f2 "$T/apt-signals") & (1 << 14)) == 0 )) || fail "apt-get inherited an ignored SIGTERM"
 end
 
 begin "apt's own cache is used before downloading"
@@ -504,6 +539,7 @@ expect_call_like "^apt-get install -y nvidia-driver-595 "
 expect_out "not signed by a key it trusts"
 expect_out "Don't reboot"
 expect_journal
+grep -q '^failed:' "$T/var/lib/green-light/recovery-status" || fail "no note for the app"
 end
 
 begin "Secure Boot: a module unsigned before and after is restored as it was"
@@ -589,7 +625,6 @@ end
 begin "nothing is written to a pipe that can go away"
 echo 1 > "$T/installer-wait"
 set +o pipefail
-LOG_BEFORE=0
 sandbox "$T/bin/bash" "$SCRIPT" "$RUN" "$(sha "$RUN")" 2>&1 | head -c 1 > /dev/null
 RC="${PIPESTATUS[0]}"
 set -o pipefail
@@ -653,25 +688,43 @@ expect_rc 0
 expect_out "==== Done."
 end
 
-begin "a second install while one runs is refused"
+begin "a second install while one runs is refused, and so is signing setup"
 RC=0
-LOG_BEFORE=0
 sandbox "$T/bin/bash" -c 'flock /run/green-light-install.lock sleep 3 & sleep 0.5; "$0" "$@"' \
     "$SCRIPT" "$RUN" "$(sha "$RUN")" > /dev/null 2>&1 || RC=$?
 OUT="$(cat "$T/var/log/green-light.log")"
 expect_rc 2
 expect_out "Another Green Light install is still running"
 expect_no_call_like "^installer"
+RC=0
+sandbox "$T/bin/bash" -c 'flock /run/green-light-install.lock sleep 3 & sleep 0.5; echo pass1234 | "$0" --setup-signing' \
+    "$SCRIPT" > /dev/null 2>&1 || RC=$?
+OUT="$(cat "$T/var/log/green-light.log")"
+expect_rc 1
+expect_out "A Green Light install is running; set up signing once it has finished."
+expect_no_out "==== Module signing setup started"
 end
 
 begin "under systemd: its own scope, and shutdown held off while armed"
 SANDBOX_EXTRA=(--dir /run/systemd/system)
-stub systemd-run 'while [[ "$1" != -- ]]; do shift; done; shift; exec "$@"'
+stub systemd-run 'while [[ $# -gt 0 && "$1" == --* && "$1" != -- ]]; do shift; done
+[[ "${1:-}" == -- ]] && shift
+exec "$@"'
 stub systemd-inhibit 'while [[ "$1" == --* ]]; do shift; done; exec "$@"'
 run_default
 expect_rc 0
+expect_call "systemd-run --scope --quiet --collect true"
 expect_call_like "^systemd-run --scope --quiet --collect --unit=green-light-install-[0-9]+ "
 expect_call_like "^systemd-inhibit --what=shutdown:sleep --mode=block --who=Green Light "
+end
+
+begin "when systemd-run can't make a scope, the install still runs"
+SANDBOX_EXTRA=(--dir /run/systemd/system)
+stub systemd-run 'exit 1'
+run_default
+expect_rc 0
+expect_out "systemd-run could not give the install a scope of its own"
+expect_out "==== Done."
 end
 
 # ── Power loss / SIGKILL, the journal and recovery ─────────────────────
@@ -683,16 +736,22 @@ kill_hard() {
     wait "$BG" 2>/dev/null || true
 }
 recover() { run_script --recover; }
+# Cut an install off during its purge, leaving a journal in phase armed
+# (the stubbed purge itself still finishes).
+cut_off_during_purge() {
+    echo 3 > "$T/purge-wait"
+    start_script
+    for _ in $(seq 100); do grep -q "^apt-get purge -y" "$T/calls" && break; sleep 0.1; done
+    sleep 0.3
+    kill_hard "$(script_pid_now)"
+    sleep 3
+    rm -f "$T/purge-wait"
+}
 
 begin "cut off during the purge (armed): --recover puts it back, offline"
-echo 3 > "$T/purge-wait"
-start_script
-for _ in $(seq 100); do grep -q "^apt-get purge -y" "$T/calls" && break; sleep 0.1; done
-sleep 0.3
-kill_hard "$(script_pid_now)"
+cut_off_during_purge
 expect_journal
 grep -qx armed "$T/var/lib/green-light/journal/phase" || fail "phase is not armed"
-sleep 3   # the stubbed purge finishes on its own, as a real dpkg run would not
 touch "$T/offline"
 : > "$T/calls"
 recover
@@ -719,16 +778,19 @@ echo 595.84 > "$T/run-version"
 printf '#!/bin/bash\necho "nvidia-uninstall $*" >> "$GLT/calls"\nrm -f "$GLT/run-version" "$GLT/bin/nvidia-uninstall"\n' > "$T/bin/nvidia-uninstall"
 chmod 755 "$T/bin/nvidia-uninstall"
 : > "$T/calls"
-# What green-light-recover.service runs, as it would at boot.
 EXEC="$(grep '^ExecStart=' "$UNIT" | cut -d= -f2-)"
 [[ "$EXEC" == "/usr/lib/green-light/privileged-install.sh --recover" ]] || fail "unexpected ExecStart: $EXEC"
 grep -qx 'ConditionPathExists=/var/lib/green-light/journal' "$UNIT" || fail "unit not conditional on the journal"
-grep -qx 'SuccessExitStatus=3' "$UNIT" || fail "unit doesn't count a verified rollback as success"
+grep -qx 'SuccessExitStatus=3 6' "$UNIT" || fail "unit's success codes"
+# As systemd runs it: INVOCATION_ID set, output kept for the journal.
+SANDBOX_EXTRA=(--setenv INVOCATION_ID test)
 recover
 expect_rc 3
 expect_call "nvidia-uninstall --silent"
 expect_pkg nvidia-driver-595
 expect_no_journal
+grep -q "Restored and checked the previous driver setup" "$T/stdout" || fail "nothing on the unit's output"
+expect_no_call_like "^systemd-run"
 end
 
 begin "cut off after the installer had finished: recovery only clears the journal"
@@ -736,8 +798,6 @@ echo 30 > "$T/initramfs-wait"
 start_script
 for _ in $(seq 150); do grep -q "^update-initramfs" "$T/calls" && break; sleep 0.1; done
 kill_hard "$(script_pid_now)"
-# (The journal is gone the moment the installer succeeds; a cut between
-# its last two steps leaves it in phase installer-done.)
 mkdir -p "$T/var/lib/green-light/journal"
 echo installer-done > "$T/var/lib/green-light/journal/phase"
 : > "$T/calls"
@@ -748,19 +808,110 @@ expect_no_call_like "^apt-get install"
 expect_no_journal
 end
 
+begin "recovery at boot into a newer kernel: that kernel gets its module too"
+cut_off_during_purge
+mkdir -p "$T/modules/$KVER2"
+echo "$KVER2" > "$T/uname"
+: > "$T/calls"
+recover
+expect_rc 3
+expect_call "apt-get install -y linux-modules-nvidia-595-$KVER2"
+expect_call "update-initramfs -u -k $KVER"
+expect_call "update-initramfs -u -k $KVER2"
+expect_no_journal
+end
+
+begin "recovery into a newer kernel without its module is not called a success"
+cut_off_during_purge
+mkdir -p "$T/modules/$KVER2"
+echo "$KVER2" > "$T/uname"
+touch "$T/offline"
+recover
+expect_rc 4
+expect_out "There is no nvidia kernel module for $KVER2"
+expect_journal
+end
+
+begin "recovery into a newer kernel builds a DKMS module for it"
+# A DKMS setup: the module comes from nvidia-dkms-595, built per kernel.
+printf '%s\n' 'ii |nvidia-driver-595|595.84-0ubuntu1' 'ii |nvidia-dkms-595|595.84-0ubuntu1' \
+    'ii |bash|5.2-1' > "$T/dpkg"
+echo 'nvidia-driver-595 nvidia-dkms-595' > "$T/revdeps"
+echo 'nvidia-dkms-595' > "$T/mod-pkg"
+echo 'nvidia-dkms-595' > "$T/auto-pkgs"
+: > "$T/held"
+: > "$T/mod-signer"
+cut_off_during_purge
+mkdir -p "$T/modules/$KVER2"
+echo "$KVER2" > "$T/uname"
+touch "$T/dkms-builds"
+: > "$T/calls"
+recover
+expect_rc 3
+expect_call "dkms autoinstall -k $KVER2"
+grep -q 595.84 "$T/mod-version.$KVER2" || fail "no module for $KVER2"
+end
+
 begin "a journal left behind is dealt with before the next install"
-echo 3 > "$T/purge-wait"
-start_script
-for _ in $(seq 100); do grep -q "^apt-get purge -y" "$T/calls" && break; sleep 0.1; done
-sleep 0.3
-kill_hard "$(script_pid_now)"
-sleep 3
-rm -f "$T/purge-wait"
+cut_off_during_purge
 run_default
 expect_rc 0
 expect_out "An earlier install was cut off (armed); putting the driver setup it changed back first"
 expect_out "Restored and checked the previous driver setup"
 expect_out "==== Done."
+expect_no_journal
+end
+
+begin "a journal whose driver was changed since is left alone, until discarded"
+cut_off_during_purge
+other_driver_installed_since
+: > "$T/calls"
+recover
+expect_rc 6
+expect_out "Not restoring from the recovery data of an earlier interrupted install"
+expect_out "the driver installed now from NVIDIA's installer (600.1)"
+expect_no_call_like "^apt-get install"
+expect_journal
+grep -q '^refused:' "$T/var/lib/green-light/recovery-status" || fail "no note for the app"
+run_default
+expect_rc 6
+expect_out "discard it to install. No changes made."
+expect_no_call_like "^apt-get purge"
+run_script --discard-recovery
+expect_rc 0
+expect_no_journal
+expect_no_file "$T/var/lib/green-light/recovery-status"
+end
+
+begin "an install asked to discard stale recovery data goes ahead"
+cut_off_during_purge
+other_driver_installed_since
+run_default --discard-recovery
+expect_rc 0
+expect_out "Discarding the recovery data of an earlier interrupted install, as asked."
+expect_out "==== Done."
+end
+
+begin "distro driver packages installed since also make a journal stale"
+cut_off_during_purge
+echo 'ii |nvidia-driver-610|610.1-0ubuntu1' >> "$T/dpkg"
+recover
+expect_rc 6
+expect_out "the distribution driver package nvidia-driver-610=610.1-0ubuntu1 was installed after it"
+end
+
+begin "a failed recovery's baseline is carried into the next install"
+cut_off_during_purge
+echo 2 > "$T/fail-reinstall-times"
+echo fail > "$T/installer-mode"
+run_default
+expect_rc 3
+expect_out "this install keeps its recovery data as the starting point to restore"
+# The rollback of the new install restores the original setup, from the
+# copies the first install kept.
+expect_call_like "^apt-get install -y --allow-downgrades /var/lib/green-light/journal/cache/nvidia-driver-595_595.84-0ubuntu1_amd64.deb"
+expect_pkg nvidia-driver-595
+grep -q '|nvidia-driver-595|595.84-0ubuntu1' "$T/dpkg" || fail "not the original version"
 expect_no_journal
 end
 
@@ -770,14 +921,27 @@ expect_rc 0
 expect_out "Nothing to recover."
 end
 
+begin "--recover takes the shutdown inhibitor too"
+cut_off_during_purge
+SANDBOX_EXTRA=(--dir /run/systemd/system)
+stub systemd-run 'while [[ $# -gt 0 && "$1" == --* && "$1" != -- ]]; do shift; done
+[[ "${1:-}" == -- ]] && shift
+exec "$@"'
+stub systemd-inhibit 'while [[ "$1" == --* ]]; do shift; done; exec "$@"'
+: > "$T/calls"
+recover
+expect_rc 3
+expect_call_like "^systemd-inhibit --what=shutdown:sleep --mode=block "
+end
+
 if command -v systemd-analyze >/dev/null 2>&1; then
     begin "systemd-analyze verify accepts the boot unit"
     sed "s#^ExecStart=/usr/lib/green-light/privileged-install.sh#ExecStart=$SCRIPT#" "$UNIT" \
         > "$T/green-light-recover.service"
-    # A machine without a display manager has no display-manager.service to
-    # order against; that is not an error in the unit.
+    # Units it is ordered against may not exist on this machine (no display
+    # manager, akmods or dkms); that is not an error in the unit.
     if ! OUT="$(systemd-analyze verify "$T/green-light-recover.service" 2>&1)" \
-        && grep -v 'display-manager.service' <<<"$OUT" | grep -q .; then
+        && grep -vE '(display-manager|akmods|dkms)\.service' <<<"$OUT" | grep -q .; then
         fail "systemd-analyze verify failed"
     fi
     end
@@ -807,6 +971,7 @@ end
 
 # dnf machines: no apt-get, a fake rpm database instead ("<name.arch>|<nvra>").
 # akmod-nvidia's module comes from kmod-nvidia-<kernel>, built here by akmods.
+# Offline, dnf fails to load repository metadata unless all repos are off.
 dnf_case() {
     begin "$1"
     unstub apt-get; unstub apt-mark; unstub dpkg-query; unstub update-initramfs; unstub lsinitramfs
@@ -815,8 +980,6 @@ dnf_case() {
         'xorg-x11-drv-nvidia.x86_64|xorg-x11-drv-nvidia-595.84-1.fc44.x86_64' \
         'nvidia-persistenced.x86_64|nvidia-persistenced-595.84-1.fc44.x86_64' \
         'bash.x86_64|bash-5.2-1.fc44.x86_64' > "$T/rpm"
-    # Removing xorg-x11-drv-nvidia takes nvidia-persistenced (not in the
-    # globs) with it, like a reverse dependency.
     echo 'xorg-x11-drv-nvidia nvidia-persistenced' > "$T/revdeps"
     echo "kmod-nvidia-$KVER" > "$T/mod-pkg"
     echo 'nvidia-persistenced.x86_64' > "$T/auto-pkgs"
@@ -825,7 +988,13 @@ dnf_case() {
     [[ "$n" =~ ^(akmod-nvidia|xorg-x11-drv-nvidia|kmod-nvidia|nvidia-driver|nvidia-settings) ]] && echo "$n"
   done < "$GLT/rpm"; fi'
     stub dnf 'cmd="$1"; shift
-tolerant=0; for a in "$@"; do [[ "$a" == --skip-unavailable || "$a" == --setopt=strict=0 ]] && tolerant=1; done
+tolerant=0; norepos=0
+for a in "$@"; do
+  [[ "$a" == --skip-unavailable || "$a" == --setopt=strict=0 ]] && tolerant=1
+  [[ "$a" == "--disablerepo=*" ]] && norepos=1
+done
+# Expired metadata and no network: loading the repositories fails.
+if [[ -e "$GLT/offline" && $norepos -eq 0 && "$cmd" != repoquery ]]; then echo "Failed to download metadata"; exit 1; fi
 case "$cmd" in
   remove)
     sim=0; [[ "$1" == --assumeno ]] && { sim=1; shift; echo "Package   Arch   Version   Repository   Size"; echo "Removing:"; }
@@ -838,7 +1007,6 @@ case "$cmd" in
     done
     [[ $sim -eq 1 ]] && { echo; echo "Transaction Summary:"; exit 1; } ;;
   download)
-    [[ -e "$GLT/offline" ]] && exit 1
     dest="$2"; spec="$3"; grep -qF "|$spec" "$GLT/rpm" && [[ "$spec" != kmod-nvidia-6* ]] && touch "$dest/$spec.rpm" ;;
   repoquery)
     if [[ "$*" == *--userinstalled* ]]; then cut -d"|" -f1 "$GLT/rpm" | grep -vxF -f "$GLT/auto-pkgs"; else cut -d"|" -f1 "$GLT/rpm"; fi ;;
@@ -846,6 +1014,8 @@ case "$cmd" in
     if [[ "$*" == *nvidia* ]]; then
       [[ -e "$GLT/fail-reinstall" ]] && exit 1
       for p in "$@"; do [[ "$p" == -* ]] && continue
+        # With the repositories off only local files can be installed.
+        [[ $norepos -eq 1 && "$p" != /* ]] && exit 1
         spec="${p##*/}"; spec="${spec%.rpm}"
         # akmods builds kmod-nvidia-<kernel> here; no repository has it.
         if [[ "$spec" == kmod-nvidia-6* && "$p" != /* ]]; then [[ $tolerant -eq 1 ]] && continue; exit 1; fi
@@ -881,13 +1051,13 @@ expect_out "needs apt or dnf5"
 expect_no_file "$T/etc/dnf/libdnf5.conf.d/90-green-light-nvidia.conf"
 end
 
-dnf_case "dnf rollback: kept copies, no local kmod from a repository, akmods rebuilds it"
+dnf_case "dnf rollback: kept copies with repositories off, akmods rebuilds the local kmod"
 echo fail > "$T/installer-mode"
 run_default
 expect_rc 3
-expect_call_like "^dnf install -y --setopt=strict=0 /var/lib/green-light/journal/cache/akmod-nvidia-595.84-1.fc44.x86_64.rpm"
+expect_call_like "^dnf install -y --disablerepo=\* /var/lib/green-light/journal/cache/akmod-nvidia-595.84-1.fc44.x86_64.rpm"
 expect_call_like "nvidia-persistenced-595.84-1.fc44.x86_64.rpm"
-expect_no_call_like "^dnf install .*kmod-nvidia-$KVER"
+expect_no_call_like "^dnf install .*kmod-nvidia-$KVER-"
 expect_call "akmods --force --kernels $KVER"
 expect_no_file "$T/lock-leaked-to-akmods"
 expect_call "dnf mark remove nvidia-persistenced"
@@ -896,13 +1066,23 @@ grep -q "^kmod-nvidia-$KVER\." "$T/rpm" || fail "kmod not rebuilt"
 expect_out "Restored and checked the previous driver setup"
 end
 
-dnf_case "dnf5 rollback skips what no repository has"
+dnf_case "dnf rollback with no network and expired metadata works from the kept copies"
+echo fail > "$T/installer-mode"
+touch "$T/offline-at-installer"
+run_default
+expect_rc 3
+expect_call_like "^dnf install -y --disablerepo=\* "
+expect_no_call_like "^dnf install -y --setopt=strict=0"
+expect_out "Restored and checked the previous driver setup"
+end
+
+dnf_case "dnf5: akmods' kept kmod for this kernel is installed, nothing rebuilt"
 stub dnf5 'exit 0'
 echo fail > "$T/installer-mode"
 touch "$T/var/cache/akmods/nvidia/kmod-nvidia-$KVER-595.84-1.fc44.x86_64.rpm"
 run_default
 expect_rc 3
-expect_call_like "^dnf install -y --skip-unavailable .*kmod-nvidia-$KVER-595.84-1.fc44.x86_64.rpm"
+expect_call_like "^dnf install -y --disablerepo=\* .*kmod-nvidia-$KVER-595.84-1.fc44.x86_64.rpm"
 expect_no_call_like "^akmods"
 expect_call "dnf mark dependency nvidia-persistenced"
 end
