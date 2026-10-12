@@ -48,15 +48,18 @@ mkdir -p "$APPDIR/usr/bin" \
 
 cp "${CARGO_TARGET_DIR:-target}/release/$APP" "$APPDIR/usr/bin/"
 cp scripts/privileged-install.sh            "$APPDIR/usr/lib/$APP/"
+cp data/green-light-recover.service         "$APPDIR/usr/lib/$APP/"
 chmod 755 "$APPDIR/usr/lib/$APP/privileged-install.sh"
 
 # Setup helper: bake the SHA256 of the script and policy into it so that,
 # once installed root-owned, it can verify whatever AppRun stages for it.
 SCRIPT_SHA="$(sha256sum scripts/privileged-install.sh | cut -d' ' -f1)"
 POLICY_SHA="$(sha256sum data/io.github.labj1987.GreenLight.policy | cut -d' ' -f1)"
+UNIT_SHA="$(sha256sum data/green-light-recover.service | cut -d' ' -f1)"
 HELPER_TEXT="$(<scripts/green-light-setup.sh)"
 HELPER_TEXT="${HELPER_TEXT//@SCRIPT_SHA256@/$SCRIPT_SHA}"
 HELPER_TEXT="${HELPER_TEXT//@POLICY_SHA256@/$POLICY_SHA}"
+HELPER_TEXT="${HELPER_TEXT//@UNIT_SHA256@/$UNIT_SHA}"
 printf '%s\n' "$HELPER_TEXT" > "$APPDIR/usr/lib/$APP/green-light-setup"
 chmod 755 "$APPDIR/usr/lib/$APP/green-light-setup"
 cp data/$APP.desktop                        "$APPDIR/usr/share/applications/"
@@ -92,13 +95,15 @@ APP="green-light"
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
 SRC_HELPER="$HERE/usr/lib/$APP/green-light-setup"
 SRC_POLICY="$HERE/usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy"
+SRC_UNIT="$HERE/usr/lib/$APP/green-light-recover.service"
 DST_SCRIPT="/usr/lib/$APP/privileged-install.sh"
 DST_HELPER="/usr/lib/$APP/green-light-setup"
 DST_POLICY="/usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy"
+DST_UNIT="/etc/systemd/system/green-light-recover.service"
 SETUP_ACTION="io.github.labj1987.GreenLight.setup"
 
 needs_install=0
-for pair in "$SRC_SCRIPT:$DST_SCRIPT" "$SRC_POLICY:$DST_POLICY" "$SRC_HELPER:$DST_HELPER"; do
+for pair in "$SRC_SCRIPT:$DST_SCRIPT" "$SRC_POLICY:$DST_POLICY" "$SRC_HELPER:$DST_HELPER" "$SRC_UNIT:$DST_UNIT"; do
     src="${pair%%:*}"; dst="${pair#*:}"
     if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
         needs_install=1
@@ -109,6 +114,7 @@ if [[ $needs_install -eq 1 ]]; then
     STAGE="$(mktemp -d)"
     cp "$SRC_SCRIPT" "$STAGE/privileged-install.sh"
     cp "$SRC_POLICY" "$STAGE/policy"
+    cp "$SRC_UNIT" "$STAGE/recover-service"
     cp "$SRC_HELPER" "$STAGE/green-light-setup"
     chmod 755 "$STAGE/green-light-setup"
 

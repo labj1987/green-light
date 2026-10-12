@@ -1,0 +1,20 @@
+# Installed by Green Light's first-launch setup. Runs only when an install
+# was cut off (power loss, crash) and left its journal behind: it puts the
+# previous NVIDIA driver back before the login screen starts, or clears the
+# journal when NVIDIA's installer had already finished.
+[Unit]
+Description=Green Light: restore the previous NVIDIA driver after an interrupted install
+Documentation=https://github.com/labj1987/green-light
+ConditionPathExists=/var/lib/green-light/journal
+RequiresMountsFor=/var/lib/green-light /var/log
+Before=display-manager.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/green-light/privileged-install.sh --recover
+# 3: rolled back and checked. 4 (could not fully restore) stays a failure.
+SuccessExitStatus=3
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=multi-user.target

@@ -75,12 +75,15 @@ EXIT_INITRAMFS=5
 
 LOGFILE="/var/log/green-light.log"
 
-# The app reading this script's output can go away mid-install (window
-# closed, app killed), and the terminal it was started from can hang up.
-# Neither may stop an install halfway: SIGPIPE and SIGHUP are ignored (the
-# commands run below inherit that), writes to stdout are best effort, and
-# every line always goes to the log file first.
-trap '' PIPE HUP
+# Nothing this script writes may go to a pipe that can vanish (the app that
+# started it may be closed mid-install, which would kill it with SIGPIPE):
+# without a terminal, stdout goes nowhere and stderr to the log file, and the
+# app follows the log file instead. SIGPIPE keeps its default for the
+# commands run below. SIGHUP is ignored (a closing terminal must not stop an
+# install; the commands inherit that, which they should).
+if [[ ! -t 1 ]]; then exec >/dev/null; fi
+if [[ ! -t 2 ]]; then exec 2>>"$LOGFILE"; fi
+trap '' HUP
 
 log() {
     local msg="[green-light] $*"
@@ -92,30 +95,43 @@ trap 'log "ERROR: step failed near line $LINENO (exit $?) — install aborted"' 
 
 # Set once the install starts changing the system (distro packages, boot
 # config); cleared once NVIDIA's installer has succeeded. Any failure in
-# between, a SIGTERM or SIGINT included, restores the previous setup
-# (rollback, defined below).
+# between restores the previous setup (rollback, defined below).
 ROLLBACK_ARMED=0
 PRIV_DIR=""
+INHIBIT_PID=""
 on_exit() {
-    local rc=$?
+    local rc=$1
     set +e
-    # Putting things back must not be cut short in turn.
-    trap '' TERM INT
     trap - ERR
     if [[ $ROLLBACK_ARMED -eq 1 && $rc -ne 0 ]]; then
         ROLLBACK_ARMED=0
-        if rollback; then rc=$EXIT_ROLLED_BACK; else rc=$EXIT_ROLLBACK_FAILED; fi
+        if rollback; then
+            journal_clear
+            rc=$EXIT_ROLLED_BACK
+        else
+            # Kept: the next install, Restore Previous Driver or the boot
+            # unit tries again.
+            rc=$EXIT_ROLLBACK_FAILED
+        fi
+    elif [[ ${JOURNAL_OURS:-0} -eq 1 ]]; then
+        # Ended before changing anything: nothing to put back.
+        journal_clear
     fi
+    if [[ -n "$INHIBIT_PID" ]]; then kill "$INHIBIT_PID" 2>/dev/null; fi
     if [[ -n "$PRIV_DIR" ]]; then rm -rf "$PRIV_DIR"; fi
     if [[ $rc -eq 126 || $rc -eq 127 ]]; then rc=$EXIT_FAILED; fi
     exit "$rc"
 }
-trap on_exit EXIT
-# A signal ends the run through on_exit with a failure code, so the
-# rollback runs. (Bash takes it once the running command has finished, so
-# apt or NVIDIA's installer is never cut off mid-way.)
-trap 'log "ERROR: stopped by SIGTERM"; exit 143' TERM
-trap 'log "ERROR: stopped by SIGINT"; exit 130' INT
+# Signals are ignored first thing, so nothing can cut the rollback short.
+# shellcheck disable=SC2154  # assigned inside the trap string
+trap 'on_exit_rc=$?; trap "" TERM INT; on_exit "$on_exit_rc"' EXIT
+# SIGTERM/SIGINT ask the run to stop; it does so at the next point where
+# that is safe (see STOP_REQUESTED below), never in the middle of a step.
+STOP_REQUESTED=0
+trap 'STOP_REQUESTED=1; log "Stop requested (SIGTERM); stopping at the next safe point…"' TERM
+trap 'STOP_REQUESTED=1; log "Stop requested (SIGINT); stopping at the next safe point…"' INT
+# Stub for setup mode; the install part defines the real one.
+journal_clear() { :; }
 
 # ── Package manager detection (shared by both modes) ───────────────────
 detect_pkg_mgr() {
@@ -346,9 +362,29 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     exit 0
 fi
 
-# ── Install mode ───────────────────────────────────────────────────────
-# Its own session first: a hangup or Ctrl-C delivered to the app's process
-# group (the terminal it was started from) must not reach the install. Under
+# ── Install and recover modes ──────────────────────────────────────────
+#   privileged-install.sh <run-file> <sha256> [options]   install
+#   privileged-install.sh --recover                       roll back an install
+#     that was cut off (power loss, SIGKILL) from its journal; also what the
+#     green-light-recover.service boot unit runs.
+MODE="install"
+if [[ "${1:-}" == "--recover" ]]; then MODE="recover"; fi
+
+# Out of the user's session: logging out (or the session being torn down)
+# stops every process in the session's scope, which would cut the install
+# off mid-way. A transient scope of its own avoids that; systemd-run execs
+# the command in the same process, so the exit code still reaches pkexec.
+# (Not when systemd started it as a service, the boot unit: that is already
+# its own unit, and its process must stay the service's.)
+if [[ -z "${GREEN_LIGHT_SCOPED:-}" && -z "${INVOCATION_ID:-}" && -d /run/systemd/system ]] \
+    && command -v systemd-run >/dev/null 2>&1; then
+    export GREEN_LIGHT_SCOPED=1
+    exec systemd-run --scope --quiet --collect --unit="green-light-install-$$" \
+        --description="Green Light driver install" -- "$BASH" "$0" "$@"
+fi
+
+# Its own session: a hangup or Ctrl-C delivered to the app's process group
+# (the terminal it was started from) must not reach the install. Under
 # pkexec this keeps the PID (not a group leader, so setsid doesn't fork);
 # --wait passes the exit code on when it does fork.
 read -r PROC_STAT < /proc/$$/stat
@@ -359,9 +395,18 @@ fi
 
 # Logged first, so every message of this run (argument and file errors
 # included) comes after it in the log.
-log "==== NVIDIA driver install started ===="
+if [[ "$MODE" == "recover" ]]; then
+    log "==== Green Light recovery started ===="
+else
+    log "==== NVIDIA driver install started ===="
+fi
 
 usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
+
+# Run a command without the lock's file descriptor, so nothing it leaves
+# running in the background (akmods from an rpm scriptlet, a DKMS build)
+# keeps the lock, and with it the "install running" state, after this run.
+nolock() { "$@" 9>&-; }
 
 # One install at a time. The app also checks this lock to tell that an
 # install is still running (for example after it was closed and reopened).
@@ -373,107 +418,7 @@ if ! flock -n 9; then
 fi
 echo "$$" > "$INSTALL_LOCK"
 
-ORIG_RUN_FILE="${1:-}"
-EXPECT_SHA256="${2:-}"
-USE_DKMS=0
-BLOCK_DISTRO=0
-MODULE_TYPE=""
-
-if [[ -z "$ORIG_RUN_FILE" ]]; then usage_error "No .run file specified"; fi
-if [[ ! "$ORIG_RUN_FILE" =~ ^/.*\.run$ ]]; then usage_error "Invalid run file path (must be absolute and end in .run): $ORIG_RUN_FILE"; fi
-if [[ -L "$ORIG_RUN_FILE" ]]; then usage_error "Refusing symlink: $ORIG_RUN_FILE"; fi
-if [[ ! -f "$ORIG_RUN_FILE" ]]; then usage_error "File not found: $ORIG_RUN_FILE"; fi
-if [[ ! "$EXPECT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
-    usage_error "A 64-character SHA256 of the run file is required as the second argument"
-fi
-EXPECT_SHA256="${EXPECT_SHA256,,}"
-
-shift 2
-for arg in "$@"; do
-    case "$arg" in
-        --dkms)                USE_DKMS=1 ;;
-        --block-distro-driver) BLOCK_DISTRO=1 ;;
-        --kernel-module-type=open|--kernel-module-type=proprietary)
-            MODULE_TYPE="${arg#--kernel-module-type=}" ;;
-        *) usage_error "Unknown argument: $arg" ;;
-    esac
-done
-
-# Whether <gid> is the private group of the account <uid>: named after it,
-# its primary group, and with no other member. Supplementary members come
-# from the group entry itself; accounts with it as their primary group are
-# looked for in the account list NSS can enumerate (all local ones).
-group_is_owners_private_group() { # <gid> <uid>
-    local entry owner owner_gid gname members name pgid
-    entry="$(getent passwd "$2")" || return 1
-    IFS=: read -r owner _ _ owner_gid _ <<<"$entry"
-    [[ "$owner_gid" == "$1" ]] || return 1
-    entry="$(getent group "$1")" || return 1
-    IFS=: read -r gname _ _ members <<<"$entry"
-    [[ "$gname" == "$owner" ]] || return 1
-    [[ -z "$members" || "$members" == "$owner" ]] || return 1
-    while IFS=: read -r name _ _ pgid _; do
-        if [[ "$pgid" == "$1" && "$name" != "$owner" ]]; then return 1; fi
-    done < <(getent passwd || true)
-    return 0
-}
-
-# Who besides the owner an ACL lets write the file, as "user:<name>" /
-# "group:<gid-or-name>" lines; empty when nobody. Without an ACL (or without
-# getfacl to read one) prints "?" when the file has one it can't read.
-acl_writers() { # <file> <owner-uid>
-    local line kind who perms mask="rwx"
-    # ls shows "+" after the mode for a file with an ACL.
-    local mode_str
-    mode_str="$(ls -ldn -- "$1" | cut -d' ' -f1)"
-    [[ "$mode_str" == *+ ]] || return 0
-    if ! command -v getfacl >/dev/null 2>&1; then echo "?"; return 0; fi
-    while IFS= read -r line; do
-        if [[ "$line" == mask::* ]]; then mask="${line#mask::}"; fi
-    done < <(getfacl -cpn -- "$1" 2>/dev/null)
-    while IFS=: read -r kind who perms; do
-        [[ "$kind" == user && -n "$who" && "$who" != "$2" ]] || [[ "$kind" == group && -n "$who" ]] || continue
-        if [[ "${perms:1:1}" == w && "${mask:1:1}" == w ]]; then echo "$kind:$who"; fi
-    done < <(getfacl -cpn -- "$1" 2>/dev/null)
-    return 0
-}
-
-# Ownership / permission check on the original file: only its owner (root
-# or the invoking user) may have been able to write it.
-FILE_UID="$(stat -c '%u' -- "$ORIG_RUN_FILE")"
-FILE_GID="$(stat -c '%g' -- "$ORIG_RUN_FILE")"
-FILE_MODE="$(stat -c '%a' -- "$ORIG_RUN_FILE")"
-CALLER_UID="${PKEXEC_UID:-${SUDO_UID:-0}}"
-if [[ "$FILE_UID" != "0" && "$FILE_UID" != "$CALLER_UID" ]]; then
-    usage_error "$ORIG_RUN_FILE is owned by uid $FILE_UID, not root or the invoking user ($CALLER_UID)"
-fi
-if (( (8#$FILE_MODE) & 8#002 )); then
-    usage_error "$ORIG_RUN_FILE can be changed by every user (mode $FILE_MODE) — refusing. Remove that permission (chmod go-w) and retry."
-fi
-if (( (8#$FILE_MODE) & 8#020 )) && ! group_is_owners_private_group "$FILE_GID" "$FILE_UID"; then
-    usage_error "$ORIG_RUN_FILE can be changed by other members of group $FILE_GID (mode $FILE_MODE) — refusing. Remove that permission (chmod go-w) and retry."
-fi
-ACL_WRITERS="$(acl_writers "$ORIG_RUN_FILE" "$FILE_UID")"
-if [[ "$ACL_WRITERS" == "?" ]]; then
-    usage_error "$ORIG_RUN_FILE has an access control list that can't be checked (getfacl is missing) — refusing. Remove it (setfacl -b) and retry."
-fi
-while IFS= read -r who; do
-    [[ -n "$who" ]] || continue
-    if [[ "$who" == group:* ]] && group_is_owners_private_group "${who#group:}" "$FILE_UID"; then continue; fi
-    usage_error "$ORIG_RUN_FILE has an access control list letting $who change it — refusing. Remove it (setfacl -b) and retry."
-done <<<"$ACL_WRITERS"
-
-# ── Detect package manager ─────────────────────────────────────────────
-detect_pkg_mgr
-
-log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS block_distro_driver=$BLOCK_DISTRO module=${MODULE_TYPE:-auto} pkg_mgr=$PKG_MGR)"
-
-KVER="$(uname -r)"
-if [[ "$PKG_MGR" == "apt" ]]; then
-    INITRAMFS_CMD=(update-initramfs -u -k "$KVER")
-else
-    INITRAMFS_CMD=(dracut --force --kver "$KVER")
-fi
+# ── Shared helpers ─────────────────────────────────────────────────────
 
 # Distro driver packages, removed before the install. Keep in step with
 # DEB_DRIVER_GLOBS / RPM_DRIVER_GLOBS / is_driver_package in preflight.rs
@@ -483,6 +428,9 @@ fi
 DEB_DRIVER_GLOBS=('nvidia-*' 'libnvidia-*' 'xserver-xorg-video-nvidia*' 'system76-driver-nvidia*')
 RPM_DRIVER_GLOBS=('akmod-nvidia*' 'xorg-x11-drv-nvidia*' 'kmod-nvidia*' 'nvidia-driver*' 'nvidia-settings*')
 NOT_DRIVER_RE='^(nvidia-container|libnvidia-container)'
+# Kernel module packages akmods builds on this machine (kmod-nvidia-<kernel>);
+# no repository has them.
+LOCAL_KMOD_RE='^kmod-nvidia-[0-9]'
 
 is_driver_pkg() { # <name[:arch]> <glob>...
     local name="${1%%:*}" glob
@@ -568,7 +516,7 @@ log_dkms_build_tail() {
 installed_run_version() {
     command -v nvidia-uninstall >/dev/null 2>&1 || return 0
     local out
-    out="$(nvidia-installer --version 2>/dev/null || true)"
+    out="$(nolock nvidia-installer --version 2>/dev/null || true)"
     if [[ "$out" =~ version[[:space:]]+([0-9]+\.[0-9.]+) ]]; then printf '%s' "${BASH_REMATCH[1]}"; fi
     return 0
 }
@@ -579,177 +527,151 @@ secure_boot_on() {
     command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
 }
 
-# ── Step 0: Copy into a root-only directory and verify the copy ───────
-# /var/tmp rather than /tmp: the installer self-extracts and executes, and
-# /tmp is often mounted noexec.
-PRIV_DIR="$(mktemp -d /var/tmp/green-light-install.XXXXXX)"
-chmod 700 "$PRIV_DIR"
-RUN_FILE="$PRIV_DIR/installer.run"
-log "Copying installer to private directory…"
-if ! cp --no-preserve=mode,ownership -- "$ORIG_RUN_FILE" "$RUN_FILE"; then
-    log "ERROR: Could not copy the installer (disk full?). No changes made."
-    exit "$EXIT_FAILED"
-fi
-chmod 700 "$RUN_FILE"
-ACTUAL_SHA256="$(sha256sum "$RUN_FILE" | cut -d' ' -f1)"
-if [[ "$ACTUAL_SHA256" != "$EXPECT_SHA256" ]]; then
-    log "ERROR: SHA256 mismatch on the private copy (expected $EXPECT_SHA256, got $ACTUAL_SHA256). No changes made."
-    exit "$EXIT_FAILED"
-fi
-log "SHA256 verified on private copy"
-
-# ── Step 1: Verify archive integrity before touching anything ────────
-log "Verifying installer archive integrity…"
-if ! "$RUN_FILE" --check >>"$LOGFILE" 2>&1; then
-    log "ERROR: Installer failed its integrity self-check. No changes made."
-    exit "$EXIT_FAILED"
-fi
-log "Integrity OK"
-
-# ── Step 2: Build prerequisites ───────────────────────────────────────
-# Installing them may fail for reasons that don't matter (an unrelated
-# repository being down, packages already present under other names), so
-# that alone is not fatal. What is checked afterwards is fatal: everything
-# below removes the distro driver, and a module that can't build would leave
-# the next boot without any NVIDIA driver.
-log "Ensuring kernel headers and build tools for $KVER…"
-if [[ "$PKG_MGR" == "apt" ]]; then
-    apt-get install -y "linux-headers-${KVER}" build-essential dkms >>"$LOGFILE" 2>&1 \
-        || log "WARNING: apt could not install all of the prerequisites; checking what is there"
-else
-    dnf install -y "kernel-devel-${KVER}" "kernel-headers-${KVER}" \
-        gcc make dkms >>"$LOGFILE" 2>&1 \
-        || log "WARNING: dnf could not install all of the prerequisites; checking what is there"
-fi
-
-check_build_prereqs() {
-    local build="/lib/modules/$KVER/build" autoconf missing=() list
-    autoconf="$build/include/generated/autoconf.h"
-    if [[ ! -f "$build/Makefile" || ! -f "$autoconf" ]]; then
-        missing+=("the kernel headers for $KVER ($build)")
-    fi
-    # Modules must be built with the compiler (and linker) the kernel was.
-    if grep -qs '^#define CONFIG_CC_IS_CLANG 1' "$autoconf"; then
-        command -v clang >/dev/null 2>&1 || missing+=("clang")
+set_kernel() { # <kernel release>
+    KVER="$1"
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        INITRAMFS_CMD=(update-initramfs -u -k "$KVER")
     else
-        command -v gcc >/dev/null 2>&1 || missing+=("gcc")
+        INITRAMFS_CMD=(dracut --force --kver "$KVER")
     fi
-    if grep -qs '^#define CONFIG_LD_IS_LLD 1' "$autoconf"; then
-        command -v ld.lld >/dev/null 2>&1 || missing+=("ld.lld")
-    fi
-    command -v make >/dev/null 2>&1 || missing+=("make")
-    if [[ $USE_DKMS -eq 1 ]]; then
-        command -v dkms >/dev/null 2>&1 || missing+=("dkms")
-    fi
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        printf -v list '%s, ' "${missing[@]}"
-        log "ERROR: The NVIDIA kernel module can't be built for kernel $KVER: missing ${list%, }."
-        log "       Install them and retry (the package manager's output is in $LOGFILE). No changes made."
-        exit "$EXIT_FAILED"
-    fi
-    log "Build prerequisites for $KVER are present"
 }
-check_build_prereqs
 
-# ── Step 2b: Test-build the kernel module before changing anything ────
-# The most likely way for the install to fail is the kernel module not
-# building for this kernel (a kernel newer than the driver supports). Build
-# it the way DKMS does, from the unpacked installer in the private dir: if
-# that fails, nothing has been changed yet. With the module flavor left to
-# the installer, both flavors are built, since which one it picks depends on
-# the GPUs.
-test_build_modules() {
-    local dir="$PRIV_DIR/unpacked" flavors=() f out="$PRIV_DIR/test-build.log"
-    log "Test-building the NVIDIA kernel module for $KVER before changing anything…"
-    if ! "$RUN_FILE" --extract-only --target "$dir" >>"$LOGFILE" 2>&1; then
-        log "ERROR: Could not unpack the installer to test-build its kernel module. No changes made."
-        exit "$EXIT_FAILED"
-    fi
-    case "$MODULE_TYPE" in
-        open)        flavors=(kernel-open) ;;
-        proprietary) flavors=(kernel) ;;
-        *)           flavors=(kernel-open kernel) ;;
-    esac
-    for f in "${flavors[@]}"; do
-        # Drivers older than 515 have no open flavor.
-        [[ -d "$dir/$f" ]] || continue
-        if ! make -C "$dir/$f" -j"$(nproc)" KERNEL_UNAME="$KVER" modules >"$out" 2>&1; then
-            cat "$out" >> "$LOGFILE" 2>/dev/null || true
-            log "ERROR: The NVIDIA kernel module ($f) doesn't build for kernel $KVER. No changes made."
-            log_tail "$out" "the test build"
-            exit "$EXIT_FAILED"
-        fi
-        log "Test build OK: $f"
-    done
-    rm -rf "$dir" "$out"
+# Options that let dnf install what it can when some of the packages asked
+# for exist nowhere any more; the result is checked afterwards anyway.
+dnf_tolerant() {
+    if command -v dnf5 >/dev/null 2>&1; then echo "--skip-unavailable"; else echo "--setopt=strict=0"; fi
 }
-test_build_modules
 
-# ── Step 3: Clear conflicting distro packages ─────────────────────────
-# Removing package files does not affect the running driver — the loaded
-# kernel module and already-mapped libraries keep working, same as
-# during a normal package-manager driver upgrade.
-#
-# The package set here has caused two real failures in practice:
-#   - nvidia-container-toolkit / libnvidia-container* match nvidia-*/
-#     libnvidia-* but are Docker's GPU-passthrough plumbing, not the
-#     display driver. Purging them doesn't touch the running driver, but
-#     it breaks every GPU container the moment its runtime next restarts
-#     (confirmed: took down a running Frigate NVR container this way).
-#   - xserver-xorg-video-nvidia-<ver> does NOT match nvidia-*/libnvidia-*
-#     (wrong prefix) but is part of the same apt-managed driver flavor and
-#     is a reverse-dependency of nvidia-support-<ver>. Leaving it installed
-#     makes dpkg refuse to remove nvidia-support-<ver>. The half-removed
-#     state that results leaves nvidia-support-<ver>'s
-#     /usr/lib/nvidia/alternate-install-present marker file in place, which
-#     makes the .run installer itself abort with "please use the Debian
-#     packages instead" — on a machine that's mid-purge of those exact
-#     packages. Confirmed end to end against a real install.
-#
-# Everything this step and the next ones change is recorded first, so a
-# failure from here until NVIDIA's installer succeeds puts it all back
-# (rollback), and the rollback is checked against the recorded state.
-PKGS=()       # installed driver packages to remove (name[:arch] / rpm name)
-HELD=()       # apt holds on them
-BACKUPS=()    # "<path>|<saved copy, or empty when it didn't exist>"
-WAS_BLOCKED=0
-INSTALLER_STARTED=0
-BACKUP_DIR="$PRIV_DIR/backup"
-PKGS_BEFORE="$PRIV_DIR/packages-before"
-mkdir -p "$BACKUP_DIR"
+# ── The journal ────────────────────────────────────────────────────────
+# Everything needed to put the previous driver setup back, written before
+# the first change and kept until NVIDIA's installer has succeeded (or a
+# rollback has been verified), so a run cut off by a power loss or SIGKILL
+# can be rolled back later: by the next install, by "--recover" (the app's
+# Restore Previous Driver), or at boot by green-light-recover.service. It
+# also holds copies of the packages the install removes, so that works
+# offline. Every file is written to a temporary name, synced and renamed.
+# The directory is root-only; its parent is readable so the app can see
+# whether a journal exists (keep in step with JOURNAL_DIR in install.rs).
+STATE_DIR="/var/lib/green-light"
+JOURNAL="$STATE_DIR/journal"
 
-# Every installed package as "<key>|<exact spec>": apt "name[:arch]|name[:arch]=version",
-# rpm "name.arch|name-version-release.arch". Comparing two of these gives
-# exactly what a removal took away, reverse dependencies included.
+durable() { sync -- "$@" 2>/dev/null || sync; }
+
+journal_set_phase() { # armed | installer-started | installer-done
+    local tmp
+    tmp="$(mktemp "$JOURNAL/.phase.XXXXXX")" || return 1
+    printf '%s\n' "$1" > "$tmp" || return 1
+    durable "$tmp"
+    mv -f "$tmp" "$JOURNAL/phase" || return 1
+    durable "$JOURNAL"
+}
+
+journal_clear() {
+    if [[ -d "$JOURNAL" ]]; then
+        rm -rf "$JOURNAL"
+        durable "$STATE_DIR"
+    fi
+    return 0
+}
+
+# Every installed package as "<key>|<exact spec>": apt
+# "name[:arch]|name[:arch]=version", rpm "name.arch|name-version-release.arch".
 package_snapshot() {
     if [[ "$PKG_MGR" == "apt" ]]; then
-        { dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}|${Version}\n' 2>/dev/null || true; } \
+        { nolock dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}|${Version}\n' 2>/dev/null || true; } \
             | while IFS='|' read -r st name ver; do
                 if [[ "${st:1:1}" == "i" ]]; then printf '%s|%s=%s\n' "$name" "$name" "$ver"; fi
             done
     else
-        rpm -qa --qf '%{NAME}.%{ARCH}|%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null || true
+        nolock rpm -qa --qf '%{NAME}.%{ARCH}|%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null || true
     fi
     return 0
 }
 
-# Packages in the "before" snapshot that are no longer installed, as
-# "<key>|<spec>" lines.
+# What this run's removal takes away, as keys: apt's simulated purge
+# ("Purg"/"Remv" lines), or dnf's transaction listing (every "Removing ..."
+# section). Only these are ever reinstalled: something else removed in the
+# meantime is not this run's to put back.
+planned_removals() { # <package>...
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        { nolock apt-get -s purge "$@" 2>/dev/null || true; } | while read -r op name _; do
+            if [[ "$op" == Purg || "$op" == Remv ]]; then printf '%s\n' "$name"; fi
+        done
+    else
+        { nolock dnf remove --assumeno "$@" 2>/dev/null || true; } | {
+            local section=0 line name arch
+            while IFS= read -r line; do
+                if [[ "$line" == Removing* ]]; then section=1; continue; fi
+                if [[ $section -eq 1 && "$line" =~ ^[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]] ]]; then
+                    name="${BASH_REMATCH[1]}"; arch="${BASH_REMATCH[2]}"
+                    printf '%s.%s\n' "$name" "$arch"
+                elif [[ $section -eq 1 && ! "$line" =~ ^[[:space:]] ]]; then
+                    section=0
+                fi
+            done
+        }
+    fi
+    return 0
+}
+
+# Packages of the plan that are no longer installed, as "<key>|<spec>".
 packages_removed() {
-    local -A now=()
+    local -A now=() plan=()
     local key spec
     while IFS='|' read -r key spec; do now["$key"]=1; done < <(package_snapshot)
+    while IFS= read -r key; do [[ -n "$key" ]] && plan["$key"]=1; done < "$JOURNAL/planned"
     while IFS='|' read -r key spec; do
-        if [[ -n "$key" && -z "${now[$key]:-}" ]]; then printf '%s|%s\n' "$key" "$spec"; fi
-    done < "$PKGS_BEFORE"
+        if [[ -n "$key" && -n "${plan[$key]:-}" && -z "${now[$key]:-}" ]]; then
+            printf '%s|%s\n' "$key" "$spec"
+        fi
+    done < "$JOURNAL/packages-before"
     return 0
+}
+
+# Copy the packages the removal will take into the journal, so they can be
+# reinstalled without the network: from apt's or akmods' cache when there,
+# else downloaded at the exact version. "cache-index" maps keys to files.
+cache_planned_packages() {
+    local key spec name ver file got
+    mkdir -p "$JOURNAL/cache"
+    : > "$JOURNAL/cache-index"
+    while IFS='|' read -r key spec; do
+        grep -qxF -- "$key" "$JOURNAL/planned" || continue
+        got=""
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            name="${key%%:*}"; ver="${spec#*=}"
+            for file in /var/cache/apt/archives/"${name}_${ver//:/%3a}"_*.deb; do
+                [[ -f "$file" ]] && { cp -- "$file" "$JOURNAL/cache/" && got="$JOURNAL/cache/${file##*/}"; break; }
+            done
+            if [[ -z "$got" ]] && (cd "$JOURNAL/cache" && nolock apt-get download "$spec" >>"$LOGFILE" 2>&1); then
+                for file in "$JOURNAL/cache/${name}_${ver//:/%3a}"_*.deb; do [[ -f "$file" ]] && got="$file"; done
+            fi
+        else
+            if [[ "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then
+                for file in /var/cache/akmods/*/"$spec.rpm"; do
+                    [[ -f "$file" ]] && { cp -- "$file" "$JOURNAL/cache/" && got="$JOURNAL/cache/${file##*/}"; break; }
+                done
+            elif nolock dnf download --destdir "$JOURNAL/cache" "$spec" >>"$LOGFILE" 2>&1 \
+                && [[ -f "$JOURNAL/cache/$spec.rpm" ]]; then
+                got="$JOURNAL/cache/$spec.rpm"
+            fi
+        fi
+        if [[ -n "$got" ]]; then
+            printf '%s|%s\n' "$key" "$got" >> "$JOURNAL/cache-index"
+        elif [[ "$PKG_MGR" == "dnf" && "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then
+            log "  $key was built here by akmods; it is rebuilt if needed"
+        else
+            log "WARNING: Could not keep a copy of $spec; putting it back would need the package source"
+        fi
+    done < "$JOURNAL/packages-before"
+    durable "$JOURNAL/cache" "$JOURNAL/cache-index"
 }
 
 backup_file() { # <path>
     local saved=""
     if [[ -e "$1" ]]; then
-        saved="$BACKUP_DIR/${#BACKUPS[@]}"
-        cp -a -- "$1" "$saved"
+        saved="${#BACKUPS[@]}"
+        cp -a -- "$1" "$JOURNAL.new/backup/$saved"
     fi
     BACKUPS+=("$1|$saved")
 }
@@ -760,7 +682,7 @@ restore_backups() {
         path="${entry%%|*}"
         saved="${entry#*|}"
         if [[ -n "$saved" ]]; then
-            cp -a -- "$saved" "$path" || { log "ERROR: Could not restore $path"; rc=1; }
+            cp -a -- "$JOURNAL/backup/$saved" "$path" || { log "ERROR: Could not restore $path"; rc=1; }
         else
             rm -f -- "$path" || { log "ERROR: Could not remove $path"; rc=1; }
         fi
@@ -791,9 +713,11 @@ verify_restored() {
         log "       Install a driver (that version or another) with Green Light before rebooting."
         ok=0
     fi
-    while IFS= read -r entry; do
+    while IFS='|' read -r entry _; do
         [[ -n "$entry" ]] || continue
-        log "ERROR: The removed package ${entry%%|*} is not installed again."
+        # akmods' local builds are checked through the module itself.
+        if [[ "$PKG_MGR" == "dnf" && "${entry%.*}" =~ $LOCAL_KMOD_RE ]]; then continue; fi
+        log "ERROR: The removed package $entry is not installed again."
         ok=0
     done < <(packages_removed)
     mod_now="$(module_version)"
@@ -806,8 +730,10 @@ verify_restored() {
                 log "The nvidia kernel module for $KVER is now $mod_now (it was $MOD_VER_BEFORE)."
             fi
             signer_now="$(module_signer)"
-            if secure_boot_on && ! signer_trusted "$signer_now"; then
-                log "ERROR: Secure Boot is on, and the restored nvidia module for $KVER is ${signer_now:+signed by \"$signer_now\", }not signed by a key it trusts."
+            # Unchanged (unsigned before and after included) is restored as
+            # it was; a changed signer must be one Secure Boot trusts.
+            if secure_boot_on && [[ "$signer_now" != "$MOD_SIGNER_BEFORE" ]] && ! signer_trusted "$signer_now"; then
+                log "ERROR: Secure Boot is on, and the restored nvidia module for $KVER is ${signer_now:+signed by \"$signer_now\", }not signed by a key it trusts (it was ${MOD_SIGNER_BEFORE:-unsigned})."
                 ok=0
             fi
         fi
@@ -819,7 +745,9 @@ verify_restored() {
 }
 
 rollback() {
-    local ok=1 removed=() specs=() names=() key spec run_now
+    local ok=1 key spec file run_now akmod=0 kmod_cached=0
+    local -A cached=()
+    local files=() specs=() names=() auto=()
     log "Restoring the previous driver setup…"
     # A partial install of the new driver: let its own uninstaller take it
     # out, so the restored packages don't sit on top of half of it.
@@ -827,41 +755,68 @@ rollback() {
         run_now="$(installed_run_version)"
         if [[ -n "$run_now" && "$run_now" != "$RUN_VER_BEFORE" ]]; then
             log "Removing what NVIDIA's installer had already put in place ($run_now)…"
-            nvidia-uninstall --silent >>"$LOGFILE" 2>&1 \
+            nolock nvidia-uninstall --silent >>"$LOGFILE" 2>&1 \
                 || { log "ERROR: nvidia-uninstall could not remove the partial install"; ok=0; }
         fi
     fi
     restore_backups || ok=0
+    while IFS='|' read -r key file; do [[ -n "$key" ]] && cached["$key"]="$file"; done < "$JOURNAL/cache-index"
     while IFS='|' read -r key spec; do
         [[ -n "$key" ]] || continue
-        removed+=("$key")
-        specs+=("$spec")
+        if [[ "$PKG_MGR" == "dnf" && "${key%.*}" == akmod-nvidia ]]; then akmod=1; fi
+        if [[ -n "${cached[$key]:-}" ]]; then
+            files+=("${cached[$key]}")
+            if [[ "$PKG_MGR" == "dnf" && "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then kmod_cached=1; fi
+        elif [[ "$PKG_MGR" == "dnf" && "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then
+            continue   # exists in no repository; akmods rebuilds it below
+        else
+            specs+=("$spec")
+        fi
         if [[ "$PKG_MGR" == "apt" ]]; then names+=("$key"); else names+=("${key%.*}"); fi
+        if grep -qxF -- "$key" "$JOURNAL/auto" 2>/dev/null; then auto+=("$key"); fi
     done < <(packages_removed)
-    if [[ ${#removed[@]} -gt 0 ]]; then
-        log "Reinstalling the packages that were removed: ${removed[*]}"
+    if [[ ${#names[@]} -gt 0 ]]; then
+        log "Reinstalling the packages that were removed: ${names[*]}"
+        [[ ${#files[@]} -gt 0 ]] && log "  from the copies kept before the install: ${#files[@]} of them"
         if [[ "$PKG_MGR" == "apt" ]]; then
-            if ! apt-get install -y --allow-downgrades "${specs[@]}" >>"$LOGFILE" 2>&1; then
+            if ! nolock apt-get install -y --allow-downgrades "${files[@]}" "${specs[@]}" >>"$LOGFILE" 2>&1; then
                 log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
-                apt-get install -y "${names[@]}" >>"$LOGFILE" 2>&1 \
+                nolock apt-get install -y "${names[@]}" >>"$LOGFILE" 2>&1 \
                     || { log "ERROR: apt-get could not reinstall the removed packages"; ok=0; }
             fi
+            if [[ ${#auto[@]} -gt 0 ]]; then
+                nolock apt-mark auto "${auto[@]}" >>"$LOGFILE" 2>&1 || log "WARNING: Could not mark ${auto[*]} as automatically installed"
+            fi
         else
-            if ! dnf install -y "${specs[@]}" >>"$LOGFILE" 2>&1; then
+            local tolerant
+            tolerant="$(dnf_tolerant)"
+            if ! nolock dnf install -y "$tolerant" "${files[@]}" "${specs[@]}" >>"$LOGFILE" 2>&1; then
                 log "WARNING: The removed versions can't all be reinstalled; installing the distro's current ones"
-                dnf install -y "${names[@]}" >>"$LOGFILE" 2>&1 \
+                nolock dnf install -y "$tolerant" "${names[@]}" >>"$LOGFILE" 2>&1 \
                     || { log "ERROR: dnf could not reinstall the removed packages"; ok=0; }
+            fi
+            if [[ ${#auto[@]} -gt 0 ]]; then
+                local mark=(mark remove)
+                if command -v dnf5 >/dev/null 2>&1; then mark=(mark dependency); fi
+                nolock dnf "${mark[@]}" "${auto[@]%.*}" >>"$LOGFILE" 2>&1 || log "WARNING: Could not mark ${auto[*]} as installed as dependencies"
+            fi
+            # akmod-nvidia builds its kernel module in the background from
+            # its scriptlet; build it now, so it can be checked.
+            if [[ $akmod -eq 1 && $kmod_cached -eq 0 ]] && command -v akmods >/dev/null 2>&1; then
+                log "Building the restored driver's kernel module with akmods…"
+                nolock akmods --force --kernels "$KVER" >>"$LOGFILE" 2>&1 \
+                    || { log "ERROR: akmods could not build the kernel module for $KVER"; ok=0; }
             fi
         fi
     fi
     if [[ ${#HELD[@]} -gt 0 ]]; then
-        apt-mark hold "${HELD[@]}" >>"$LOGFILE" 2>&1 \
+        nolock apt-mark hold "${HELD[@]}" >>"$LOGFILE" 2>&1 \
             || { log "ERROR: Could not restore the apt holds on ${HELD[*]}"; ok=0; }
     fi
     if [[ $WAS_BLOCKED -eq 1 ]]; then
         block_distro_driver || { log "ERROR: Could not restore the block on the distro driver packages"; ok=0; }
     fi
-    if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
+    if ! nolock "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
         log "ERROR: Rebuilding the initramfs failed. Run: ${INITRAMFS_CMD[*]}"
         ok=0
     fi
@@ -875,6 +830,310 @@ rollback() {
     return 1
 }
 
+# ── Recovery from a journal ────────────────────────────────────────────
+# A journal left behind means an install was cut off. Before NVIDIA's
+# installer had succeeded, its changes are rolled back; after, it only has
+# to be cleared. Runs as "--recover", and at the start of every install.
+# (Top level, not a function: sourcing the state must set globals.)
+RECOVER_RC=0
+if [[ -d "$JOURNAL" ]]; then
+    PHASE="$(cat "$JOURNAL/phase" 2>/dev/null || echo armed)"
+    if [[ "$PHASE" == "installer-done" ]]; then
+        log "An earlier install had finished NVIDIA's installer before it was cut off; nothing to put back."
+        journal_clear
+    else
+        log "An earlier install was cut off ($PHASE); putting the driver setup it changed back first…"
+        # shellcheck source=/dev/null  # written by this script, root-only
+        source "$JOURNAL/state"
+        set_kernel "$KVER"
+        INSTALLER_STARTED=0
+        if [[ "$PHASE" == "installer-started" ]]; then INSTALLER_STARTED=1; fi
+        PRIV_DIR="$(mktemp -d /var/tmp/green-light-recover.XXXXXX)"
+        chmod 700 "$PRIV_DIR"
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            nolock dpkg --configure -a >>"$LOGFILE" 2>&1 || log "WARNING: dpkg --configure -a reported a problem"
+        fi
+        if rollback; then
+            journal_clear
+            RECOVER_RC=$EXIT_ROLLED_BACK
+        else
+            RECOVER_RC=$EXIT_ROLLBACK_FAILED
+        fi
+        rm -rf "$PRIV_DIR"
+        PRIV_DIR=""
+    fi
+fi
+if [[ "$MODE" == "recover" ]]; then
+    if [[ ! -d "$JOURNAL" && $RECOVER_RC -eq 0 ]]; then log "Nothing to recover."; fi
+    log "==== Recovery done ===="
+    exit "$RECOVER_RC"
+fi
+if [[ $RECOVER_RC -eq $EXIT_ROLLBACK_FAILED ]]; then
+    # The new install replaces what couldn't be put back; keeping the old
+    # journal would make every later run try (and fail) again.
+    log "WARNING: The earlier setup could not be fully restored; the install now replaces it."
+    journal_clear
+fi
+
+# ── Install mode ───────────────────────────────────────────────────────
+ORIG_RUN_FILE="${1:-}"
+EXPECT_SHA256="${2:-}"
+USE_DKMS=0
+BLOCK_DISTRO=0
+MODULE_TYPE=""
+
+if [[ -z "$ORIG_RUN_FILE" ]]; then usage_error "No .run file specified"; fi
+if [[ ! "$ORIG_RUN_FILE" =~ ^/.*\.run$ ]]; then usage_error "Invalid run file path (must be absolute and end in .run): $ORIG_RUN_FILE"; fi
+if [[ -L "$ORIG_RUN_FILE" ]]; then usage_error "Refusing symlink: $ORIG_RUN_FILE"; fi
+if [[ ! -f "$ORIG_RUN_FILE" ]]; then usage_error "File not found: $ORIG_RUN_FILE"; fi
+if [[ ! "$EXPECT_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    usage_error "A 64-character SHA256 of the run file is required as the second argument"
+fi
+EXPECT_SHA256="${EXPECT_SHA256,,}"
+
+shift 2
+for arg in "$@"; do
+    case "$arg" in
+        --dkms)                USE_DKMS=1 ;;
+        --block-distro-driver) BLOCK_DISTRO=1 ;;
+        --kernel-module-type=open|--kernel-module-type=proprietary)
+            MODULE_TYPE="${arg#--kernel-module-type=}" ;;
+        *) usage_error "Unknown argument: $arg" ;;
+    esac
+done
+
+# Whether <gid> is the private group of the account <uid>: named after it,
+# its primary group, and with no other member. Supplementary members come
+# from the group entry itself; accounts with it as their primary group are
+# looked for in the account list NSS can enumerate (all local ones).
+group_is_owners_private_group() { # <gid> <uid>
+    local entry owner owner_gid gname members name pgid
+    entry="$(getent passwd "$2")" || return 1
+    IFS=: read -r owner _ _ owner_gid _ <<<"$entry"
+    [[ "$owner_gid" == "$1" ]] || return 1
+    entry="$(getent group "$1")" || return 1
+    IFS=: read -r gname _ _ members <<<"$entry"
+    [[ "$gname" == "$owner" ]] || return 1
+    [[ -z "$members" || "$members" == "$owner" ]] || return 1
+    while IFS=: read -r name _ _ pgid _; do
+        if [[ "$pgid" == "$1" && "$name" != "$owner" ]]; then return 1; fi
+    done < <(getent passwd || true)
+    return 0
+}
+
+# Who besides the owner an ACL lets write the file, as "user:<uid>" /
+# "group:<gid>" lines; empty when nobody, "?" when the file has an ACL that
+# can't be read (no getfacl).
+acl_writers() { # <file> <owner-uid>
+    local line kind who perms mask="rwx"
+    # ls shows "+" after the mode for a file with an ACL.
+    local mode_str
+    mode_str="$(ls -ldn -- "$1" | cut -d' ' -f1)"
+    [[ "$mode_str" == *+ ]] || return 0
+    if ! command -v getfacl >/dev/null 2>&1; then echo "?"; return 0; fi
+    while IFS= read -r line; do
+        if [[ "$line" == mask::* ]]; then mask="${line#mask::}"; fi
+    done < <(getfacl -cpn -- "$1" 2>/dev/null)
+    while IFS=: read -r kind who perms; do
+        [[ "$kind" == user && -n "$who" && "$who" != "$2" ]] || [[ "$kind" == group && -n "$who" ]] || continue
+        if [[ "${perms:1:1}" == w && "${mask:1:1}" == w ]]; then echo "$kind:$who"; fi
+    done < <(getfacl -cpn -- "$1" 2>/dev/null)
+    return 0
+}
+
+# Ownership / permission check on the original file: only its owner (root
+# or the invoking user) may have been able to write it.
+FILE_UID="$(stat -c '%u' -- "$ORIG_RUN_FILE")"
+FILE_GID="$(stat -c '%g' -- "$ORIG_RUN_FILE")"
+FILE_MODE="$(stat -c '%a' -- "$ORIG_RUN_FILE")"
+CALLER_UID="${PKEXEC_UID:-${SUDO_UID:-0}}"
+if [[ "$FILE_UID" != "0" && "$FILE_UID" != "$CALLER_UID" ]]; then
+    usage_error "$ORIG_RUN_FILE is owned by uid $FILE_UID, not root or the invoking user ($CALLER_UID)"
+fi
+if (( (8#$FILE_MODE) & 8#002 )); then
+    usage_error "$ORIG_RUN_FILE can be changed by every user (mode $FILE_MODE) — refusing. Remove that permission (chmod go-w) and retry."
+fi
+if (( (8#$FILE_MODE) & 8#020 )) && ! group_is_owners_private_group "$FILE_GID" "$FILE_UID"; then
+    usage_error "$ORIG_RUN_FILE can be changed by other members of group $FILE_GID (mode $FILE_MODE) — refusing. Remove that permission (chmod go-w) and retry."
+fi
+ACL_WRITERS="$(acl_writers "$ORIG_RUN_FILE" "$FILE_UID")"
+if [[ "$ACL_WRITERS" == "?" ]]; then
+    usage_error "$ORIG_RUN_FILE has an access control list that can't be checked (getfacl is missing) — refusing. Remove it (setfacl -b) and retry."
+fi
+while IFS= read -r who; do
+    [[ -n "$who" ]] || continue
+    if [[ "$who" == group:* ]] && group_is_owners_private_group "${who#group:}" "$FILE_UID"; then continue; fi
+    usage_error "$ORIG_RUN_FILE has an access control list letting $who change it — refusing. Remove it (setfacl -b) and retry."
+done <<<"$ACL_WRITERS"
+
+# ── Detect package manager ─────────────────────────────────────────────
+detect_pkg_mgr
+set_kernel "$(uname -r)"
+
+log "Run file: $ORIG_RUN_FILE (dkms=$USE_DKMS block_distro_driver=$BLOCK_DISTRO module=${MODULE_TYPE:-auto} pkg_mgr=$PKG_MGR)"
+
+# A requested stop, honoured before anything has been changed.
+stop_point_unchanged() {
+    if [[ $STOP_REQUESTED -eq 1 ]]; then
+        log "Stopped as requested. No changes made."
+        exit "$EXIT_FAILED"
+    fi
+}
+
+# ── Step 0: Copy into a root-only directory and verify the copy ───────
+# /var/tmp rather than /tmp: the installer self-extracts and executes, and
+# /tmp is often mounted noexec.
+PRIV_DIR="$(mktemp -d /var/tmp/green-light-install.XXXXXX)"
+chmod 700 "$PRIV_DIR"
+RUN_FILE="$PRIV_DIR/installer.run"
+log "Copying installer to private directory…"
+if ! cp --no-preserve=mode,ownership -- "$ORIG_RUN_FILE" "$RUN_FILE"; then
+    log "ERROR: Could not copy the installer (disk full?). No changes made."
+    exit "$EXIT_FAILED"
+fi
+chmod 700 "$RUN_FILE"
+ACTUAL_SHA256="$(sha256sum "$RUN_FILE" | cut -d' ' -f1)"
+if [[ "$ACTUAL_SHA256" != "$EXPECT_SHA256" ]]; then
+    log "ERROR: SHA256 mismatch on the private copy (expected $EXPECT_SHA256, got $ACTUAL_SHA256). No changes made."
+    exit "$EXIT_FAILED"
+fi
+log "SHA256 verified on private copy"
+
+# ── Step 1: Verify archive integrity before touching anything ────────
+log "Verifying installer archive integrity…"
+if ! nolock "$RUN_FILE" --check >>"$LOGFILE" 2>&1; then
+    log "ERROR: Installer failed its integrity self-check. No changes made."
+    exit "$EXIT_FAILED"
+fi
+log "Integrity OK"
+
+# ── Step 2: Build prerequisites ───────────────────────────────────────
+# Installing them may fail for reasons that don't matter (an unrelated
+# repository being down, packages already present under other names), so
+# that alone is not fatal. What is checked afterwards is fatal: everything
+# below removes the distro driver, and a module that can't build would leave
+# the next boot without any NVIDIA driver.
+log "Ensuring kernel headers and build tools for $KVER…"
+if [[ "$PKG_MGR" == "apt" ]]; then
+    nolock apt-get install -y "linux-headers-${KVER}" build-essential dkms >>"$LOGFILE" 2>&1 \
+        || log "WARNING: apt could not install all of the prerequisites; checking what is there"
+else
+    nolock dnf install -y "kernel-devel-${KVER}" "kernel-headers-${KVER}" \
+        gcc make dkms >>"$LOGFILE" 2>&1 \
+        || log "WARNING: dnf could not install all of the prerequisites; checking what is there"
+fi
+
+# The compiler the kernel was built with, chosen the way DKMS does: clang
+# kernels build with LLVM=1; for gcc, the compiler named in
+# CONFIG_CC_VERSION_TEXT (e.g. x86_64-linux-gnu-gcc-15) when installed, else
+# gcc. Sets BUILD_VARS (make variables) and BUILD_CC (for the prerequisites).
+choose_compiler() {
+    local autoconf="/lib/modules/$KVER/build/include/generated/autoconf.h" text cc
+    BUILD_VARS=()
+    text="$(grep -s '^#define CONFIG_CC_VERSION_TEXT ' "$autoconf" | cut -d'"' -f2 || true)"
+    cc="${text%% *}"
+    if grep -qs '^#define CONFIG_CC_IS_CLANG 1' "$autoconf"; then
+        BUILD_CC="clang"
+        BUILD_VARS=(LLVM=1)
+    elif [[ -n "$cc" ]] && command -v "$cc" >/dev/null 2>&1; then
+        BUILD_CC="$cc"
+        BUILD_VARS=("CC=$cc")
+    else
+        BUILD_CC="gcc"
+    fi
+}
+
+check_build_prereqs() {
+    local build="/lib/modules/$KVER/build" autoconf missing=() list
+    autoconf="$build/include/generated/autoconf.h"
+    if [[ ! -f "$build/Makefile" || ! -f "$autoconf" ]]; then
+        missing+=("the kernel headers for $KVER ($build)")
+    fi
+    # Modules must be built with the compiler (and linker) the kernel was.
+    choose_compiler
+    command -v "$BUILD_CC" >/dev/null 2>&1 || missing+=("$BUILD_CC")
+    if grep -qs '^#define CONFIG_LD_IS_LLD 1' "$autoconf"; then
+        command -v ld.lld >/dev/null 2>&1 || missing+=("ld.lld")
+    fi
+    command -v make >/dev/null 2>&1 || missing+=("make")
+    if [[ $USE_DKMS -eq 1 ]]; then
+        command -v dkms >/dev/null 2>&1 || missing+=("dkms")
+    fi
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        printf -v list '%s, ' "${missing[@]}"
+        log "ERROR: The NVIDIA kernel module can't be built for kernel $KVER: missing ${list%, }."
+        log "       Install them and retry (the package manager's output is in $LOGFILE). No changes made."
+        exit "$EXIT_FAILED"
+    fi
+    log "Build prerequisites for $KVER are present (compiler: $BUILD_CC)"
+}
+check_build_prereqs
+
+# ── Step 2b: Test-build the kernel module before changing anything ────
+# The most likely way for the install to fail is the kernel module not
+# building for this kernel (a kernel newer than the driver supports). Build
+# it the way DKMS does, from the unpacked installer in the private dir: if
+# that fails, nothing has been changed yet. With the module flavor left to
+# the installer, both flavors are built, since which one it picks depends on
+# the GPUs.
+test_build_modules() {
+    local dir="$PRIV_DIR/unpacked" flavors=() f out="$PRIV_DIR/test-build.log"
+    log "Test-building the NVIDIA kernel module for $KVER before changing anything…"
+    if ! nolock "$RUN_FILE" --extract-only --target "$dir" >>"$LOGFILE" 2>&1; then
+        log "ERROR: Could not unpack the installer to test-build its kernel module. No changes made."
+        exit "$EXIT_FAILED"
+    fi
+    case "$MODULE_TYPE" in
+        open)        flavors=(kernel-open) ;;
+        proprietary) flavors=(kernel) ;;
+        *)           flavors=(kernel-open kernel) ;;
+    esac
+    for f in "${flavors[@]}"; do
+        # Drivers older than 515 have no open flavor.
+        [[ -d "$dir/$f" ]] || continue
+        if ! nolock make -C "$dir/$f" -j"$(nproc)" "${BUILD_VARS[@]}" KERNEL_UNAME="$KVER" modules >"$out" 2>&1; then
+            cat "$out" >> "$LOGFILE" 2>/dev/null || true
+            log "ERROR: The NVIDIA kernel module ($f) doesn't build for kernel $KVER. No changes made."
+            log_tail "$out" "the test build"
+            exit "$EXIT_FAILED"
+        fi
+        log "Test build OK: $f"
+    done
+    rm -rf "$dir" "$out"
+}
+test_build_modules
+stop_point_unchanged
+
+# ── Step 3: Record everything, then clear conflicting distro packages ─
+# Removing package files does not affect the running driver — the loaded
+# kernel module and already-mapped libraries keep working, same as
+# during a normal package-manager driver upgrade.
+#
+# The package set here has caused two real failures in practice:
+#   - nvidia-container-toolkit / libnvidia-container* match nvidia-*/
+#     libnvidia-* but are Docker's GPU-passthrough plumbing, not the
+#     display driver. Purging them doesn't touch the running driver, but
+#     it breaks every GPU container the moment its runtime next restarts
+#     (confirmed: took down a running Frigate NVR container this way).
+#   - xserver-xorg-video-nvidia-<ver> does NOT match nvidia-*/libnvidia-*
+#     (wrong prefix) but is part of the same apt-managed driver flavor and
+#     is a reverse-dependency of nvidia-support-<ver>. Leaving it installed
+#     makes dpkg refuse to remove nvidia-support-<ver>. The half-removed
+#     state that results leaves nvidia-support-<ver>'s
+#     /usr/lib/nvidia/alternate-install-present marker file in place, which
+#     makes the .run installer itself abort with "please use the Debian
+#     packages instead" — on a machine that's mid-purge of those exact
+#     packages. Confirmed end to end against a real install.
+#
+# Everything this step and the next ones change goes into the journal first
+# (see above), so a failure, a stop or a cut-off run can put it all back,
+# checked against the recorded state.
+PKGS=()       # installed driver packages to remove (name[:arch] / rpm name)
+HELD=()       # apt holds on them
+BACKUPS=()    # "<path>|<saved copy number, or empty when it didn't exist>"
+WAS_BLOCKED=0
+INSTALLER_STARTED=0
+
 log "Removing distro-managed NVIDIA packages (if any)…"
 if [[ "$PKG_MGR" == "apt" ]]; then
     # Second status letter "i" = installed, whatever the selection (a held
@@ -883,24 +1142,72 @@ if [[ "$PKG_MGR" == "apt" ]]; then
         if [[ "${st:1:1}" == "i" ]] && is_driver_pkg "$name" "${DEB_DRIVER_GLOBS[@]}"; then
             PKGS+=("$name")
         fi
-    done < <(dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}|${Version}\n' \
+    done < <(nolock dpkg-query -W -f '${db:Status-Abbrev}|${binary:Package}|${Version}\n' \
                  "${DEB_DRIVER_GLOBS[@]}" 2>/dev/null || true)
     while IFS= read -r name; do
         if is_driver_pkg "$name" "${DEB_DRIVER_GLOBS[@]}"; then HELD+=("$name"); fi
-    done < <(apt-mark showhold 2>/dev/null || true)
+    done < <(nolock apt-mark showhold 2>/dev/null || true)
 else
     while IFS= read -r name; do
         if is_driver_pkg "$name" "${RPM_DRIVER_GLOBS[@]}"; then PKGS+=("$name"); fi
-    done < <(rpm -qa --qf '%{NAME}\n' "${RPM_DRIVER_GLOBS[@]}" 2>/dev/null || true)
+    done < <(nolock rpm -qa --qf '%{NAME}\n' "${RPM_DRIVER_GLOBS[@]}" 2>/dev/null || true)
 fi
-package_snapshot > "$PKGS_BEFORE"
 if distro_driver_blocked; then WAS_BLOCKED=1; fi
 RUN_VER_BEFORE="$(installed_run_version)"
 MOD_VER_BEFORE="$(module_version)"
 MOD_SIGNER_BEFORE="$(module_signer)"
+
+# Write the journal: built under a temporary name and renamed into place.
+mkdir -p "$STATE_DIR"
+chmod 755 "$STATE_DIR"
+rm -rf "$JOURNAL.new"
+mkdir -m 700 "$JOURNAL.new" "$JOURNAL.new/backup"
+package_snapshot > "$JOURNAL.new/packages-before"
+if [[ ${#PKGS[@]} -gt 0 ]]; then
+    planned_removals "${PKGS[@]}" > "$JOURNAL.new/planned"
+else
+    : > "$JOURNAL.new/planned"
+fi
+# Packages of the plan that were installed only as dependencies, so they
+# are marked that way again when put back.
+if [[ "$PKG_MGR" == "apt" ]]; then
+    { nolock apt-mark showauto 2>/dev/null || true; } | grep -xF -f "$JOURNAL.new/planned" > "$JOURNAL.new/auto" || true
+else
+    { nolock dnf repoquery --installed --qf '%{name}.%{arch}\n' 2>/dev/null || true; } > "$PRIV_DIR/all-installed"
+    { nolock dnf repoquery --installed --userinstalled --qf '%{name}.%{arch}\n' 2>/dev/null || true; } > "$PRIV_DIR/user-installed"
+    grep -xF -f "$JOURNAL.new/planned" "$PRIV_DIR/all-installed" | grep -vxF -f "$PRIV_DIR/user-installed" > "$JOURNAL.new/auto" || true
+fi
 backup_file /etc/modprobe.d/blacklist-nouveau.conf
 backup_file /etc/modprobe.d/nvidia-drm-modeset.conf
 backup_file /usr/lib/nvidia/alternate-install-present
+declare -p PKG_MGR KVER HELD BACKUPS WAS_BLOCKED RUN_VER_BEFORE MOD_VER_BEFORE MOD_SIGNER_BEFORE \
+    > "$JOURNAL.new/state"
+printf 'armed\n' > "$JOURNAL.new/phase"
+: > "$JOURNAL.new/cache-index"
+durable "$JOURNAL.new"/* "$JOURNAL.new/backup" "$JOURNAL.new"
+rm -rf "$JOURNAL"
+mv "$JOURNAL.new" "$JOURNAL"
+durable "$STATE_DIR"
+JOURNAL_OURS=1
+# From here a leftover journal means "roll this back" (phase: armed).
+if [[ -s "$JOURNAL/planned" ]]; then
+    log "Keeping copies of the packages the install removes, so they can be put back offline…"
+    cache_planned_packages
+fi
+if [[ $STOP_REQUESTED -eq 1 ]]; then
+    journal_clear
+    stop_point_unchanged
+fi
+
+# Keep the machine from shutting down or suspending until the driver is in
+# place or put back. The inhibitor follows this process (tail --pid), so it
+# also ends if the run is killed.
+if [[ -d /run/systemd/system ]] && command -v systemd-inhibit >/dev/null 2>&1; then
+    systemd-inhibit --what=shutdown:sleep --mode=block --who="Green Light" \
+        --why="Installing the NVIDIA driver; stopping now could leave the computer without one" \
+        tail --pid=$$ -f /dev/null 9>&- &
+    INHIBIT_PID=$!
+fi
 
 ROLLBACK_ARMED=1
 
@@ -910,18 +1217,18 @@ unblock_distro_driver
 if [[ "$PKG_MGR" == "apt" ]]; then
     # apt refuses to remove held packages.
     if [[ ${#HELD[@]} -gt 0 ]]; then
-        apt-mark unhold "${HELD[@]}" >>"$LOGFILE" 2>&1
+        nolock apt-mark unhold "${HELD[@]}" >>"$LOGFILE" 2>&1
     fi
     # Driver packages only. libcuda*/libcudnn* are deliberately NOT matched:
     # they can belong to a user-installed CUDA toolkit unrelated to the
     # display driver (the driver's own libcuda is in libnvidia-compute-*).
     # apt also removes what depends on them (Ubuntu's prebuilt module
-    # packages, cuda-drivers, ...); those are recorded through the snapshot.
+    # packages, cuda-drivers, ...); those are in the journal's plan.
     if [[ ${#PKGS[@]} -gt 0 ]]; then
         log "  purging: ${PKGS[*]}"
         # No dpkg --force-all fallback: it can leave dpkg in a broken
         # dependency state. Fail and restore instead.
-        if ! apt-get purge -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
+        if ! nolock apt-get purge -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
             log "ERROR: apt-get purge of the distro NVIDIA packages failed (see $LOGFILE)."
             exit "$EXIT_FAILED"
         fi
@@ -941,7 +1248,7 @@ else
     # xorg-x11-drv-nvidia*, kmod-nvidia*, nvidia-driver* if present.
     if [[ ${#PKGS[@]} -gt 0 ]]; then
         log "  removing: ${PKGS[*]}"
-        if ! dnf remove -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
+        if ! nolock dnf remove -y "${PKGS[@]}" >>"$LOGFILE" 2>&1; then
             log "ERROR: dnf remove of the distro NVIDIA packages failed (see $LOGFILE)."
             exit "$EXIT_FAILED"
         fi
@@ -965,6 +1272,11 @@ BLACKLIST
 cat > /etc/modprobe.d/nvidia-drm-modeset.conf << 'MODESET'
 options nvidia_drm modeset=1
 MODESET
+
+if [[ $STOP_REQUESTED -eq 1 ]]; then
+    log "Stopping as requested, before NVIDIA's installer: putting everything back."
+    exit "$EXIT_FAILED"
+fi
 
 # ── Step 5: Run the installer — repo-style, old driver keeps running ──
 log "Running the NVIDIA installer (a few minutes; desktop stays up)…"
@@ -1009,15 +1321,21 @@ INSTALL_SIGN_CERT="$SIGN_CERT"
 
 RC=0
 INSTALLER_STARTED=1
-"$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1 || RC=$?
+journal_set_phase installer-started
+nolock "$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1 || RC=$?
 if [[ $RC -ne 0 ]]; then
     log "ERROR: NVIDIA installer exited with code $RC"
     log "See /var/log/nvidia-installer.log for details."
     log_dkms_build_tail
     exit "$EXIT_FAILED"
 fi
+journal_set_phase installer-done
 ROLLBACK_ARMED=0
+journal_clear
 log "NVIDIA installer finished successfully"
+if [[ $STOP_REQUESTED -eq 1 ]]; then
+    log "A stop was requested while NVIDIA's installer ran; it had already succeeded, so the install is finished rather than undone."
+fi
 
 # ── Step 6: Keep the distro driver from coming back (optional) ────────
 # Right after the install, so every later exit (initramfs failure included)
@@ -1034,11 +1352,12 @@ fi
 
 # ── Step 7: Rebuild initramfs so the blacklist applies at boot ────────
 log "Rebuilding initramfs…"
-if ! "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
+if ! nolock "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
     log "ERROR: initramfs rebuild failed. The driver is installed but the nouveau"
     log "       blacklist may not apply at boot. Run: ${INITRAMFS_CMD[*]}"
     exit "$EXIT_INITRAMFS"
 fi
+if [[ -n "$INHIBIT_PID" ]]; then kill "$INHIBIT_PID" 2>/dev/null || true; INHIBIT_PID=""; fi
 
 # ── Step 8: Verify the result (report only; never fails the install) ──
 # Everything here is a read-only check whose outcome goes to the log; the app

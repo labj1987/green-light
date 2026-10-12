@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # green-light-setup — runs as root via pkexec (polkit action
 # io.github.labj1987.GreenLight.setup once installed). Installs or updates
-# Green Light's privileged install script and polkit policy at their fixed
-# system paths.
+# Green Light's privileged install script, polkit policy and the
+# green-light-recover.service boot unit at their fixed system paths.
 #
 # Usage: green-light-setup <stage-dir>
-#   <stage-dir> holds `privileged-install.sh` and `policy`, staged by the
+#   <stage-dir> holds `privileged-install.sh`, `policy` and `recover-service`, staged by the
 #   AppImage's AppRun (the AppImage's FUSE mount isn't readable by root).
 #
 # The stage directory is user-writable, so nothing in it is trusted: the
@@ -18,11 +18,14 @@ set -euo pipefail
 
 BAKED_SCRIPT_SHA256="@SCRIPT_SHA256@"
 BAKED_POLICY_SHA256="@POLICY_SHA256@"
+BAKED_UNIT_SHA256="@UNIT_SHA256@"
 
 DST_DIR="/usr/lib/green-light"
 DST_SCRIPT="$DST_DIR/privileged-install.sh"
 DST_HELPER="$DST_DIR/green-light-setup"
 DST_POLICY="/usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy"
+# Keep in step with DST_UNIT in build-appimage.sh's AppRun.
+DST_UNIT="/etc/systemd/system/green-light-recover.service"
 
 die() { echo "green-light-setup: $*" >&2; exit 1; }
 
@@ -40,13 +43,14 @@ trap on_exit EXIT
 
 STAGE="${1:-}"
 [[ -n "$STAGE" && -d "$STAGE" ]] || die "usage: green-light-setup <stage-dir>"
-[[ "$BAKED_SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ && "$BAKED_POLICY_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+[[ "$BAKED_SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ && "$BAKED_POLICY_SHA256" =~ ^[0-9a-f]{64}$ \
+    && "$BAKED_UNIT_SHA256" =~ ^[0-9a-f]{64}$ ]] \
     || die "build-time hashes missing; refusing to install"
 
 WORK="$(mktemp -d /var/tmp/green-light-setup.XXXXXX)"
 chmod 700 "$WORK"
 
-for f in privileged-install.sh policy; do
+for f in privileged-install.sh policy recover-service; do
     [[ -f "$STAGE/$f" && ! -L "$STAGE/$f" ]] || die "missing or invalid staged file: $f"
     cp --no-preserve=mode,ownership -- "$STAGE/$f" "$WORK/$f"
 done
@@ -59,8 +63,16 @@ check() { # <file> <expected-sha256> <label>
 }
 check "$WORK/privileged-install.sh" "$BAKED_SCRIPT_SHA256" "install script"
 check "$WORK/policy"                "$BAKED_POLICY_SHA256" "polkit policy"
+check "$WORK/recover-service"       "$BAKED_UNIT_SHA256"   "recovery boot unit"
 
 install -D -m 755 "$WORK/privileged-install.sh" "$DST_SCRIPT"
 install -D -m 755 "$WORK/helper"                "$DST_HELPER"
 install -D -m 644 "$WORK/policy"                "$DST_POLICY"
+install -D -m 644 "$WORK/recover-service"       "$DST_UNIT"
+# The unit starts at boot only when an interrupted install left a journal.
+if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    systemctl enable green-light-recover.service >/dev/null 2>&1 \
+        || echo "green-light-setup: could not enable green-light-recover.service" >&2
+fi
 echo "green-light-setup: installed"
