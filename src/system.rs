@@ -54,7 +54,7 @@ pub enum SecureBootStatus {
 impl std::fmt::Display for SecureBootStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Enabled => write!(f, "Enabled (MOK enrollment may be required)"),
+            Self::Enabled => write!(f, "Enabled"),
             Self::Disabled => write!(f, "Disabled"),
             Self::Unknown => write!(f, "Unknown"),
         }

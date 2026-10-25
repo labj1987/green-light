@@ -6,7 +6,8 @@ use crate::install::{
     run_privileged_setup_signing, InstallOptions, Recovered, RecoveryNote, StaleRecovery,
 };
 use crate::preflight::{
-    conflict_summary, module_hint, secure_boot_advice, signing_summary, validate_module_choice,
+    conflict_summary, module_hint, secure_boot_advice, secure_boot_summary, signing_summary,
+    validate_module_choice,
     validate_mok_password, ModuleChoice,
 };
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
@@ -540,6 +541,10 @@ pub fn build_ui(app: &Application) {
             open_file_btn.set_sensitive(a.open_file);
             install_btn.set_sensitive(a.install);
             signing_btn.set_sensitive(a.setup_signing);
+            // Nothing to set up once the key is enrolled or queued: hide the
+            // button rather than leave an action that looks needed.
+            let s = state.borrow();
+            signing_btn.set_visible(!s.sysinfo_loaded || s.sysinfo.signing_key.setup_needed());
         })
     };
 
@@ -723,7 +728,7 @@ pub fn build_ui(app: &Application) {
                     }
 
                     // Secure boot
-                    secureboot_row.set_subtitle(&info.secure_boot.to_string());
+                    secureboot_row.set_subtitle(&secure_boot_summary(&info.secure_boot, &info.signing_key));
 
                     // Module signing: key state, installed module's signer
                     let mut signing_text = signing_summary(&info.signing_key, &info.module_signature);

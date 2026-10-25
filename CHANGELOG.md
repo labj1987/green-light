@@ -5,6 +5,12 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.3 — 2026-10-25
+
+- With Secure Boot on and the module-signing key enrolled, the System tab now says so
+  ("the module-signing key is enrolled, so signed modules load") instead of "MOK enrollment
+  may be required", and Set Up Signing is hidden while there is nothing to set up.
+
 ## 2.10.2 — 2026-10-25
 
 **Fixed: the module-signing key not enrolling** when another app had also queued a key for

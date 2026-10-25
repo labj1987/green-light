@@ -621,6 +621,27 @@ pub fn validate_mok_password(first: &str, second: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The Secure Boot row's text: the firmware state, and with Secure Boot on,
+/// whether modules signed with this machine's key will load.
+pub fn secure_boot_summary(sb: &crate::system::SecureBootStatus, key: &SigningKeyState) -> String {
+    use crate::system::SecureBootStatus as S;
+    match (sb, key) {
+        (S::Enabled, SigningKeyState::Enrolled(_)) => {
+            "Enabled — the module-signing key is enrolled, so signed modules load".to_string()
+        }
+        (S::Enabled, SigningKeyState::PendingEnrollment(_)) => {
+            "Enabled — the module-signing key is waiting for enrollment at the next reboot".to_string()
+        }
+        (S::Enabled, SigningKeyState::Untested(_) | SigningKeyState::Unknown) => {
+            "Enabled — could not check whether the module-signing key is enrolled".to_string()
+        }
+        (S::Enabled, _) => {
+            "Enabled — the module-signing key is not enrolled; use Set Up Signing".to_string()
+        }
+        (other, _) => other.to_string(),
+    }
+}
+
 /// Warning text for the pre-install checks. `None` means nothing to warn
 /// about. `pair` is the key the install would sign with and `use_dkms` the
 /// DKMS option: DKMS signs with any key, NVIDIA's installer (no DKMS) can't
@@ -822,6 +843,18 @@ mod tests {
             parse_mok_test_key("Abort!!! /c.pem is not a valid x509 certificate in DER format"),
             None
         );
+    }
+
+    #[test]
+    fn secure_boot_summary_follows_the_key() {
+        use crate::system::SecureBootStatus as S;
+        let on = S::Enabled;
+        assert!(secure_boot_summary(&on, &SigningKeyState::Enrolled("/c".into())).contains("is enrolled"));
+        assert!(secure_boot_summary(&on, &SigningKeyState::PendingEnrollment("/c".into())).contains("waiting"));
+        assert!(secure_boot_summary(&on, &SigningKeyState::NotEnrolled("/c".into())).contains("Set Up Signing"));
+        assert!(secure_boot_summary(&on, &SigningKeyState::NoKey).contains("Set Up Signing"));
+        assert!(!secure_boot_summary(&on, &SigningKeyState::Enrolled("/c".into())).contains("may be required"));
+        assert_eq!(secure_boot_summary(&S::Disabled, &SigningKeyState::NoKey), "Disabled");
     }
 
     #[test]
