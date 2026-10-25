@@ -1181,7 +1181,9 @@ mok_case() {   # sets up the tools, a module-signing key and an efivars dir
         -keyout "$T/var/lib/shim-signed/mok/MOK.priv" -outform DER -out "$T/var/lib/shim-signed/mok/MOK.der" >/dev/null 2>&1
     openssl req -new -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=Other app key" \
         -keyout "$T/other/k.pem" -outform DER -out "$T/other/c.der" >/dev/null 2>&1
-    SANDBOX_EXTRA=(--bind "$T/efivars" /sys/firmware/efi/efivars)
+    # A tmpfs over /sys/firmware: the efivars path exists in the sandbox even on
+    # machines without EFI (CI runners).
+    SANDBOX_EXTRA=(--tmpfs /sys/firmware --bind "$T/efivars" /sys/firmware/efi/efivars)
     stub mokutil 'case "$1" in
   --test-key) if [[ -e "$GLT/enrolled" ]]; then echo "$2 is already enrolled"; else echo "$2 is not enrolled"; fi ;;
   --generate-hash) read -r a; read -r b; printf "\x246\x24salt\x24hash\n" ;;
