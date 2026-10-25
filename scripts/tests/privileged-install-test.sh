@@ -1188,7 +1188,7 @@ mok_case() {   # sets up the tools, a module-signing key and an efivars dir
   --test-key) if [[ -e "$GLT/enrolled" ]]; then echo "$2 is already enrolled"; else echo "$2 is not enrolled"; fi ;;
   --generate-hash) read -r a; read -r b; printf "\x246\x24salt\x24hash\n" ;;
   --revoke-import) rm -f /sys/firmware/efi/efivars/MokNew-* ;;
-  --import) shift; for f in "$@"; do [[ "$f" == --hash-file ]] && break; openssl x509 -inform DER -in "$f" -noout -subject >> "$GLT/imported"; done ;;
+  --import) shift; for f in "$@"; do [[ "$f" == --hash-file ]] && break; openssl x509 -inform DER -in "$f" -noout -subject -nameopt RFC2253 >> "$GLT/imported"; done ;;
 esac'
 }
 write_moknew() {   # <type: x509|sha256> <der>
