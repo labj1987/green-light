@@ -5,6 +5,18 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.1 — 2026-10-25
+
+**Fixed: the module-signing key not enrolling** when another app had also queued a key for
+enrollment (for example a kernel-signing key). The two requests ended up needing different
+passwords, and the blue MOK Manager screen enrolled neither key.
+
+- Set Up Signing now keeps any key another app already queued in the same request and
+  puts this computer's module-signing key with it, under the one password you choose. At
+  the next reboot that password enrolls all of them.
+- Setting up again replaces the password instead of quietly keeping the old one.
+- A key waiting for enrollment now shows as waiting instead of "not enrolled".
+
 ## 2.10.0 — 2026-10-12
 
 **Installs that fail safely**

@@ -1169,6 +1169,91 @@ expect_no_call_like "^akmods"
 expect_call "dnf mark dependency nvidia-persistenced"
 end
 
+# ── Signing setup: one enrollment request, one password ────────────────
+# shim keeps one waiting request with one password; another tool's key
+# already waiting (a kernel-signing key) must be carried over into this
+# request, never silently left needing a different password.
+mok_case() {   # sets up the tools, a module-signing key and an efivars dir
+    local tool
+    for tool in perl openssl sed tr; do ln -sf "$(readlink -f "$(type -P "$tool")")" "$T/bin/$tool"; done
+    mkdir -p "$T/var/lib/shim-signed/mok" "$T/efivars" "$T/other"
+    openssl req -new -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=Test Module Signing key" \
+        -keyout "$T/var/lib/shim-signed/mok/MOK.priv" -outform DER -out "$T/var/lib/shim-signed/mok/MOK.der" >/dev/null 2>&1
+    openssl req -new -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=Other app key" \
+        -keyout "$T/other/k.pem" -outform DER -out "$T/other/c.der" >/dev/null 2>&1
+    SANDBOX_EXTRA=(--bind "$T/efivars" /sys/firmware/efi/efivars)
+    stub mokutil 'case "$1" in
+  --test-key) if [[ -e "$GLT/enrolled" ]]; then echo "$2 is already enrolled"; else echo "$2 is not enrolled"; fi ;;
+  --generate-hash) read -r a; read -r b; printf "\x246\x24salt\x24hash\n" ;;
+  --revoke-import) rm -f /sys/firmware/efi/efivars/MokNew-* ;;
+  --import) shift; for f in "$@"; do [[ "$f" == --hash-file ]] && break; openssl x509 -inform DER -in "$f" -noout -subject >> "$GLT/imported"; done ;;
+esac'
+}
+write_moknew() {   # <type: x509|sha256> <der>
+    perl -e '
+        my ($kind, $f) = @ARGV;
+        my %g = (x509 => "a159c0a5e494a74a87b5ab155c2bf072", sha256 => "2616c4c14c509240aca941f936934328");
+        open(my $h, "<:raw", $f) or die; local $/; my $d = <$h>;
+        my $entry = ("\x11" x 16) . $d;
+        binmode STDOUT;
+        print pack("V", 7) . pack("H*", $g{$kind}) . pack("V3", 28 + length $entry, 0, length $entry) . $entry;
+    ' "$1" "$2" > "$T/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23"
+}
+fpr() { openssl x509 -inform DER -in "$1" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f'; }
+
+begin "signing setup carries a key another tool queued into one request"
+mok_case
+write_moknew x509 "$T/other/c.der"
+RC=0
+sandbox "$T/bin/bash" -c 'echo pass1234 | "$0" --setup-signing' "$SCRIPT" > /dev/null 2>&1 || RC=$?
+OUT="$(cat "$T/var/log/green-light.log")"
+expect_rc 0
+expect_out "To enroll: Other app key (already waiting for enrollment)"
+expect_out "To enroll: Test Module Signing key"
+expect_out "That one password enrolls all of these keys"
+expect_call "mokutil --revoke-import"
+[[ "$(sort "$T/imported" | tr '\n' '|')" == "subject=CN=Other app key|subject=CN=Test Module Signing key|" ]] \
+    || fail "imported [$(tr '\n' '|' < "$T/imported" 2>/dev/null)]"
+[[ "$(sort "$T/var/lib/green-light/mok-pending" | tr '\n' ' ')" == "$(printf '%s\n' "$(fpr "$T/other/c.der")" "$(fpr "$T/var/lib/shim-signed/mok/MOK.der")" | sort | tr '\n' ' ')" ]] \
+    || fail "the app's pending list is wrong"
+[[ "$(stat -c %a "$T/var/lib/green-light/mok-pending")" == 644 ]] || fail "the pending list must be readable by the app"
+grep -q pass1234 "$T/calls" && fail "the password reached an argument list"
+end
+
+begin "signing setup re-queues its own waiting key under the new password"
+mok_case
+write_moknew x509 "$T/var/lib/shim-signed/mok/MOK.der"
+RC=0
+sandbox "$T/bin/bash" -c 'echo pass5678 | "$0" --setup-signing' "$SCRIPT" > /dev/null 2>&1 || RC=$?
+OUT="$(cat "$T/var/log/green-light.log")"
+expect_rc 0
+expect_call "mokutil --revoke-import"
+[[ "$(cat "$T/imported")" == "subject=CN=Test Module Signing key" ]] || fail "imported [$(cat "$T/imported" 2>/dev/null)]"
+end
+
+begin "signing setup with every key enrolled queues nothing"
+mok_case
+touch "$T/enrolled"
+RC=0
+sandbox "$T/bin/bash" -c 'echo pass5678 | "$0" --setup-signing' "$SCRIPT" > /dev/null 2>&1 || RC=$?
+OUT="$(cat "$T/var/log/green-light.log")"
+expect_rc 0
+expect_out "already enrolled; nothing to do"
+expect_no_call_like "^mokutil --import"
+end
+
+begin "signing setup leaves a waiting request it cannot carry over alone"
+mok_case
+write_moknew sha256 "$T/other/c.der"
+RC=0
+sandbox "$T/bin/bash" -c 'echo pass5678 | "$0" --setup-signing' "$SCRIPT" > /dev/null 2>&1 || RC=$?
+OUT="$(cat "$T/var/log/green-light.log")"
+expect_rc 1
+expect_out "holds more than certificates"
+expect_no_call_like "^mokutil --(revoke-)?import"
+expect_file "$T/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23"
+end
+
 echo
 echo "$PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

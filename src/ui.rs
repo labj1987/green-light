@@ -819,7 +819,10 @@ pub fn build_ui(app: &Application) {
                 Some(
                     "Pick a one-time password to approve this computer's module-signing key. \
                      On the next restart a blue MOK Manager screen appears before Linux starts: \
-                     choose Enroll MOK and type this same password there once.",
+                     choose Enroll MOK and type this same password there once. Any key another \
+                     app has already queued (such as a kernel-signing key) is kept in the same \
+                     request, and this password enrolls all of them; a password chosen earlier \
+                     no longer works.",
                 ),
             );
             dialog.set_extra_child(Some(&fields));

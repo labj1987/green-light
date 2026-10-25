@@ -523,24 +523,19 @@ pub fn parse_mok_test_key(output: &str) -> Option<MokTestResult> {
     }
 }
 
-/// SHA1 fingerprints (lowercase hex, no colons) of the keys listed by
-/// `mokutil --list-new`.
-pub fn parse_mok_fingerprints(list_new: &str) -> Vec<String> {
-    list_new
-        .lines()
-        .filter_map(|l| {
-            let (label, value) = l.split_once(':')?;
-            label.trim().eq_ignore_ascii_case("SHA1 Fingerprint").then(|| {
-                value.chars().filter(char::is_ascii_hexdigit).collect::<String>()
-                    .to_lowercase()
-            })
-        })
+/// SHA1 fingerprints (lowercase hex, no colons) of the keys the last
+/// signing setup queued, from the list the privileged script writes to
+/// /var/lib/green-light/mok-pending (one per line). `mokutil --list-new`
+/// cannot tell: the waiting request (MokNew) is readable by root only.
+pub fn parse_pending_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.chars().filter(char::is_ascii_hexdigit).collect::<String>().to_lowercase())
         .filter(|f| f.len() == 40)
         .collect()
 }
 
 /// State of the certificate at `path` from the mokutil results: its SHA1
-/// among the `mokutil --list-new` fingerprints means queued, otherwise the
+/// among the pending fingerprints means queued, otherwise the
 /// `--test-key` answer decides. `cert_sha1` is the SHA1 of the certificate
 /// file, which equals mokutil's fingerprint for a DER certificate. `None`
 /// when mokutil gave no usable answer.
@@ -1063,11 +1058,13 @@ mod tests {
 
     #[test]
     fn mok_pending_fingerprints() {
-        let out = "[key 1]\nSHA1 Fingerprint: 5C:9C:AB:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01\n\
-                   Certificate:\n    Data:\n        Subject: CN = test\n";
-        let fprs = parse_mok_fingerprints(out);
-        assert_eq!(fprs, vec!["5c9cab0123456789abcdef0123456789abcdef01".to_string()]);
-        assert!(parse_mok_fingerprints("MokNew is empty\n").is_empty());
+        let out = "5c9cab0123456789abcdef0123456789abcdef01\n43:E4:F8:24:5B:73:F1:34:BF:13:C1:DB:E6:30:01:52:7C:7B:09:05\nnot a fingerprint\n";
+        let fprs = parse_pending_list(out);
+        assert_eq!(
+            fprs,
+            vec!["5c9cab0123456789abcdef0123456789abcdef01".to_string(), "43e4f8245b73f134bf13c1dbe63001527c7b0905".to_string()]
+        );
+        assert!(parse_pending_list("").is_empty());
 
         let path = "/var/lib/dkms/mok.pub";
         let sha = "5c9cab0123456789abcdef0123456789abcdef01";

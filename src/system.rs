@@ -3,7 +3,7 @@
 
 use crate::preflight::{
     classify_signing_key, parse_compute_caps, parse_dkms_signing_config, parse_dpkg_installed,
-    parse_module_flavor, parse_module_signer, parse_mok_fingerprints, parse_rpm_names,
+    parse_module_flavor, parse_module_signer, parse_pending_list, parse_rpm_names,
     resolve_signing_pair, ComputeCap, ModuleFlavor, ModuleSignature, SigningKeyState,
     SigningPair, APT_BLOCK_FILE, DEB_DRIVER_GLOBS, DNF_BLOCK_FILE, RPM_DRIVER_GLOBS,
 };
@@ -190,11 +190,18 @@ fn file_exists(path: &str) -> Option<bool> {
     }
 }
 
+const MOK_NEW: &str = "/sys/firmware/efi/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23";
+const MOK_PENDING_LIST: &str = "/var/lib/green-light/mok-pending";
+
 /// Enrollment state of the certificate at `path`.
 fn cert_enrollment(path: &str) -> SigningKeyState {
-    let pending = command_text("mokutil", &["--list-new"])
-        .map(|t| parse_mok_fingerprints(&t))
-        .unwrap_or_default();
+    // Pending: an enrollment request exists and the last signing setup
+    // listed this key in it (MokNew itself is readable by root only).
+    let pending = if std::path::Path::new(MOK_NEW).exists() {
+        std::fs::read_to_string(MOK_PENDING_LIST).map(|t| parse_pending_list(&t)).unwrap_or_default()
+    } else {
+        vec![]
+    };
     let sha1 = Command::new("sha1sum")
         .arg(path)
         .output()

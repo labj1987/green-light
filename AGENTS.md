@@ -108,11 +108,19 @@ copy of that logic.
   `mokutil`/`openssl` if missing, `ensure_signing_key` (never overwrites;
   `update-secureboot-policy --new-key`, else `dkms generate_mok`), then
   `mokutil --generate-hash` (password piped twice) into a root-only hash
-  file and `mokutil --import <der> --hash-file`. The password must never
-  reach argv or a log. Setup doesn't touch the installed driver.
-- `mokutil --test-key` says "is already in the enrollment request" for a
-  queued key; the app also matches `mokutil --list-new` SHA1 fingerprints
-  against `sha1sum` of the DER cert.
+  file, then one `mokutil --import <ders...> --hash-file`. The password
+  must never reach argv or a log. Setup doesn't touch the installed driver.
+- shim keeps ONE pending request (MokNew) with ONE password (MokAuth);
+  `mokutil --import` appends to it but replaces the password, and skips an
+  already-queued key without updating it. So setup rebuilds the whole
+  request: the certificates already waiting (parsed out of the MokNew EFI
+  variable, e.g. another app's kernel-signing key) plus this cert, minus
+  anything enrolled, under the new password (`--revoke-import`, then one
+  `--import`). A request holding non-certificate entries is left alone.
+- MokNew is root-only, so `mokutil --list-new` and `--test-key` run as the
+  user cannot see a queued key. Setup writes the queued SHA1 fingerprints to
+  `/var/lib/green-light/mok-pending` (0644); the app counts the cert as
+  pending when MokNew exists and the `sha1sum` of the DER cert is listed.
 - Never run `mokutil --import/--delete/--reset` or the privileged script
   against a real machine while developing; test helpers in a temp dir.
 
