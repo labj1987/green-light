@@ -352,3 +352,10 @@ workflows together (each checks the two agree).
   operating as root, run git commands as `alex`
   (`su -s /bin/bash alex -c '...'`) to keep authorship and file
   ownership correct.
+
+## Shared memory
+
+The owner's Claude sessions (local, cloud and chat) share notes in the Google Drive folder "Claude Memory", one doc per topic; this repo's doc is "app: green-light". If you have the Google Drive connector:
+
+- Before starting work, read that doc and the "prefs:" docs for decisions, things already tried or ruled out, and the release state.
+- After meaningful work (a release, a decision, a failed attempt worth not repeating, an open issue), update the doc. The connector can't edit a doc's text: create a replacement doc with the same title in that folder, then trash the old one. The folder's "README - how this folder works" doc has the conventions.
