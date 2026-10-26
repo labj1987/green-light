@@ -8,15 +8,15 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 
 | System | Browse |
 |---|---|
-| ![System tab showing GPU, driver, kernel, DKMS, and disk info](screenshots/system.png) | ![Browse tab showing version list with branch labels and upgrade/installed/older status](screenshots/browse.png) |
+| ![System tab showing GPU, driver, kernel module, kernel, DKMS, Secure Boot, module signing, disk space and reboot status](screenshots/system.png) | ![Browse tab showing the version list with branch labels, installed/older status, a filter and the selected version](screenshots/browse.png) |
 
 | Configure | Log |
 |---|---|
-| ![Configure tab showing selected driver, checksum, and install options](screenshots/configure.png) | ![Log tab showing driver query and version fetch output](screenshots/log.png) |
+| ![Configure tab showing the selected driver, pre-install checks and install options: DKMS, kernel module and Block Distro Driver Packages](screenshots/configure.png) | ![Log tab showing driver query and version fetch output](screenshots/log.png) |
 
 | About |
 |---|
-| ![About dialog showing app version and live system info](screenshots/about.png) |
+| ![About dialog showing the app version](screenshots/about.png) |
 
 ## What it does
 
