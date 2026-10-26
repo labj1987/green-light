@@ -1,16 +1,20 @@
-# Keeps the workflows' SHA-pinned actions current (one pull request per update, with the new
-# commit SHA and its release in the trailing comment) and the lockfile current (two weekly pull
-# requests: one for patch-level crate updates, one for minor ones).
+# Version-update pull requests are off (open-pull-requests-limit: 0 below): the owner's weekly
+# maintenance round updates the lockfile and the SHA-pinned actions (new commit SHA, its release in
+# the trailing comment) directly, so no update pull requests pile up. Dependabot security updates
+# still open pull requests. The rules below are the ones the weekly round follows, and they apply
+# again if the limit is raised.
 version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 0
     # Indirect crates are included: a gtk-rs release has to move its -sys crates with it
     # (gio 0.22.10 does not build against gio-sys 0.22.8), and a direct-only update leaves them
     # behind. Patch and minor updates are grouped separately because Dependabot counts a 0.x

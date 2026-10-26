@@ -325,7 +325,7 @@ workflows together (each checks the two agree).
    one with write access, attaches them to a GitHub Release via
    `softprops/action-gh-release`, with that version's changelog section
    as the release text. Actions in both workflows are pinned to commit
-   SHAs; Dependabot (`.github/dependabot.yml`) proposes the updates.
+   SHAs; the weekly maintenance round updates them (see `.github/dependabot.yml`).
    The release-asset glob must match both files — check it whenever the
    output filename pattern changes.
 

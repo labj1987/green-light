@@ -10,7 +10,7 @@ on:
 # (cargo, build scripts, apt packages) with a read-only token and no stored git credentials, so
 # a compromised dependency has nothing to publish with. Every action is pinned to a full commit
 # SHA: a tag such as `v3` can be moved to other code, a SHA cannot. The trailing comment names
-# the release the SHA is; Dependabot proposes the updates (.github/dependabot.yml).
+# the release the SHA is; the weekly maintenance round updates them (see .github/dependabot.yml).
 permissions:
   contents: read
 
