@@ -303,8 +303,66 @@ cert_subject_cn() { # <cert>
 }
 
 # ── Setup mode: --setup-signing ────────────────────────────────────────
-# Where the list of queued keys goes for the app (MokNew is root-only).
-STATE_DIR_SIGNING="/var/lib/green-light"
+# The list of waiting keys the apps read (MokNew itself is readable by root
+# only). It is shared: another app's signing setup rebuilds the same request
+# and writes the same list. First line "moknew-size <bytes>", MokNew's size
+# right after the import, so an app can tell when the request has changed
+# since (enrolled at boot, revoked, replaced by other means) and ignore the
+# list; then one SHA1 fingerprint (lowercase hex) per line, every key in the
+# request.
+MOK_PENDING_LIST="/var/lib/mok-pending/list"
+MOK_GUID="605dab50-e046-4300-abb6-3dd810dd8b23"
+EFI_DIR="/sys/firmware/efi"
+EFIVARS_DIR="$EFI_DIR/efivars"
+MOK_NEW="$EFIVARS_DIR/MokNew-$MOK_GUID"
+
+# MOK Manager takes 8 to 16 characters typed on a bare (US layout) keyboard
+# at boot: printable ASCII without spaces, whatever the locale.
+valid_mok_password() {
+    local LC_ALL=C
+    [[ "$1" =~ ^[!-~]{8,16}$ ]]
+}
+
+# Write the shared list for the keys just imported (<sha1>...), atomically.
+write_mok_pending_list() {
+    local dir size tmp
+    dir="${MOK_PENDING_LIST%/*}"
+    if ! size="$(stat -c %s "$MOK_NEW" 2>/dev/null)"; then
+        rm -f "$MOK_PENDING_LIST"
+        log "WARNING: mokutil reported success, but no enrollment request can be seen, so the keys may not be waiting. Set up signing again."
+        return 1
+    fi
+    mkdir -p "$dir" && chmod 755 "$dir" || return 1
+    tmp="$(mktemp "$dir/.list.XXXXXX")" || return 1
+    if { printf 'moknew-size %s\n' "$size"; printf '%s\n' "$@"; } > "$tmp" \
+            && chmod 644 "$tmp" && mv -f "$tmp" "$MOK_PENDING_LIST"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+# Before anything is decided about MokNew: on an EFI machine the EFI
+# variables must be mounted, or MokNew looks absent and mokutil sees
+# nothing (a chroot teardown can unmount them, for example). Mounted means
+# another filesystem than the EFI firmware directory's (a mount that has been
+# covered by another one is still listed in mountinfo, so that is not asked).
+efivars_mounted() {
+    local d e
+    d="$(stat -c %d "$EFIVARS_DIR" 2>/dev/null)" || return 1
+    e="$(stat -c %d "$EFI_DIR" 2>/dev/null)" || return 1
+    [[ "$d" != "$e" ]]
+}
+ensure_efivarfs() {
+    [[ -d "$EFI_DIR" ]] || return 0
+    efivars_mounted && return 0
+    log "The EFI variables are not mounted; mounting them on $EFIVARS_DIR"
+    if ! mount -t efivarfs -o nosuid,nodev,noexec efivarfs "$EFIVARS_DIR" >>"$LOGFILE" 2>&1; then
+        log "ERROR: The EFI variables are not mounted and could not be mounted on $EFIVARS_DIR, so Green Light cannot see the waiting enrollment request or check the key. Nothing was changed. Mount them (mount -t efivarfs efivarfs $EFIVARS_DIR) or reboot, then set up signing again."
+        return 1
+    fi
+}
+
 # Creates the key if needed and queues its certificate for MOK enrollment.
 # The one-time password arrives on stdin and never appears in argv or a log.
 if [[ "${1:-}" == "--setup-signing" ]]; then
@@ -318,11 +376,11 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     MOK_PASSWORD=""
     IFS= read -r MOK_PASSWORD || true
     log "==== Module signing setup started ===="
-    PASSWORD_RE='^[[:print:]]{8,16}$'
-    if [[ ! "$MOK_PASSWORD" =~ $PASSWORD_RE ]]; then
-        log "ERROR: The one-time password must be 8 to 16 printable characters."
+    if ! valid_mok_password "$MOK_PASSWORD"; then
+        log "ERROR: The one-time password must be 8 to 16 printable ASCII characters without spaces."
         exit 1
     fi
+    ensure_efivarfs || exit 1
     detect_pkg_mgr
 
     MISSING_PKGS=()
@@ -358,9 +416,6 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     # works at MOK Manager. Instead the whole request is rebuilt here: the
     # certificates already waiting (read from MokNew) plus this one, under
     # the password chosen now, and the log says so.
-    MOK_GUID="605dab50-e046-4300-abb6-3dd810dd8b23"
-    MOK_NEW="/sys/firmware/efi/efivars/MokNew-$MOK_GUID"
-    MOK_PENDING="$STATE_DIR_SIGNING/mok-pending"
     mkdir -p "$PRIV_DIR/pending"
     PENDING_RC=0
     if [[ -e "$MOK_NEW" ]]; then
@@ -377,6 +432,8 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
                 my $type = substr($data, $off, 16);
                 my ($lsize, $hsize, $ssize) = unpack("V3", substr($data, $off + 16, 12));
                 exit 2 if $lsize < 28 || $off + $lsize > length $data || $ssize < 16;
+                # The header and whole entries must fill the list exactly.
+                exit 2 if 28 + $hsize > $lsize || ($lsize - 28 - $hsize) % $ssize != 0;
                 my $e = $off + 28 + $hsize;
                 while ($e + $ssize <= $off + $lsize) {
                     if ($type eq $x509) {
@@ -402,10 +459,19 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
 
     cert_sha1() { openssl x509 -inform DER -in "$1" -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f'; }
     QUEUE_DERS=(); QUEUE_FPS=(); QUEUE_NAMES=()
-    queue_add() { # <der> <why>
-        local der="$1" why="$2" fp c cn
-        fp="$(cert_sha1 "$der")"
-        if [[ -z "$fp" ]]; then log "Skipping $der: not a readable certificate"; return 0; fi
+    queue_add() { # <der> <why> <waiting|own>
+        local der="$1" why="$2" kind="$3" fp c cn
+        fp="$(cert_sha1 "$der")" || fp=""
+        if [[ -z "$fp" ]]; then
+            # Nothing has been changed yet. A waiting entry that cannot be
+            # read would be lost by rebuilding the request: leave it alone.
+            if [[ "$kind" == waiting ]]; then
+                log "ERROR: The waiting enrollment request holds an entry that is not a readable certificate, so Green Light will not replace it. Reboot to finish it first, then set up signing again."
+            else
+                log "ERROR: Could not read the certificate $SIGN_CERT ($why). Nothing was queued."
+            fi
+            exit 1
+        fi
         for c in "${QUEUE_FPS[@]}"; do [[ "$c" == "$fp" ]] && return 0; done
         cn="$(cert_subject_cn "$der")"
         # Enrolled ("already enrolled") or trusted another way ("already in
@@ -421,13 +487,13 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     }
     for f in "$PRIV_DIR"/pending/*.der; do
         [[ -e "$f" ]] || continue
-        queue_add "$f" "already waiting for enrollment"
+        queue_add "$f" "already waiting for enrollment" waiting
     done
-    queue_add "$CERT_DER" "this machine's module-signing key"
+    queue_add "$CERT_DER" "this machine's module-signing key" own
 
     if [[ ${#QUEUE_DERS[@]} -eq 0 ]]; then
         if [[ -e "$MOK_NEW" ]]; then mokutil --revoke-import >>"$LOGFILE" 2>&1 || true; fi
-        rm -f "$MOK_PENDING"
+        rm -f "$MOK_PENDING_LIST"
         log "The certificate is already enrolled; nothing to do."
         log "==== Module signing setup done ===="
         exit 0
@@ -451,15 +517,23 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
         exit 1
     fi
     if ! mokutil --import "${QUEUE_DERS[@]}" --hash-file "$HASH_FILE" >>"$LOGFILE" 2>&1; then
-        log "ERROR: mokutil --import failed (see $LOGFILE)."
-        exit 1
+        log "mokutil --import failed; trying once more"
+        if ! mokutil --import "${QUEUE_DERS[@]}" --hash-file "$HASH_FILE" >>"$LOGFILE" 2>&1; then
+            # The earlier request is gone. Drop whatever part of the new one
+            # mokutil may have written, so that nothing at all waits and no
+            # list claims otherwise.
+            if [[ -e "$MOK_NEW" ]]; then mokutil --revoke-import >>"$LOGFILE" 2>&1 || true; fi
+            rm -f "$MOK_PENDING_LIST"
+            log "ERROR: mokutil --import failed twice (see $LOGFILE). None of these keys is waiting for enrollment now:"
+            for i in "${!QUEUE_DERS[@]}"; do
+                log "  ${QUEUE_NAMES[$i]} (SHA1 ${QUEUE_FPS[$i]})"
+            done
+            log "Set up signing again to queue them all."
+            exit 1
+        fi
     fi
     rm -f "$HASH_FILE"
-    mkdir -p "$STATE_DIR_SIGNING"
-    chmod 755 "$STATE_DIR_SIGNING"
-    printf '%s\n' "${QUEUE_FPS[@]}" > "$PRIV_DIR/fps"
-    chmod 644 "$PRIV_DIR/fps"
-    mv -f "$PRIV_DIR/fps" "$MOK_PENDING" || log "WARNING: could not record the queued keys for the app"
+    write_mok_pending_list "${QUEUE_FPS[@]}" || log "WARNING: could not record the queued keys for the apps"
     NAMES_JOINED="$(printf '%s, ' "${QUEUE_NAMES[@]}")"
     log "Enrollment queued for ${#QUEUE_DERS[@]} key(s): ${NAMES_JOINED%, }."
     log "On the next reboot, choose Enroll MOK at the blue MOK Manager screen and type the one-time password you chose here. That one password enrolls all of these keys; a password chosen earlier, here or in another app, no longer works."

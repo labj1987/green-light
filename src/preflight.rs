@@ -471,6 +471,9 @@ pub enum SigningKeyState {
     PendingEnrollment(String),
     /// The certificate is enrolled in the MOK list.
     Enrolled(String),
+    /// The certificate exists, but this EFI machine's EFI variables are not
+    /// mounted, so its enrollment can't be read.
+    EfiVarsNotMounted(String),
     /// The certificate exists but mokutil could not say whether it is
     /// enrolled (mokutil missing, or no EFI variables).
     Untested(String),
@@ -484,7 +487,7 @@ impl SigningKeyState {
     pub fn cert_path(&self) -> Option<&str> {
         match self {
             Self::NotEnrolled(p) | Self::PendingEnrollment(p) | Self::Enrolled(p)
-            | Self::Untested(p) => Some(p),
+            | Self::EfiVarsNotMounted(p) | Self::Untested(p) => Some(p),
             Self::NoKey | Self::Incomplete(..) | Self::Unknown => None,
         }
     }
@@ -503,13 +506,19 @@ pub enum MokTestResult {
     /// Queued: "is already in the enrollment request".
     Pending,
     NotEnrolled,
+    /// "EFI variables are not supported" on a machine that booted with EFI
+    /// (/sys/firmware/efi exists): efivarfs is not mounted.
+    EfiVarsNotMounted,
 }
 
-/// Interpret `mokutil --test-key <file>` output. `None` for anything else,
-/// such as "EFI variables are not supported" or a non-DER certificate.
-pub fn parse_mok_test_key(output: &str) -> Option<MokTestResult> {
+/// Interpret `mokutil --test-key <file>` output (stdout and stderr).
+/// `efi_firmware` is whether /sys/firmware/efi exists. `None` for anything
+/// else, such as a non-DER certificate or a machine without EFI.
+pub fn parse_mok_test_key(output: &str, efi_firmware: bool) -> Option<MokTestResult> {
     let o = output.to_lowercase();
-    if o.contains("already in the enrollment request") {
+    if o.contains("efi variables are not supported") {
+        efi_firmware.then_some(MokTestResult::EfiVarsNotMounted)
+    } else if o.contains("already in the enrollment request") {
         Some(MokTestResult::Pending)
     } else if o.contains("already enrolled")
         || o.contains("already in db")
@@ -523,36 +532,55 @@ pub fn parse_mok_test_key(output: &str) -> Option<MokTestResult> {
     }
 }
 
-/// SHA1 fingerprints (lowercase hex, no colons) of the keys the last
-/// signing setup queued, from the list the privileged script writes to
-/// /var/lib/green-light/mok-pending (one per line). `mokutil --list-new`
-/// cannot tell: the waiting request (MokNew) is readable by root only.
-pub fn parse_pending_list(text: &str) -> Vec<String> {
-    text.lines()
+/// SHA1 fingerprints (lowercase hex, no colons) from the shared list of
+/// waiting keys that the signing setup of this app or another one writes
+/// (`mokutil --list-new` cannot tell: the waiting request, MokNew, is
+/// readable by root only). The first line is `moknew-size <bytes>`, MokNew's
+/// size right after that setup queued the keys; `moknew_size` is its size
+/// now, `None` when nothing is waiting. Any other size means the request
+/// changed since (enrolled at boot, revoked, replaced by other means): the
+/// list is stale and gives nothing.
+pub fn parse_pending_list(text: &str, moknew_size: Option<u64>) -> Vec<String> {
+    let mut lines = text.lines();
+    let recorded = lines
+        .next()
+        .and_then(|l| l.trim().strip_prefix("moknew-size "))
+        .and_then(|n| n.trim().parse::<u64>().ok());
+    if recorded.is_none() || recorded != moknew_size {
+        return vec![];
+    }
+    lines
         .map(|l| l.chars().filter(char::is_ascii_hexdigit).collect::<String>().to_lowercase())
         .filter(|f| f.len() == 40)
         .collect()
 }
 
-/// State of the certificate at `path` from the mokutil results: its SHA1
-/// among the pending fingerprints means queued, otherwise the
-/// `--test-key` answer decides. `cert_sha1` is the SHA1 of the certificate
-/// file, which equals mokutil's fingerprint for a DER certificate. `None`
-/// when mokutil gave no usable answer.
+/// State of the certificate at `path` from the mokutil results. Enrolled
+/// (or otherwise trusted) per `--test-key` wins; then its SHA1 among the
+/// pending fingerprints means queued; otherwise the `--test-key` answer
+/// decides. `cert_sha1` is the SHA1 of the certificate file, which equals
+/// mokutil's fingerprint for a DER certificate. `None` when mokutil gave no
+/// usable answer and the key isn't listed.
 pub fn classify_signing_key(
     path: &str,
     test_key_output: &str,
+    efi_firmware: bool,
     pending: &[String],
     cert_sha1: Option<&str>,
 ) -> Option<SigningKeyState> {
-    if cert_sha1.is_some_and(|f| pending.iter().any(|p| p.eq_ignore_ascii_case(f))) {
-        return Some(SigningKeyState::PendingEnrollment(path.to_string()));
-    }
     let path = path.to_string();
-    Some(match parse_mok_test_key(test_key_output)? {
+    let test = parse_mok_test_key(test_key_output, efi_firmware);
+    if test == Some(MokTestResult::Trusted) {
+        return Some(SigningKeyState::Enrolled(path));
+    }
+    if cert_sha1.is_some_and(|f| pending.iter().any(|p| p.eq_ignore_ascii_case(f))) {
+        return Some(SigningKeyState::PendingEnrollment(path));
+    }
+    Some(match test? {
         MokTestResult::Trusted => SigningKeyState::Enrolled(path),
         MokTestResult::Pending => SigningKeyState::PendingEnrollment(path),
         MokTestResult::NotEnrolled => SigningKeyState::NotEnrolled(path),
+        MokTestResult::EfiVarsNotMounted => SigningKeyState::EfiVarsNotMounted(path),
     })
 }
 
@@ -591,6 +619,10 @@ pub fn signing_summary(key: &SigningKeyState, module: &ModuleSignature) -> Strin
             format!("Key {p} is queued; enroll it at the MOK Manager screen on the next reboot")
         }
         SigningKeyState::Enrolled(p) => format!("Key {p} is enrolled"),
+        SigningKeyState::EfiVarsNotMounted(p) => format!(
+            "Key {p}: the EFI variables are not mounted, so its enrollment can't be read. \
+             Mount them (sudo mount -t efivarfs efivarfs /sys/firmware/efi/efivars) or reboot"
+        ),
         SigningKeyState::Untested(p) => format!("Key {p} (enrollment unknown)"),
         SigningKeyState::Unknown => "Unknown".to_string(),
     };
@@ -605,15 +637,20 @@ pub fn signing_summary(key: &SigningKeyState, module: &ModuleSignature) -> Strin
     key_text + &module_text
 }
 
+/// The password rule as the Set Up Signing dialog first shows it.
+pub const MOK_PASSWORD_HINT: &str =
+    "Use 8 to 16 characters: letters, digits and standard symbols, without spaces.";
+
 /// Check the one-time MOK password typed twice. MOK Manager takes 8-16
-/// characters typed on a bare keyboard, so only printable ASCII is allowed.
+/// characters typed on a bare (US layout) keyboard, so only printable ASCII
+/// without spaces is allowed (the install script checks the same).
 pub fn validate_mok_password(first: &str, second: &str) -> Result<(), String> {
     let len = first.chars().count();
     if !(8..=16).contains(&len) {
-        return Err("Use 8 to 16 characters.".to_string());
+        return Err(MOK_PASSWORD_HINT.to_string());
     }
-    if !first.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
-        return Err("Use only letters, digits, spaces and standard symbols.".to_string());
+    if !first.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("Use only letters, digits and standard symbols, without spaces.".to_string());
     }
     if first != second {
         return Err("The passwords do not match.".to_string());
@@ -631,6 +668,11 @@ pub fn secure_boot_summary(sb: &crate::system::SecureBootStatus, key: &SigningKe
         }
         (S::Enabled, SigningKeyState::PendingEnrollment(_)) => {
             "Enabled — the module-signing key is waiting for enrollment at the next reboot".to_string()
+        }
+        (S::Enabled, SigningKeyState::EfiVarsNotMounted(_)) => {
+            "Enabled — the EFI variables are not mounted, so the module-signing key's enrollment \
+             can't be checked"
+                .to_string()
         }
         (S::Enabled, SigningKeyState::Untested(_) | SigningKeyState::Unknown) => {
             "Enabled — could not check whether the module-signing key is enrolled".to_string()
@@ -681,6 +723,11 @@ pub fn secure_boot_advice(
         SigningKeyState::NotEnrolled(path) => format!(
             "Enabled, and the module-signing key {path} is not enrolled, so modules signed \
              with it are not trusted yet. Use Set Up Signing on the System tab."
+        ),
+        SigningKeyState::EfiVarsNotMounted(path) => format!(
+            "Enabled, but the EFI variables are not mounted, so Green Light can't check \
+             whether the module-signing key {path} is enrolled. Mount them (sudo mount -t \
+             efivarfs efivarfs /sys/firmware/efi/efivars) or reboot."
         ),
         SigningKeyState::Untested(path) => format!(
             "Enabled. Could not check whether the module-signing key {path} is enrolled. \
@@ -831,16 +878,19 @@ mod tests {
     #[test]
     fn mokutil_output() {
         use MokTestResult::*;
-        assert_eq!(parse_mok_test_key("/var/lib/dkms/mok.pub is already enrolled\n"), Some(Trusted));
-        assert_eq!(parse_mok_test_key("/c.der is already in the built-in trusted keyring\n"), Some(Trusted));
-        assert_eq!(parse_mok_test_key("/var/lib/dkms/mok.pub is not enrolled\n"), Some(NotEnrolled));
+        assert_eq!(parse_mok_test_key("/var/lib/dkms/mok.pub is already enrolled\n", true), Some(Trusted));
+        assert_eq!(parse_mok_test_key("/c.der is already in the built-in trusted keyring\n", true), Some(Trusted));
+        assert_eq!(parse_mok_test_key("/var/lib/dkms/mok.pub is not enrolled\n", true), Some(NotEnrolled));
         assert_eq!(
-            parse_mok_test_key("/c.der is already in the enrollment request\n"),
+            parse_mok_test_key("/c.der is already in the enrollment request\n", true),
             Some(Pending)
         );
-        assert_eq!(parse_mok_test_key("EFI variables are not supported"), None);
+        // On an EFI machine this means efivarfs is not mounted; without EFI
+        // firmware there is nothing to read.
+        assert_eq!(parse_mok_test_key("EFI variables are not supported on this system\n", true), Some(EfiVarsNotMounted));
+        assert_eq!(parse_mok_test_key("EFI variables are not supported on this system\n", false), None);
         assert_eq!(
-            parse_mok_test_key("Abort!!! /c.pem is not a valid x509 certificate in DER format"),
+            parse_mok_test_key("Abort!!! /c.pem is not a valid x509 certificate in DER format", true),
             None
         );
     }
@@ -1091,35 +1141,53 @@ mod tests {
 
     #[test]
     fn mok_pending_fingerprints() {
-        let out = "5c9cab0123456789abcdef0123456789abcdef01\n43:E4:F8:24:5B:73:F1:34:BF:13:C1:DB:E6:30:01:52:7C:7B:09:05\nnot a fingerprint\n";
-        let fprs = parse_pending_list(out);
+        let out = "moknew-size 2052\n5c9cab0123456789abcdef0123456789abcdef01\n43:E4:F8:24:5B:73:F1:34:BF:13:C1:DB:E6:30:01:52:7C:7B:09:05\nnot a fingerprint\n";
+        let fprs = parse_pending_list(out, Some(2052));
         assert_eq!(
             fprs,
             vec!["5c9cab0123456789abcdef0123456789abcdef01".to_string(), "43e4f8245b73f134bf13c1dbe63001527c7b0905".to_string()]
         );
-        assert!(parse_pending_list("").is_empty());
+        // Valid only while MokNew exists with the size recorded at the import.
+        assert!(parse_pending_list(out, Some(2053)).is_empty(), "request changed since: stale");
+        assert!(parse_pending_list(out, None).is_empty(), "no request waiting: stale");
+        // A list without the size line, or with a damaged one, is never trusted.
+        assert!(parse_pending_list("5c9cab0123456789abcdef0123456789abcdef01\n", Some(2052)).is_empty());
+        assert!(parse_pending_list("moknew-size\n5c9cab0123456789abcdef0123456789abcdef01\n", Some(2052)).is_empty());
+        assert!(parse_pending_list("", Some(0)).is_empty());
+        assert!(parse_pending_list("moknew-size 7\n", Some(7)).is_empty());
 
         let path = "/var/lib/dkms/mok.pub";
         let sha = "5c9cab0123456789abcdef0123456789abcdef01";
         let enrolled_out = "/var/lib/dkms/mok.pub is already enrolled\n";
-        // Queued keys also test as "already enrolled"; the pending list decides.
+        // Enrolled wins over a list entry: the key was enrolled at boot.
         assert_eq!(
-            classify_signing_key(path, enrolled_out, &fprs, Some(sha)),
-            Some(SigningKeyState::PendingEnrollment(path.into()))
-        );
-        assert_eq!(
-            classify_signing_key(path, enrolled_out, &[], Some(sha)),
+            classify_signing_key(path, enrolled_out, true, &fprs, Some(sha)),
             Some(SigningKeyState::Enrolled(path.into()))
         );
         assert_eq!(
-            classify_signing_key(path, "/var/lib/dkms/mok.pub is not enrolled", &fprs, None),
+            classify_signing_key(path, enrolled_out, true, &[], Some(sha)),
+            Some(SigningKeyState::Enrolled(path.into()))
+        );
+        // Listed and not enrolled: queued (a plain user's --test-key can't see MokNew).
+        assert_eq!(
+            classify_signing_key(path, "/var/lib/dkms/mok.pub is not enrolled", true, &fprs, Some(sha)),
+            Some(SigningKeyState::PendingEnrollment(path.into()))
+        );
+        assert_eq!(
+            classify_signing_key(path, "/var/lib/dkms/mok.pub is not enrolled", true, &fprs, None),
             Some(SigningKeyState::NotEnrolled(path.into()))
         );
         assert_eq!(
-            classify_signing_key(path, "/var/lib/dkms/mok.pub is already in the enrollment request", &[], None),
+            classify_signing_key(path, "/var/lib/dkms/mok.pub is already in the enrollment request", true, &[], None),
             Some(SigningKeyState::PendingEnrollment(path.into()))
         );
-        assert_eq!(classify_signing_key(path, "EFI variables are not supported", &[], None), None);
+        assert_eq!(
+            classify_signing_key(path, "EFI variables are not supported on this system", true, &[], Some(sha)),
+            Some(SigningKeyState::EfiVarsNotMounted(path.into()))
+        );
+        assert_eq!(classify_signing_key(path, "EFI variables are not supported", false, &[], None), None);
+        assert_eq!(classify_signing_key(path, "mokutil: command not found", true, &fprs, Some(sha)),
+            Some(SigningKeyState::PendingEnrollment(path.into())));
     }
 
     #[test]
@@ -1130,6 +1198,8 @@ mod tests {
         assert!(!SigningKeyState::PendingEnrollment("/c".into()).setup_needed());
         assert_eq!(SigningKeyState::NoKey.cert_path(), None);
         assert_eq!(SigningKeyState::Untested("/c".into()).cert_path(), Some("/c"));
+        assert_eq!(SigningKeyState::EfiVarsNotMounted("/c".into()).cert_path(), Some("/c"));
+        assert!(SigningKeyState::EfiVarsNotMounted("/c".into()).setup_needed());
     }
 
     #[test]
@@ -1161,5 +1231,26 @@ mod tests {
         assert!(validate_mok_password("abcd1234", "abcd1235").is_err());
         assert!(validate_mok_password("pässwörd1", "pässwörd1").is_err());
         assert!(validate_mok_password("abcd\n1234", "abcd\n1234").is_err());
+        // Same rule as the other apps and the install script: no spaces.
+        assert!(validate_mok_password("has space1", "has space1").is_err());
+        assert!(validate_mok_password("tab\there12", "tab\there12").is_err());
+        assert!(validate_mok_password("Abc123!@#$%^&*()", "Abc123!@#$%^&*()").is_ok());
+        assert!(validate_mok_password("p4ssw0rd~", "p4ssw0rd~").is_ok());
+    }
+
+    #[test]
+    fn mok_password_rule_matches_the_script() {
+        let script = include_str!("../scripts/privileged-install.sh");
+        assert!(script.contains("local LC_ALL=C\n    [[ \"$1\" =~ ^[!-~]{8,16}$ ]]"));
+        assert!(MOK_PASSWORD_HINT.contains("without spaces"));
+    }
+
+    #[test]
+    fn efi_variables_not_mounted_is_explained() {
+        let key = SigningKeyState::EfiVarsNotMounted("/c.der".into());
+        assert!(signing_summary(&key, &ModuleSignature::Missing).contains("EFI variables are not mounted"));
+        let on = SecureBootStatus::Enabled;
+        assert!(secure_boot_summary(&on, &key).contains("not mounted"));
+        assert!(secure_boot_advice(&on, &key, None, true).unwrap().contains("mount -t efivarfs"));
     }
 }

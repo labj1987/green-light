@@ -8,7 +8,7 @@ use crate::install::{
 use crate::preflight::{
     conflict_summary, module_hint, secure_boot_advice, secure_boot_summary, signing_summary,
     validate_module_choice,
-    validate_mok_password, ModuleChoice,
+    validate_mok_password, ModuleChoice, MOK_PASSWORD_HINT,
 };
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
 use crate::versions::{
@@ -809,7 +809,7 @@ pub fn build_ui(app: &Application) {
                 .show_peek_icon(true)
                 .build();
             let hint = Label::builder()
-                .label("Use 8 to 16 characters.")
+                .label(MOK_PASSWORD_HINT)
                 .wrap(true)
                 .xalign(0.0)
                 .build();

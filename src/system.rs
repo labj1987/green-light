@@ -191,17 +191,20 @@ fn file_exists(path: &str) -> Option<bool> {
 }
 
 const MOK_NEW: &str = "/sys/firmware/efi/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23";
-const MOK_PENDING_LIST: &str = "/var/lib/green-light/mok-pending";
+/// The shared list of waiting keys, written by this app's signing setup or
+/// another app's (they rebuild the same request).
+const MOK_PENDING_LIST: &str = "/var/lib/mok-pending/list";
 
 /// Enrollment state of the certificate at `path`.
 fn cert_enrollment(path: &str) -> SigningKeyState {
-    // Pending: an enrollment request exists and the last signing setup
-    // listed this key in it (MokNew itself is readable by root only).
-    let pending = if std::path::Path::new(MOK_NEW).exists() {
-        std::fs::read_to_string(MOK_PENDING_LIST).map(|t| parse_pending_list(&t)).unwrap_or_default()
-    } else {
-        vec![]
-    };
+    // Pending: an enrollment request exists, unchanged since the last
+    // signing setup, and that setup listed this key in it (MokNew itself is
+    // readable by root only, but a plain user can stat it).
+    let moknew_size = std::fs::metadata(MOK_NEW).ok().map(|m| m.len());
+    let pending = std::fs::read_to_string(MOK_PENDING_LIST)
+        .map(|t| parse_pending_list(&t, moknew_size))
+        .unwrap_or_default();
+    let efi_firmware = std::path::Path::new("/sys/firmware/efi").exists();
     let sha1 = Command::new("sha1sum")
         .arg(path)
         .output()
@@ -211,7 +214,7 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
             String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string)
         });
     command_text("mokutil", &["--test-key", path])
-        .and_then(|t| classify_signing_key(path, &t, &pending, sha1.as_deref()))
+        .and_then(|t| classify_signing_key(path, &t, efi_firmware, &pending, sha1.as_deref()))
         .unwrap_or_else(|| SigningKeyState::Untested(path.to_string()))
 }
 

@@ -1184,24 +1184,60 @@ mok_case() {   # sets up the tools, a module-signing key and an efivars dir
     # A tmpfs over /sys/firmware: the efivars path exists in the sandbox even on
     # machines without EFI (CI runners).
     SANDBOX_EXTRA=(--tmpfs /sys/firmware --bind "$T/efivars" /sys/firmware/efi/efivars)
+    # --import: records the subjects and writes a MokNew holding the
+    # certificates; $GLT/import-fails: how many imports fail before one works.
     stub mokutil 'case "$1" in
   --test-key) if [[ -e "$GLT/enrolled" ]]; then echo "$2 is already enrolled"; else echo "$2 is not enrolled"; fi ;;
   --generate-hash) read -r a; read -r b; printf "\x246\x24salt\x24hash\n" ;;
   --revoke-import) rm -f /sys/firmware/efi/efivars/MokNew-* ;;
-  --import) shift; for f in "$@"; do [[ "$f" == --hash-file ]] && break; openssl x509 -inform DER -in "$f" -noout -subject -nameopt RFC2253 >> "$GLT/imported"; done ;;
+  --import)
+    if [[ -s "$GLT/import-fails" ]] && (( $(cat "$GLT/import-fails") > 0 )); then
+      echo $(( $(cat "$GLT/import-fails") - 1 )) > "$GLT/import-fails"; exit 1
+    fi
+    shift; files=()
+    for f in "$@"; do [[ "$f" == --hash-file ]] && break; files+=("$f"); openssl x509 -inform DER -in "$f" -noout -subject -nameopt RFC2253 >> "$GLT/imported"; done
+    { printf "attr"; cat "${files[@]}"; } > /sys/firmware/efi/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23 ;;
 esac'
+    stub mount 'exit "$(cat "$GLT/mount-rc" 2>/dev/null || echo 0)"'
 }
-write_moknew() {   # <type: x509|sha256> <der>
+MOKNEW_NAME="MokNew-605dab50-e046-4300-abb6-3dd810dd8b23"
+write_moknew() {   # <type: x509|sha256> <der>...: an efivarfs MokNew with one list per file
+    local kind="$1"; shift
     perl -e '
-        my ($kind, $f) = @ARGV;
+        my $kind = shift;
         my %g = (x509 => "a159c0a5e494a74a87b5ab155c2bf072", sha256 => "2616c4c14c509240aca941f936934328");
+        my $out = pack("V", 7);
+        for my $f (@ARGV) {
+            open(my $h, "<:raw", $f) or die; local $/; my $d = <$h>;
+            my $entry = ("\x11" x 16) . $d;
+            $out .= pack("H*", $g{$kind}) . pack("V3", 28 + length $entry, 0, length $entry) . $entry;
+        }
+        binmode STDOUT; print $out;
+    ' "$kind" "$@" > "$T/efivars/$MOKNEW_NAME"
+}
+# One x509 list whose sizes are off: <header size> <extra bytes in the list>.
+malformed_moknew() {
+    perl -e '
+        my ($hsize, $adj, $f) = @ARGV;
         open(my $h, "<:raw", $f) or die; local $/; my $d = <$h>;
         my $entry = ("\x11" x 16) . $d;
         binmode STDOUT;
-        print pack("V", 7) . pack("H*", $g{$kind}) . pack("V3", 28 + length $entry, 0, length $entry) . $entry;
-    ' "$1" "$2" > "$T/efivars/MokNew-605dab50-e046-4300-abb6-3dd810dd8b23"
+        print pack("V", 7) . pack("H*", "a159c0a5e494a74a87b5ab155c2bf072")
+            . pack("V3", 28 + length($entry) + $adj, $hsize, length $entry) . $entry . ("\0" x $adj);
+    ' "$1" "$2" "$T/other/c.der" > "$T/efivars/$MOKNEW_NAME"
 }
 fpr() { openssl x509 -inform DER -in "$1" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f'; }
+# Signing setup with <password> on stdin; sets RC and OUT (this run's log).
+setup_signing() {
+    local before
+    before="$(log_size)"
+    RC=0
+    sandbox "$T/bin/bash" -c 'printf "%s\n" "$1" | "$0" --setup-signing' "$SCRIPT" "$1" > /dev/null 2>&1 || RC=$?
+    OUT="$(tail -c +"$((before + 1))" "$T/var/log/green-light.log" 2>/dev/null)"
+}
+list_fps() { tail -n +2 "$T/var/lib/mok-pending/list" | sort | tr '\n' ' '; }
+fps_of() { local f; for f in "$@"; do fpr "$f"; done | sort | tr '\n' ' '; }
+list_size_ok() { [[ "$(head -1 "$T/var/lib/mok-pending/list")" == "moknew-size $(stat -c %s "$T/efivars/$MOKNEW_NAME")" ]]; }
 
 begin "signing setup carries a key another tool queued into one request"
 mok_case
@@ -1216,9 +1252,12 @@ expect_out "That one password enrolls all of these keys"
 expect_call "mokutil --revoke-import"
 [[ "$(sort "$T/imported" | tr '\n' '|')" == "subject=CN=Other app key|subject=CN=Test Module Signing key|" ]] \
     || fail "imported [$(tr '\n' '|' < "$T/imported" 2>/dev/null)]"
-[[ "$(sort "$T/var/lib/green-light/mok-pending" | tr '\n' ' ')" == "$(printf '%s\n' "$(fpr "$T/other/c.der")" "$(fpr "$T/var/lib/shim-signed/mok/MOK.der")" | sort | tr '\n' ' ')" ]] \
-    || fail "the app's pending list is wrong"
-[[ "$(stat -c %a "$T/var/lib/green-light/mok-pending")" == 644 ]] || fail "the pending list must be readable by the app"
+[[ "$(list_fps)" == "$(fps_of "$T/other/c.der" "$T/var/lib/shim-signed/mok/MOK.der")" ]] \
+    || fail "the shared pending list is wrong: $(cat "$T/var/lib/mok-pending/list" 2>/dev/null)"
+list_size_ok || fail "the shared list must record MokNew's size: $(head -1 "$T/var/lib/mok-pending/list" 2>/dev/null)"
+[[ "$(stat -c %a "$T/var/lib/mok-pending/list")" == 644 && "$(stat -c %a "$T/var/lib/mok-pending")" == 755 ]] \
+    || fail "the shared list must be readable by the apps"
+[[ -z "$(compgen -G "$T/var/lib/mok-pending/.list.*")" ]] || fail "a temp list was left behind"
 grep -q pass1234 "$T/calls" && fail "the password reached an argument list"
 end
 
@@ -1242,6 +1281,123 @@ OUT="$(cat "$T/var/log/green-light.log")"
 expect_rc 0
 expect_out "already enrolled; nothing to do"
 expect_no_call_like "^mokutil --import"
+end
+
+begin "signing setup with every key enrolled removes the shared list"
+mok_case
+write_moknew x509 "$T/other/c.der"
+mkdir -p "$T/var/lib/mok-pending"; printf 'moknew-size 1\n%s\n' "$(fpr "$T/other/c.der")" > "$T/var/lib/mok-pending/list"
+touch "$T/enrolled"
+setup_signing pass5678
+expect_rc 0
+expect_no_file "$T/var/lib/mok-pending/list"
+end
+
+begin "signing setup carries over several signature lists"
+mok_case
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=Third key" \
+    -keyout "$T/other/k3.pem" -outform DER -out "$T/other/c3.der" >/dev/null 2>&1
+write_moknew x509 "$T/other/c.der" "$T/other/c3.der"
+setup_signing pass1234
+expect_rc 0
+expect_out "To enroll: Other app key (already waiting for enrollment)"
+expect_out "To enroll: Third key (already waiting for enrollment)"
+[[ "$(sort "$T/imported" | tr '\n' '|')" == "subject=CN=Other app key|subject=CN=Test Module Signing key|subject=CN=Third key|" ]] \
+    || fail "imported [$(tr '\n' '|' < "$T/imported" 2>/dev/null)]"
+[[ "$(list_fps)" == "$(fps_of "$T/other/c.der" "$T/other/c3.der" "$T/var/lib/shim-signed/mok/MOK.der")" ]] \
+    || fail "the shared list should hold all three keys"
+list_size_ok || fail "the shared list must record MokNew's size"
+end
+
+begin "signing setup refuses a malformed waiting request and leaves it alone"
+mok_case
+for sizes in "4096 0" "0 5"; do
+    # shellcheck disable=SC2086  # two arguments
+    malformed_moknew $sizes
+    cp "$T/efivars/$MOKNEW_NAME" "$T/moknew-before"
+    : > "$T/calls"
+    setup_signing pass5678
+    expect_rc 1
+    expect_out "The waiting enrollment request could not be read"
+    expect_no_call_like "^mokutil --(revoke-)?import"
+    cmp -s "$T/efivars/$MOKNEW_NAME" "$T/moknew-before" || fail "the malformed request ($sizes) was changed"
+done
+end
+
+begin "signing setup leaves a request with an unreadable certificate alone"
+mok_case
+printf 'not a certificate' > "$T/other/junk.der"
+write_moknew x509 "$T/other/c.der" "$T/other/junk.der"
+setup_signing pass5678
+expect_rc 1
+expect_out "holds an entry that is not a readable certificate, so Green Light will not replace it"
+expect_no_call_like "^mokutil --(revoke-)?import"
+expect_file "$T/efivars/$MOKNEW_NAME"
+end
+
+begin "signing setup retries a failed import once"
+mok_case
+write_moknew x509 "$T/other/c.der"
+echo 1 > "$T/import-fails"
+setup_signing pass1234
+expect_rc 0
+expect_out "mokutil --import failed; trying once more"
+[[ "$(grep -c '^mokutil --import' "$T/calls")" == 2 ]] || fail "expected two import calls"
+[[ "$(list_fps)" == "$(fps_of "$T/other/c.der" "$T/var/lib/shim-signed/mok/MOK.der")" ]] || fail "the shared list was not written after the retry"
+list_size_ok || fail "the shared list must record MokNew's size after the retry"
+end
+
+begin "signing setup whose import fails twice names every key no longer queued"
+mok_case
+write_moknew x509 "$T/other/c.der"
+mkdir -p "$T/var/lib/mok-pending"; printf 'moknew-size 1\n%s\n' "$(fpr "$T/other/c.der")" > "$T/var/lib/mok-pending/list"
+echo 2 > "$T/import-fails"
+setup_signing pass1234
+expect_rc 1
+[[ "$(grep -c '^mokutil --import' "$T/calls")" == 2 ]] || fail "the import should be tried exactly twice"
+expect_out "None of these keys is waiting for enrollment now:"
+expect_out "Other app key (SHA1 $(fpr "$T/other/c.der"))"
+expect_out "Test Module Signing key (SHA1 $(fpr "$T/var/lib/shim-signed/mok/MOK.der"))"
+expect_out "Set up signing again to queue them all."
+expect_no_file "$T/var/lib/mok-pending/list"
+expect_no_file "$T/efivars/$MOKNEW_NAME"
+end
+
+begin "signing setup mounts the EFI variables when they are not mounted"
+mok_case
+SANDBOX_EXTRA=(--tmpfs /sys/firmware --dir /sys/firmware/efi/efivars)
+echo 32 > "$T/mount-rc"
+setup_signing pass1234
+expect_rc 1
+expect_call "mount -t efivarfs -o nosuid,nodev,noexec efivarfs /sys/firmware/efi/efivars"
+expect_out "The EFI variables are not mounted and could not be mounted"
+expect_no_call_like "^mokutil"
+echo 0 > "$T/mount-rc"
+: > "$T/calls"
+setup_signing pass1234
+expect_call "mount -t efivarfs -o nosuid,nodev,noexec efivarfs /sys/firmware/efi/efivars"
+expect_out "The EFI variables are not mounted; mounting them"
+expect_call_like "^mokutil --import"
+end
+
+begin "signing setup does not mount over mounted EFI variables"
+mok_case
+setup_signing pass1234
+expect_rc 0
+expect_no_call_like "^mount"
+end
+
+begin "signing setup takes only 8 to 16 printable ASCII characters without spaces"
+mok_case
+for pw in "pass word1" "pässwörd1" "short" "seventeen-chars-x" $'tab\there1'; do
+    : > "$T/calls"
+    setup_signing "$pw"
+    expect_rc 1
+    expect_out "must be 8 to 16 printable ASCII characters without spaces"
+    expect_no_call_like "^mokutil"
+done
+setup_signing 'Abc123!@#$%^&*()'
+expect_rc 0
 end
 
 begin "signing setup leaves a waiting request it cannot carry over alone"

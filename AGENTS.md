@@ -104,7 +104,12 @@ copy of that logic.
   key can't be passed to nvidia-installer, so a non-DKMS install with one
   is unsigned; the Secure Boot advice says to turn on DKMS. Step 6b
   compares `modinfo -F signer` with the cert's subject CN, report-only.
-- `--setup-signing` (first argument): password from stdin, installs
+- `--setup-signing` (first argument): password from stdin (8-16 printable
+  ASCII, no spaces, checked under `LC_ALL=C`; `validate_mok_password` is the
+  app's copy and a test compares them), mounts efivarfs on
+  `/sys/firmware/efi/efivars` when the EFI firmware dir exists and efivars
+  is on the same filesystem as it (not mounted; abort if the mount fails),
+  installs
   `mokutil`/`openssl` if missing, `ensure_signing_key` (never overwrites;
   `update-secureboot-policy --new-key`, else `dkms generate_mok`), then
   `mokutil --generate-hash` (password piped twice) into a root-only hash
@@ -116,11 +121,23 @@ copy of that logic.
   request: the certificates already waiting (parsed out of the MokNew EFI
   variable, e.g. another app's kernel-signing key) plus this cert, minus
   anything enrolled, under the new password (`--revoke-import`, then one
-  `--import`). A request holding non-certificate entries is left alone.
+  `--import`). A request holding non-certificate entries, an entry openssl
+  can't read, or a signature list whose sizes don't add up (perl parser
+  exit 2) is left alone, before anything is revoked. A failed `--import`
+  is retried once with the same hash file; if it fails again, whatever is
+  left in MokNew is revoked, the shared list removed, and every key logged
+  with CN and SHA1 as no longer waiting.
 - MokNew is root-only, so `mokutil --list-new` and `--test-key` run as the
-  user cannot see a queued key. Setup writes the queued SHA1 fingerprints to
-  `/var/lib/green-light/mok-pending` (0644); the app counts the cert as
-  pending when MokNew exists and the `sha1sum` of the DER cert is listed.
+  user cannot see a queued key. The list of waiting keys is shared with
+  other apps that rebuild the same request: `/var/lib/mok-pending/list`
+  (dir 0755, file 0644, written tmp + mv). First line `moknew-size <bytes>`
+  (`stat -c %s` of MokNew right after the import), then one lowercase SHA1
+  per line, every key in the request. Rewritten after every successful
+  import, removed when nothing is queued. The app (`parse_pending_list`)
+  trusts it only while MokNew exists with that size; `classify_signing_key`
+  lets `--test-key`'s enrolled answer win over the list, and reports
+  "EFI variables are not supported" on an EFI machine as
+  `EfiVarsNotMounted`. Keep the format identical in every app that writes it.
 - Never run `mokutil --import/--delete/--reset` or the privileged script
   against a real machine while developing; test helpers in a temp dir.
 

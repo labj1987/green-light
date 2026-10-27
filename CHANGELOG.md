@@ -5,6 +5,29 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.4 — 2026-10-27
+
+**Fixed: keys enrolled at boot still showing as waiting**, and this app and other apps that
+queue keys in the same enrollment request disagreeing about what is waiting.
+
+- The System tab now reads one list of waiting keys shared with those apps, and only while
+  the waiting request is unchanged since it was written. Once the keys are enrolled at the
+  blue MOK Manager screen, the list is ignored, and an enrolled key always shows as enrolled.
+  A key queued with an earlier version shows as not enrolled until you run Set Up Signing
+  again; that keeps everything already waiting in the request.
+- Set Up Signing no longer drops a waiting key it can't read, or a request whose contents
+  don't add up: it leaves the whole request alone and asks you to finish it at the next
+  reboot first.
+- If writing the new request fails, setup tries once more. If that fails too, the log names
+  every key that is no longer waiting, with its fingerprint, and tells you to run Set Up
+  Signing again; the System tab then no longer shows them as waiting.
+- When the EFI variables are not mounted (some chroot tools unmount them on exit), Set Up
+  Signing mounts them before it looks at the waiting request, instead of seeing nothing
+  waiting, and the System tab says they are not mounted instead of "enrollment unknown".
+- The one-time password can no longer contain spaces or letters outside plain ASCII:
+  8 to 16 letters, digits and standard symbols, as MOK Manager reads them with a US
+  keyboard layout. The dialog says so.
+
 ## 2.10.3 — 2026-10-25
 
 - With Secure Boot on and the module-signing key enrolled, the System tab now says so
