@@ -2,5 +2,5 @@
 # toolchain steps in .github/workflows/ci.yml and release.yml (both check it).
 [toolchain]
 channel = "1.96.0"
-components = ["clippy"]
+components = ["clippy", "rustfmt"]
 profile = "minimal"
