@@ -1,11 +1,9 @@
 //! system.rs — Query the local system for GPU, driver, kernel, disk, and boot info.
 
-
 use crate::preflight::{
-    classify_signing_key, parse_compute_caps, parse_dkms_signing_config, parse_dpkg_installed,
-    parse_module_flavor, parse_module_signer, parse_pending_list, parse_rpm_names,
-    resolve_signing_pair, ComputeCap, ModuleFlavor, ModuleSignature, SigningKeyState,
-    SigningPair, APT_BLOCK_FILE, DEB_DRIVER_GLOBS, DNF_BLOCK_FILE, RPM_DRIVER_GLOBS,
+    classify_signing_key, parse_compute_caps, parse_dkms_signing_config, parse_dpkg_installed, parse_module_flavor, parse_module_signer, parse_pending_list,
+    parse_rpm_names, resolve_signing_pair, ComputeCap, ModuleFlavor, ModuleSignature, SigningKeyState, SigningPair, APT_BLOCK_FILE, DEB_DRIVER_GLOBS,
+    DNF_BLOCK_FILE, RPM_DRIVER_GLOBS,
 };
 use std::process::Command;
 
@@ -76,8 +74,7 @@ pub fn query_system() -> SystemInfo {
         signing_pair,
         module_signature: get_module_signature(),
         distro_packages: get_distro_packages(),
-        distro_driver_blocked: std::path::Path::new(APT_BLOCK_FILE).is_file()
-            || std::path::Path::new(DNF_BLOCK_FILE).is_file(),
+        distro_driver_blocked: std::path::Path::new(APT_BLOCK_FILE).is_file() || std::path::Path::new(DNF_BLOCK_FILE).is_file(),
         block_supported: on_path("apt-get") || on_path("dnf5"),
         free_disk_bytes: get_free_disk(),
         reboot_required: check_reboot_required(),
@@ -98,19 +95,14 @@ fn get_gpu_compute_caps() -> Vec<ComputeCap> {
 
 /// Open or proprietary flavor of the loaded kernel module.
 fn get_module_flavor() -> ModuleFlavor {
-    std::fs::read_to_string("/proc/driver/nvidia/version")
-        .map(|t| parse_module_flavor(&t))
-        .unwrap_or_default()
+    std::fs::read_to_string("/proc/driver/nvidia/version").map(|t| parse_module_flavor(&t)).unwrap_or_default()
 }
 
 /// Whether an executable `name` is on PATH.
 fn on_path(name: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| {
-            std::fs::metadata(dir.join(name))
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+        std::env::split_paths(&path).any(|dir| std::fs::metadata(dir.join(name)).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
     })
 }
 
@@ -120,18 +112,10 @@ fn on_path(name: &str) -> bool {
 fn get_distro_packages() -> Vec<String> {
     // dpkg-query exits non-zero when a glob matches nothing but still prints
     // the matches of the others, so only the output is used.
-    if let Ok(out) = Command::new("dpkg-query")
-        .args(["-W", "-f", "${db:Status-Abbrev}|${Package}\\n"])
-        .args(DEB_DRIVER_GLOBS)
-        .output()
-    {
+    if let Ok(out) = Command::new("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}|${Package}\\n"]).args(DEB_DRIVER_GLOBS).output() {
         return parse_dpkg_installed(&String::from_utf8_lossy(&out.stdout));
     }
-    if let Ok(out) = Command::new("rpm")
-        .args(["-qa", "--qf", "%{NAME}\\n"])
-        .args(RPM_DRIVER_GLOBS)
-        .output()
-    {
+    if let Ok(out) = Command::new("rpm").args(["-qa", "--qf", "%{NAME}\\n"]).args(RPM_DRIVER_GLOBS).output() {
         return parse_rpm_names(&String::from_utf8_lossy(&out.stdout));
     }
     vec![]
@@ -141,28 +125,18 @@ fn get_distro_packages() -> Vec<String> {
 fn get_dkms_signing_config() -> crate::preflight::DkmsSigningConfig {
     let mut paths = vec![std::path::PathBuf::from("/etc/dkms/framework.conf")];
     if let Ok(dir) = std::fs::read_dir("/etc/dkms/framework.conf.d") {
-        let mut extra: Vec<_> = dir
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "conf"))
-            .collect();
+        let mut extra: Vec<_> = dir.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|x| x == "conf")).collect();
         extra.sort();
         paths.extend(extra);
     }
-    let texts: Vec<String> = paths
-        .iter()
-        .filter_map(|p| std::fs::read_to_string(p).ok())
-        .collect();
+    let texts: Vec<String> = paths.iter().filter_map(|p| std::fs::read_to_string(p).ok()).collect();
     let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
     parse_dkms_signing_config(&refs, &get_kernel_version())
 }
 
 fn command_text(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
-    Some(format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    ))
+    Some(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
 /// The machine's module-signing key pair, chosen as the install script
@@ -201,18 +175,14 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
     // signing setup, and that setup listed this key in it (MokNew itself is
     // readable by root only, but a plain user can stat it).
     let moknew_size = std::fs::metadata(MOK_NEW).ok().map(|m| m.len());
-    let pending = std::fs::read_to_string(MOK_PENDING_LIST)
-        .map(|t| parse_pending_list(&t, moknew_size))
-        .unwrap_or_default();
+    let pending = std::fs::read_to_string(MOK_PENDING_LIST).map(|t| parse_pending_list(&t, moknew_size)).unwrap_or_default();
     let efi_firmware = std::path::Path::new("/sys/firmware/efi").exists();
     let sha1 = Command::new("sha1sum")
         .arg(path)
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string)
-        });
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string));
     command_text("mokutil", &["--test-key", path])
         .and_then(|t| classify_signing_key(path, &t, efi_firmware, &pending, sha1.as_deref()))
         .unwrap_or_else(|| SigningKeyState::Untested(path.to_string()))
@@ -221,10 +191,7 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
 /// Who signed the nvidia module on disk for the running kernel.
 fn get_module_signature() -> ModuleSignature {
     match Command::new("modinfo").args(["-F", "signer", "nvidia"]).output() {
-        Ok(out) => parse_module_signer(
-            out.status.success(),
-            &String::from_utf8_lossy(&out.stdout),
-        ),
+        Ok(out) => parse_module_signer(out.status.success(), &String::from_utf8_lossy(&out.stdout)),
         Err(_) => ModuleSignature::Missing,
     }
 }
@@ -232,10 +199,7 @@ fn get_module_signature() -> ModuleSignature {
 /// Read the running driver version from nvidia-smi or /proc
 fn get_installed_driver() -> Option<String> {
     // Try nvidia-smi first
-    if let Ok(out) = Command::new("nvidia-smi")
-        .args(["--query-gpu=driver_version", "--format=csv,noheader"])
-        .output()
-    {
+    if let Ok(out) = Command::new("nvidia-smi").args(["--query-gpu=driver_version", "--format=csv,noheader"]).output() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !s.is_empty() && out.status.success() {
             return Some(s);
@@ -259,10 +223,7 @@ fn parse_proc_driver_version(content: &str) -> Option<String> {
     for line in content.lines().filter(|l| l.contains("NVRM version")) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if let Some(i) = parts.iter().position(|p| *p == "Module") {
-            if let Some(ver) = parts[i + 1..]
-                .iter()
-                .find(|p| p.starts_with(|c: char| c.is_ascii_digit()))
-            {
+            if let Some(ver) = parts[i + 1..].iter().find(|p| p.starts_with(|c: char| c.is_ascii_digit())) {
                 return Some(ver.to_string());
             }
         }
@@ -272,24 +233,19 @@ fn parse_proc_driver_version(content: &str) -> Option<String> {
 
 /// Get the GPU name from nvidia-smi
 fn get_gpu_name() -> Option<String> {
-    let out = Command::new("nvidia-smi")
-        .args(["--query-gpu=name", "--format=csv,noheader"])
-        .output()
-        .ok()?;
+    let out = Command::new("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output().ok()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() { return Some(s); }
+        if !s.is_empty() {
+            return Some(s);
+        }
     }
     None
 }
 
 /// uname -r
 fn get_kernel_version() -> String {
-    Command::new("uname")
-        .arg("-r")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+    Command::new("uname").arg("-r").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Parse `dkms status` output for nvidia entries. Handles all formats:
@@ -323,11 +279,7 @@ fn parse_dkms_status(text: &str) -> Vec<DkmsEntry> {
         };
 
         // The spec fields are separated by '/' (new) or ', ' (old).
-        let fields: Vec<&str> = spec
-            .split(['/', ','])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
+        let fields: Vec<&str> = spec.split(['/', ',']).map(str::trim).filter(|s| !s.is_empty()).collect();
 
         let module = fields.first().unwrap_or(&"nvidia").to_string();
         let version = fields.get(1).unwrap_or(&"?").to_string();
@@ -343,8 +295,12 @@ fn parse_dkms_status(text: &str) -> Vec<DkmsEntry> {
 fn get_secure_boot() -> SecureBootStatus {
     if let Ok(out) = Command::new("mokutil").arg("--sb-state").output() {
         let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
-        if s.contains("secureboot enabled") { return SecureBootStatus::Enabled; }
-        if s.contains("secureboot disabled") { return SecureBootStatus::Disabled; }
+        if s.contains("secureboot enabled") {
+            return SecureBootStatus::Enabled;
+        }
+        if s.contains("secureboot disabled") {
+            return SecureBootStatus::Disabled;
+        }
     }
     // Fallback: read EFI variable directly
     if let Ok(content) = std::fs::read("/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c") {
@@ -361,23 +317,15 @@ fn get_secure_boot() -> SecureBootStatus {
 /// Free disk space on /
 fn get_free_disk() -> Option<u64> {
     // Use statvfs via df -B1 for simplicity
-    let out = Command::new("df")
-        .args(["-B1", "--output=avail", "/"])
-        .output()
-        .ok()?;
+    let out = Command::new("df").args(["-B1", "--output=avail", "/"]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
-        .nth(1)
-        .and_then(|l| l.trim().parse::<u64>().ok())
+    text.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok())
 }
 
 /// Version of the nvidia kernel module ON DISK — i.e. what will load at
 /// the next boot. This is how a pending repo-style install is detected.
 fn get_disk_module_version() -> Option<String> {
-    let out = Command::new("modinfo")
-        .args(["-F", "version", "nvidia"])
-        .output()
-        .ok()?;
+    let out = Command::new("modinfo").args(["-F", "version", "nvidia"]).output().ok()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !s.is_empty() {

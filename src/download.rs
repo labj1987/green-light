@@ -3,7 +3,10 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -22,13 +25,7 @@ const DOWNLOAD_MODE: u32 = 0o644;
 /// The bytes go to `<filename>.part` and are renamed into place only once
 /// complete, so the final name never holds a partial file; any failure
 /// deletes the `.part`.
-pub async fn download_run_file<F>(
-    url: &str,
-    dest_dir: &Path,
-    filename: &str,
-    progress_cb: F,
-    cancel: Arc<AtomicBool>,
-) -> Result<PathBuf>
+pub async fn download_run_file<F>(url: &str, dest_dir: &Path, filename: &str, progress_cb: F, cancel: Arc<AtomicBool>) -> Result<PathBuf>
 where
     F: FnMut(u64, Option<u64>) + Send + 'static,
 {
@@ -51,9 +48,7 @@ where
 
     // Ensure the destination directory exists — e.g. ~/Downloads may not
     // exist yet, or HOME may point somewhere unexpected (root, containers).
-    tokio::fs::create_dir_all(dest_dir)
-        .await
-        .with_context(|| format!("Could not create download directory: {}", dest_dir.display()))?;
+    tokio::fs::create_dir_all(dest_dir).await.with_context(|| format!("Could not create download directory: {}", dest_dir.display()))?;
 
     // connect_timeout + read_timeout instead of a total request timeout:
     // a total timeout would kill a slow-but-healthy multi-hundred-MB
@@ -77,7 +72,10 @@ where
 
         let resp = match client.get(url).send().await {
             Ok(r) => r,
-            Err(e) => { last_err = e.into(); continue; }
+            Err(e) => {
+                last_err = e.into();
+                continue;
+            }
         };
 
         let status = resp.status();
@@ -120,29 +118,14 @@ enum Attempt {
 
 /// Stream the response body into `part` (created fresh, mode 0644) and make
 /// sure every byte reached the disk.
-async fn write_part<F>(
-    part: &Path,
-    resp: reqwest::Response,
-    total: Option<u64>,
-    progress_cb: &mut F,
-    cancel: &AtomicBool,
-) -> std::result::Result<(), Attempt>
+async fn write_part<F>(part: &Path, resp: reqwest::Response, total: Option<u64>, progress_cb: &mut F, cancel: &AtomicBool) -> std::result::Result<(), Attempt>
 where
     F: FnMut(u64, Option<u64>),
 {
     let fail = |e: anyhow::Error| Attempt::Failed(e);
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(DOWNLOAD_MODE)
-        .open(part)
-        .await
-        .map_err(|e| fail(e.into()))?;
+    let mut file = tokio::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(DOWNLOAD_MODE).open(part).await.map_err(|e| fail(e.into()))?;
     // A .part left over from an earlier run keeps its old mode on open.
-    file.set_permissions(std::fs::Permissions::from_mode(DOWNLOAD_MODE))
-        .await
-        .map_err(|e| fail(e.into()))?;
+    file.set_permissions(std::fs::Permissions::from_mode(DOWNLOAD_MODE)).await.map_err(|e| fail(e.into()))?;
 
     let mut downloaded: u64 = 0;
     let mut stream = resp.bytes_stream();
@@ -160,8 +143,7 @@ where
     // happening to exist.
     if let Some(t) = total {
         if downloaded != t {
-            return Err(fail(anyhow::anyhow!(
-                "Download truncated: received {} of {} bytes", downloaded, t)));
+            return Err(fail(anyhow::anyhow!("Download truncated: received {} of {} bytes", downloaded, t)));
         }
     }
     file.flush().await.map_err(|e| fail(e.into()))?;
@@ -173,18 +155,13 @@ where
 /// Streams the file in 1 MiB chunks so a ~300 MB .run file is never
 /// held in memory all at once.
 pub async fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .context("Could not open file for SHA256 verification")?;
+    let mut file = tokio::fs::File::open(path).await.context("Could not open file for SHA256 verification")?;
 
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
 
     loop {
-        let n = file
-            .read(&mut buf)
-            .await
-            .context("Read error during SHA256 verification")?;
+        let n = file.read(&mut buf).await.context("Read error during SHA256 verification")?;
         if n == 0 {
             break;
         }
@@ -194,10 +171,7 @@ pub async fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     let result = hex::encode(hasher.finalize());
 
     if result.to_lowercase() != expected.to_lowercase() {
-        bail!(
-            "SHA256 mismatch:\n  expected: {}\n  got:      {}",
-            expected, result
-        );
+        bail!("SHA256 mismatch:\n  expected: {}\n  got:      {}", expected, result);
     }
     Ok(())
 }
@@ -218,22 +192,11 @@ mod tests {
     }
 
     async fn get(base: &str, dir: &Path, name: &str) -> Result<PathBuf> {
-        download_with_retry_base(
-            &format!("{base}{name}"),
-            dir,
-            name,
-            |_, _| {},
-            Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(10),
-        )
-        .await
+        download_with_retry_base(&format!("{base}{name}"), dir, name, |_, _| {}, Arc::new(AtomicBool::new(false)), Duration::from_millis(10)).await
     }
 
     fn entries(dir: &Path) -> Vec<String> {
-        let mut v: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
-            .collect();
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
         v.sort();
         v
     }

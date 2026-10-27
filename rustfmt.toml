@@ -1,0 +1,4 @@
+# `cargo fmt --all` (CI checks it). The code is written wide: 160 columns, and the small-construct widths
+# (calls, struct literals, chains) allowed up to the full width instead of rustfmt's narrower defaults.
+max_width = 160
+use_small_heuristics = "Max"

@@ -44,8 +44,7 @@ pub struct InstallOptions {
 
 /// Hash a file with SHA256, streaming so a ~300 MB .run isn't held in memory.
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("Could not open {} for hashing", path.display()))?;
+    let mut f = std::fs::File::open(path).with_context(|| format!("Could not open {} for hashing", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1024 * 1024];
     loop {
@@ -67,8 +66,7 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
 /// refuse: a symlink, not a regular file, or changeable by anyone but its
 /// owner (see `run_file_problem`).
 pub fn check_run_file(path: &str) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("Run file not found: {path}"))?;
+    let meta = std::fs::symlink_metadata(path).with_context(|| format!("Run file not found: {path}"))?;
     if meta.file_type().is_symlink() {
         bail!("{path} is a symbolic link; open the file it points to instead.");
     }
@@ -140,12 +138,7 @@ impl LogTail {
     fn at_end(path: impl Into<std::path::PathBuf>) -> Self {
         let path = path.into();
         let meta = std::fs::metadata(&path).ok();
-        LogTail {
-            pos: meta.as_ref().map_or(0, |m| m.len()),
-            inode: meta.as_ref().map(|m| m.ino()),
-            partial: Vec::new(),
-            path,
-        }
+        LogTail { pos: meta.as_ref().map_or(0, |m| m.len()), inode: meta.as_ref().map(|m| m.ino()), partial: Vec::new(), path }
     }
 
     /// Complete new lines (raw bytes, newline-separated).
@@ -197,11 +190,7 @@ fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str
         // authentication); its exit code says why.
         let _ = writeln!(pipe, "{text}");
     }
-    let stderr = child.stderr.take().map(|pipe| {
-        std::thread::spawn(move || {
-            BufReader::new(pipe).lines().map_while(Result::ok).collect::<Vec<String>>()
-        })
-    });
+    let stderr = child.stderr.take().map(|pipe| std::thread::spawn(move || BufReader::new(pipe).lines().map_while(Result::ok).collect::<Vec<String>>()));
 
     let mut lines = Vec::new();
     let status = loop {
@@ -321,10 +310,7 @@ pub fn run_privileged_discard_recovery(mut on_line: impl FnMut(&str)) -> Result<
     match run.code {
         Some(0) => Ok(()),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
-        code => bail!(
-            "Discarding the recovery data failed (exit code {code:?}){}",
-            first_error(&run.lines).map(|e| format!(": {e}")).unwrap_or_default()
-        ),
+        code => bail!("Discarding the recovery data failed (exit code {code:?}){}", first_error(&run.lines).map(|e| format!(": {e}")).unwrap_or_default()),
     }
 }
 
@@ -352,10 +338,7 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
     let detail = first_error(lines).map(|e| format!(": {e}")).unwrap_or_default();
     match code {
         Some(126) => "Authentication was cancelled; nothing was changed.".to_string(),
-        Some(127) => {
-            "Not authorized, or pkexec could not start the install script; nothing was changed."
-                .to_string()
-        }
+        Some(127) => "Not authorized, or pkexec could not start the install script; nothing was changed.".to_string(),
         Some(1) => format!("The install stopped before changing anything{detail}"),
         Some(2) => format!("The install script refused to start{detail}"),
         Some(3) => format!(
@@ -434,10 +417,7 @@ pub struct SetupOutcome {
 pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
     let fail = |e: anyhow::Error| SetupOutcome { result: Err(e), lines: vec![] };
     if !Path::new(PRIVILEGED_SCRIPT).exists() {
-        return fail(anyhow::anyhow!(
-            "Privileged install script not found at {}",
-            PRIVILEGED_SCRIPT
-        ));
+        return fail(anyhow::anyhow!("Privileged install script not found at {}", PRIVILEGED_SCRIPT));
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--setup-signing".to_string()];
     let run = match run_pkexec(&args, Some(password), &mut |_| {}) {
@@ -450,9 +430,7 @@ pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
         Some(127) => Err(anyhow::anyhow!("Not authorized, or pkexec could not start the script.")),
         code => Err(anyhow::anyhow!(
             "Signing setup failed{}",
-            first_error(&run.lines)
-                .map(|e| format!(": {e}"))
-                .unwrap_or_else(|| format!(" (exit code {code:?}; see {INSTALL_LOG})"))
+            first_error(&run.lines).map(|e| format!(": {e}")).unwrap_or_else(|| format!(" (exit code {code:?}; see {INSTALL_LOG})"))
         )),
     };
     SetupOutcome { result, lines: run.lines }
@@ -479,17 +457,12 @@ mod tests {
 
     #[test]
     fn failure_messages_carry_the_reason() {
-        let out = lines(&[
-            "==== NVIDIA driver install started ====",
-            "ERROR: /home/a/x.run can be changed by other members of group 100 (mode 664) — refusing.",
-        ]);
+        let out =
+            lines(&["==== NVIDIA driver install started ====", "ERROR: /home/a/x.run can be changed by other members of group 100 (mode 664) — refusing."]);
         let msg = install_failure(Some(2), &out);
         assert!(msg.contains("refused") && msg.contains("other members of group 100"), "{msg}");
-        let out = lines(&[
-            "ERROR: NVIDIA installer exited with code 1",
-            "See /var/log/nvidia-installer.log for details.",
-            "Restoring the previous driver setup…",
-        ]);
+        let out =
+            lines(&["ERROR: NVIDIA installer exited with code 1", "See /var/log/nvidia-installer.log for details.", "Restoring the previous driver setup…"]);
         let msg = install_failure(Some(3), &out);
         assert!(msg.contains("NVIDIA installer exited with code 1"), "{msg}");
         assert!(msg.contains("driver this computer had before"), "{msg}");
@@ -505,10 +478,7 @@ mod tests {
                    2026-10-12 10:00:00 [green-light 77] ERROR: Another Green Light install is still running\n\
                    2026-10-12 10:00:01 [green-light 42] Copying installer\n\
                    2026-10-12 10:00:02 [green-light 42] \n";
-        assert_eq!(
-            script_lines(log.as_bytes(), 42),
-            ["==== NVIDIA driver install started ====", "Copying installer"]
-        );
+        assert_eq!(script_lines(log.as_bytes(), 42), ["==== NVIDIA driver install started ====", "Copying installer"]);
         assert_eq!(script_lines(log.as_bytes(), 77), ["ERROR: Another Green Light install is still running"]);
     }
 
@@ -520,9 +490,7 @@ mod tests {
         std::fs::write(&path, "t [green-light 5] before\n").unwrap();
         let mut tail = LogTail::at_end(&path);
         assert!(tail.read_new(5).is_empty());
-        let append = |bytes: &[u8]| {
-            std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(bytes).unwrap()
-        };
+        let append = |bytes: &[u8]| std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(bytes).unwrap();
         // "…" is three bytes; the first read ends inside it.
         let line = "t [green-light 5] Copying…done\n".as_bytes();
         let cut = line.iter().position(|&b| b == 0xE2).unwrap() + 1;
@@ -544,16 +512,17 @@ mod tests {
         assert!(e.to_string().contains("the driver changed"));
         let e = recover_result(Some(6), &[]).unwrap_err();
         assert!(e.downcast_ref::<StaleRecovery>().is_some());
-        assert_eq!(
-            parse_recovery_note("refused: the driver changed\n"),
-            Some(RecoveryNote::Refused("the driver changed".into()))
-        );
+        assert_eq!(parse_recovery_note("refused: the driver changed\n"), Some(RecoveryNote::Refused("the driver changed".into())));
         assert_eq!(parse_recovery_note("failed: x"), Some(RecoveryNote::Failed("x".into())));
         assert_eq!(parse_recovery_note(""), None);
     }
 
     fn install_failure_or_stale(code: Option<i32>, lines: &[String]) -> anyhow::Error {
-        if code == Some(6) { stale_recovery(lines) } else { anyhow::anyhow!(install_failure(code, lines)) }
+        if code == Some(6) {
+            stale_recovery(lines)
+        } else {
+            anyhow::anyhow!(install_failure(code, lines))
+        }
     }
 
     #[test]

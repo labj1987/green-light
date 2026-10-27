@@ -108,24 +108,12 @@ pub struct PageQueries {
 /// Read the lookup service address and the Linux x86_64 queries from the
 /// Unix driver page. `None` when the page no longer has them.
 pub fn parse_unix_page(html: &str) -> Option<PageQueries> {
-    let endpoint = Regex::new(
-        r#"addProperty\(\s*'web'\s*,\s*'gfDriversServicesToolkitUrlEndpoint'\s*,\s*'([^']+)'"#,
-    )
-    .ok()?
-    .captures(html)?[1]
-        .to_string();
-    let path = Regex::new(r#"baseDrvrLkupSrvcURL\s*=\s*servicesToolkitUrl\s*\+\s*'([^']*)'"#)
-        .ok()?
-        .captures(html)?[1]
-        .to_string();
-    let entry = Regex::new(
-        r#""urlParams":\s*"([^"]*)"\s*\+\s*countryID\s*\+\s*"([^"]*)",\s*"qryDesc":\s*"[^"]*",\s*"drvrType":\s*"(\w+)",\s*"osCode":\s*"linux64""#,
-    )
-    .ok()?;
-    let queries: HashMap<String, String> = entry
-        .captures_iter(html)
-        .map(|c| (c[3].to_string(), format!("{}{COUNTRY_ID}{}", &c[1], &c[2])))
-        .collect();
+    let endpoint = Regex::new(r#"addProperty\(\s*'web'\s*,\s*'gfDriversServicesToolkitUrlEndpoint'\s*,\s*'([^']+)'"#).ok()?.captures(html)?[1].to_string();
+    let path = Regex::new(r#"baseDrvrLkupSrvcURL\s*=\s*servicesToolkitUrl\s*\+\s*'([^']*)'"#).ok()?.captures(html)?[1].to_string();
+    let entry =
+        Regex::new(r#""urlParams":\s*"([^"]*)"\s*\+\s*countryID\s*\+\s*"([^"]*)",\s*"qryDesc":\s*"[^"]*",\s*"drvrType":\s*"(\w+)",\s*"osCode":\s*"linux64""#)
+            .ok()?;
+    let queries: HashMap<String, String> = entry.captures_iter(html).map(|c| (c[3].to_string(), format!("{}{COUNTRY_ID}{}", &c[1], &c[2]))).collect();
     if !queries.contains_key("PB") {
         return None;
     }
@@ -136,8 +124,18 @@ fn parse_date(text: &str) -> Option<(u32, u32, u32)> {
     // "Tue Sep 22, 2026"
     let mut f = text.split_whitespace().skip(1);
     let month = match f.next()? {
-        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
-        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
         _ => return None,
     };
     let day = f.next()?.trim_end_matches(',').parse().ok()?;
@@ -147,13 +145,9 @@ fn parse_date(text: &str) -> Option<(u32, u32, u32)> {
 
 /// The drivers in a lookup service answer.
 pub fn parse_lookup(json: &str) -> Result<Vec<Release>> {
-    let v: serde_json::Value =
-        serde_json::from_str(json).context("NVIDIA's driver lookup answered something other than JSON")?;
+    let v: serde_json::Value = serde_json::from_str(json).context("NVIDIA's driver lookup answered something other than JSON")?;
     // "Success" is the number of drivers found.
-    let found: u32 = v["Success"]
-        .as_str()
-        .and_then(|n| n.trim().parse().ok())
-        .context("NVIDIA's driver lookup answered in an unknown format")?;
+    let found: u32 = v["Success"].as_str().and_then(|n| n.trim().parse().ok()).context("NVIDIA's driver lookup answered in an unknown format")?;
     if found == 0 {
         return Ok(vec![]);
     }
@@ -162,10 +156,7 @@ pub fn parse_lookup(json: &str) -> Result<Vec<Release>> {
         .iter()
         .filter_map(|e| {
             let info = &e["downloadInfo"];
-            Some(Release {
-                branch: info["Release"].as_str()?.trim().parse().ok()?,
-                date: info["ReleaseDateTime"].as_str().and_then(parse_date),
-            })
+            Some(Release { branch: info["Release"].as_str()?.trim().parse().ok()?, date: info["ReleaseDateTime"].as_str().and_then(parse_date) })
         })
         .collect())
 }
@@ -174,24 +165,12 @@ pub fn parse_lookup(json: &str) -> Result<Vec<Release>> {
 /// Feature and Legacy queries.
 pub fn derive_branches(production: &[Release], new_feature: &[Release], legacy: &[Release]) -> Branches {
     // The current Production Branch: that of the newest production driver.
-    let newest = production
-        .iter()
-        .enumerate()
-        .max_by(|(ia, a), (ib, b)| a.date.cmp(&b.date).then(ib.cmp(ia)))
-        .map(|(_, r)| r);
+    let newest = production.iter().enumerate().max_by(|(ia, a), (ib, b)| a.date.cmp(&b.date).then(ib.cmp(ia))).map(|(_, r)| r);
     let prod = newest.map(|r| r.branch);
     // Since when it has been out, as far as the history reaches.
-    let start = production
-        .iter()
-        .filter(|r| Some(r.branch) == prod)
-        .filter_map(|r| r.date)
-        .min();
+    let start = production.iter().filter(|r| Some(r.branch) == prod).filter_map(|r| r.date).min();
     let mut older: Vec<u32> = match (prod, start) {
-        (Some(p), Some(start)) => production
-            .iter()
-            .filter(|r| r.branch < p && r.date.is_some_and(|d| d >= start))
-            .map(|r| r.branch)
-            .collect(),
+        (Some(p), Some(start)) => production.iter().filter(|r| r.branch < p && r.date.is_some_and(|d| d >= start)).map(|r| r.branch).collect(),
         _ => vec![],
     };
     older.sort_unstable();
@@ -244,11 +223,7 @@ pub async fn fetch_branches(page_url: &str) -> Result<Branches> {
             }
         }
     };
-    let (prod, nfb, legacy) = tokio::join!(
-        lookup(Some(&pb)),
-        lookup(q.queries.get("NFB")),
-        lookup(q.queries.get("Legacy"))
-    );
+    let (prod, nfb, legacy) = tokio::join!(lookup(Some(&pb)), lookup(q.queries.get("NFB")), lookup(q.queries.get("Legacy")));
     let prod = prod?;
     if prod.is_empty() {
         bail!("NVIDIA's driver lookup listed no production drivers");
@@ -295,13 +270,7 @@ mod tests {
     #[test]
     fn labels_roll_over_with_nvidia() {
         // A later day: 615 has become the Production Branch, 620 is new.
-        let production = [
-            r(615, (2027, 1, 20)),
-            r(595, (2027, 1, 12)),
-            r(615, (2026, 12, 15)),
-            r(595, (2026, 11, 2)),
-            r(580, (2026, 11, 1)),
-        ];
+        let production = [r(615, (2027, 1, 20)), r(595, (2027, 1, 12)), r(615, (2026, 12, 15)), r(595, (2026, 11, 2)), r(580, (2026, 11, 1))];
         let b = derive_branches(&production, &[r(620, (2027, 1, 22))], &[]);
         assert_eq!(b.classify("620.1"), Some(DriverBranch::NewFeature));
         assert_eq!(b.classify("615.5"), Some(DriverBranch::Production));
@@ -345,10 +314,7 @@ mod tests {
     #[test]
     fn reads_the_queries_from_the_page() {
         let q = parse_unix_page(PAGE).unwrap();
-        assert_eq!(
-            q.lookup_url,
-            "https://gfwsl.example/services_toolkit/services/x/AjaxDriverService.php?func=DriverManualLookup&languageCode=1033"
-        );
+        assert_eq!(q.lookup_url, "https://gfwsl.example/services_toolkit/services/x/AjaxDriverService.php?func=DriverManualLookup&languageCode=1033");
         assert_eq!(q.queries.len(), 2, "only the Linux x86_64 queries");
         assert_eq!(q.queries["PB"], "psid=133&pfid=1075&osID=12&languageCode=1033&beta=0&qnf=0&numberOfResults=1");
         assert!(q.queries["NFB"].contains("qnf=1"));
@@ -361,10 +327,7 @@ mod tests {
             {"downloadInfo":{"Release":"595","DisplayVersion":"595.104.02","ReleaseDateTime":"Tue Sep 22, 2026"}},
             {"downloadInfo":{"Release":"580","DisplayVersion":"","ReleaseDateTime":"odd"}},
             {"downloadInfo":{"Release":"","ReleaseDateTime":"Tue Sep 22, 2026"}}]}"#;
-        assert_eq!(
-            parse_lookup(json).unwrap(),
-            vec![r(595, (2026, 9, 22)), Release { branch: 580, date: None }]
-        );
+        assert_eq!(parse_lookup(json).unwrap(), vec![r(595, (2026, 9, 22)), Release { branch: 580, date: None }]);
         assert_eq!(parse_lookup(r#"{"Success":"0"}"#).unwrap(), vec![]);
         assert!(parse_lookup(r#"{"IDS":[]}"#).is_err());
         assert!(parse_lookup("<html>").is_err());
@@ -375,10 +338,7 @@ mod tests {
         use crate::test_http::{route, serve, Route};
         let lookup = "/svc/AjaxDriverService.php";
         let answer = |rels: &[(&str, &str)]| {
-            let ids: Vec<String> = rels
-                .iter()
-                .map(|(rel, date)| format!(r#"{{"downloadInfo":{{"Release":"{rel}","ReleaseDateTime":"{date}"}}}}"#))
-                .collect();
+            let ids: Vec<String> = rels.iter().map(|(rel, date)| format!(r#"{{"downloadInfo":{{"Release":"{rel}","ReleaseDateTime":"{date}"}}}}"#)).collect();
             format!(r#"{{"Success":"1","IDS":[{}]}}"#, ids.join(","))
         };
         let pb = answer(&[("595", "Tue Sep 22, 2026"), ("580", "Mon Aug 03, 2026"), ("595", "Tue Mar 24, 2026")]);

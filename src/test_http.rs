@@ -41,16 +41,8 @@ pub async fn serve(routes: Vec<Route>) -> String {
                 let text = String::from_utf8_lossy(&req);
                 let target = text.split_whitespace().nth(1).unwrap_or("/").to_string();
                 let (path, query) = target.split_once('?').unwrap_or((&target, ""));
-                let r = routes
-                    .iter()
-                    .find(|r| r.path == path && query.contains(r.query))
-                    .cloned()
-                    .unwrap_or_else(|| route("", 404, b"Not found"));
-                let head = format!(
-                    "HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    r.status,
-                    r.announce_len.unwrap_or(r.body.len())
-                );
+                let r = routes.iter().find(|r| r.path == path && query.contains(r.query)).cloned().unwrap_or_else(|| route("", 404, b"Not found"));
+                let head = format!("HTTP/1.1 {} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", r.status, r.announce_len.unwrap_or(r.body.len()));
                 let _ = sock.write_all(head.as_bytes()).await;
                 let _ = sock.write_all(&r.body).await;
                 let _ = sock.shutdown().await;

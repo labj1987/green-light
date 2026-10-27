@@ -1,31 +1,23 @@
-use crate::download::{download_run_file, verify_sha256};
 use crate::branches::{fetch_branches, DriverBranch, UNIX_DRIVERS_PAGE};
+use crate::download::{download_run_file, verify_sha256};
 use crate::install::{
-    check_run_file, install_running, recovery_note, recovery_pending,
-    run_privileged_discard_recovery, run_privileged_install, run_privileged_recover,
+    check_run_file, install_running, recovery_note, recovery_pending, run_privileged_discard_recovery, run_privileged_install, run_privileged_recover,
     run_privileged_setup_signing, InstallOptions, Recovered, RecoveryNote, StaleRecovery,
 };
 use crate::preflight::{
-    conflict_summary, module_hint, secure_boot_advice, secure_boot_summary, signing_summary,
-    validate_module_choice,
-    validate_mok_password, ModuleChoice, MOK_PASSWORD_HINT,
+    conflict_summary, module_hint, secure_boot_advice, secure_boot_summary, signing_summary, validate_module_choice, validate_mok_password, ModuleChoice,
+    MOK_PASSWORD_HINT,
 };
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
-use crate::versions::{
-    fetch_checksum, fetch_versions, is_sha256_hex, version_from_filename, DriverVersion,
-};
+use crate::versions::{fetch_checksum, fetch_versions, is_sha256_hex, version_from_filename, DriverVersion};
 
 use gtk4::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Button, FileDialog, Label,
-    ListBox, Orientation, ProgressBar, ScrolledWindow, SelectionMode,
-    Spinner, Stack, Switch, TextView, WrapMode,
+    Align, Box as GtkBox, Button, FileDialog, Label, ListBox, Orientation, ProgressBar, ScrolledWindow, SelectionMode, Spinner, Stack, Switch, TextView,
+    WrapMode,
 };
 use libadwaita::prelude::*;
-use libadwaita::{
-    AboutDialog, ActionRow, Application, ApplicationWindow, Banner, ComboRow, HeaderBar,
-    PreferencesGroup, Toast, ToastOverlay,
-};
+use libadwaita::{AboutDialog, ActionRow, Application, ApplicationWindow, Banner, ComboRow, HeaderBar, PreferencesGroup, Toast, ToastOverlay};
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -189,19 +181,24 @@ where
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[derive(PartialEq)]
-enum VersionRelation { Newer, Same, Older, Unknown }
+enum VersionRelation {
+    Newer,
+    Same,
+    Older,
+    Unknown,
+}
 
 fn compare_versions(installed: &str, candidate: &str) -> VersionRelation {
-    let parse = |s: &str| -> Vec<u32> {
-        s.split('.').filter_map(|x| x.parse().ok()).collect()
-    };
+    let parse = |s: &str| -> Vec<u32> { s.split('.').filter_map(|x| x.parse().ok()).collect() };
     let iv = parse(installed);
     let cv = parse(candidate);
-    if iv.is_empty() || cv.is_empty() { return VersionRelation::Unknown; }
+    if iv.is_empty() || cv.is_empty() {
+        return VersionRelation::Unknown;
+    }
     match cv.cmp(&iv) {
         std::cmp::Ordering::Greater => VersionRelation::Newer,
-        std::cmp::Ordering::Equal   => VersionRelation::Same,
-        std::cmp::Ordering::Less    => VersionRelation::Older,
+        std::cmp::Ordering::Equal => VersionRelation::Same,
+        std::cmp::Ordering::Less => VersionRelation::Older,
     }
 }
 
@@ -213,30 +210,17 @@ pub fn build_ui(app: &Application) {
     let state = Rc::new(RefCell::new(AppState::default()));
 
     // ── Window ───────────────────────────────────────────────────────────────
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("Green Light")
-        .default_width(760)
-        .default_height(640)
-        .build();
-
-
+    let window = ApplicationWindow::builder().application(app).title("Green Light").default_width(760).default_height(640).build();
 
     let toast_overlay = ToastOverlay::new();
 
     // ── Header ───────────────────────────────────────────────────────────────
     let header = HeaderBar::new();
 
-    let refresh_btn = Button::builder()
-        .icon_name("view-refresh-symbolic")
-        .tooltip_text("Refresh version list")
-        .build();
+    let refresh_btn = Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Refresh version list").build();
     header.pack_start(&refresh_btn);
 
-    let about_btn = Button::builder()
-        .icon_name("help-about-symbolic")
-        .tooltip_text("About")
-        .build();
+    let about_btn = Button::builder().icon_name("help-about-symbolic").tooltip_text("About").build();
     header.pack_end(&about_btn);
 
     // Driver badge in header — always visible
@@ -295,11 +279,7 @@ pub fn build_ui(app: &Application) {
     status_group.add(&reboot_row);
     sysinfo_page.append(&status_group);
 
-    let refresh_sysinfo_btn = Button::builder()
-        .label("Refresh System Info")
-        .halign(Align::Center)
-        .margin_top(8)
-        .build();
+    let refresh_sysinfo_btn = Button::builder().label("Refresh System Info").halign(Align::Center).margin_top(8).build();
     refresh_sysinfo_btn.add_css_class("flat");
     sysinfo_page.append(&refresh_sysinfo_btn);
 
@@ -337,19 +317,12 @@ pub fn build_ui(app: &Application) {
     list_spinner.set_size_request(48, 48);
     browse_page.append(&list_spinner);
 
-    let selected_label = Label::builder()
-        .label("No version selected")
-        .margin_top(4)
-        .margin_bottom(4)
-        .build();
+    let selected_label = Label::builder().label("No version selected").margin_top(4).margin_bottom(4).build();
     selected_label.add_css_class("dim-label");
     browse_page.append(&selected_label);
 
     let browse_bar = gtk4::ActionBar::new();
-    let open_file_btn = Button::builder()
-        .label("Open .run File…")
-        .tooltip_text("Use a locally downloaded .run file")
-        .build();
+    let open_file_btn = Button::builder().label("Open .run File…").tooltip_text("Use a locally downloaded .run file").build();
     open_file_btn.add_css_class("flat");
     let download_btn = Button::builder().label("Download").sensitive(false).build();
     download_btn.add_css_class("suggested-action");
@@ -369,10 +342,7 @@ pub fn build_ui(app: &Application) {
     config_page.set_margin_end(12);
 
     let file_group = PreferencesGroup::builder().title("Selected Driver").build();
-    let file_row = ActionRow::builder()
-        .title("No file selected")
-        .subtitle("Go to Browse tab to select or download a driver")
-        .build();
+    let file_row = ActionRow::builder().title("No file selected").subtitle("Go to Browse tab to select or download a driver").build();
     let checksum_row = ActionRow::builder().title("Checksum").subtitle("—").build();
     let version_status_row = ActionRow::builder().title("Version Status").subtitle("—").build();
     file_group.add(&file_row);
@@ -395,18 +365,12 @@ pub fn build_ui(app: &Application) {
 
     let opts_group = PreferencesGroup::builder().title("Install Options").build();
 
-    let dkms_opt_row = ActionRow::builder()
-        .title("Enable DKMS")
-        .subtitle("Automatically rebuild kernel module on kernel updates")
-        .build();
+    let dkms_opt_row = ActionRow::builder().title("Enable DKMS").subtitle("Automatically rebuild kernel module on kernel updates").build();
     let dkms_switch = Switch::builder().valign(Align::Center).active(true).build();
     dkms_opt_row.add_suffix(&dkms_switch);
     dkms_opt_row.set_activatable_widget(Some(&dkms_switch));
 
-    let block_opt_row = ActionRow::builder()
-        .title("Block Distro Driver Packages")
-        .subtitle(BLOCK_SUBTITLE)
-        .build();
+    let block_opt_row = ActionRow::builder().title("Block Distro Driver Packages").subtitle(BLOCK_SUBTITLE).build();
     block_opt_row.set_subtitle_lines(0);
     let block_switch = Switch::builder().valign(Align::Center).build();
     block_opt_row.add_suffix(&block_switch);
@@ -434,17 +398,11 @@ pub fn build_ui(app: &Application) {
     dl_cancel_box.set_halign(Align::Center);
     dl_cancel_box.set_margin_top(8);
 
-    let install_btn = Button::builder()
-        .label("Install Driver")
-        .sensitive(false)
-        .build();
+    let install_btn = Button::builder().label("Install Driver").sensitive(false).build();
     install_btn.add_css_class("pill");
     install_btn.add_css_class("suggested-action");
 
-    let cancel_dl_btn = Button::builder()
-        .label("Cancel Download")
-        .visible(false)
-        .build();
+    let cancel_dl_btn = Button::builder().label("Cancel Download").visible(false).build();
     cancel_dl_btn.add_css_class("pill");
     cancel_dl_btn.add_css_class("destructive-action");
 
@@ -458,24 +416,14 @@ pub fn build_ui(app: &Application) {
     //  PAGE 4: Log
     // ═════════════════════════════════════════════════════════════════════════
     let log_page = GtkBox::new(Orientation::Vertical, 0);
-    let log_view = TextView::builder()
-        .editable(false)
-        .monospace(true)
-        .wrap_mode(WrapMode::Word)
-        .vexpand(true)
-        .build();
+    let log_view = TextView::builder().editable(false).monospace(true).wrap_mode(WrapMode::Word).vexpand(true).build();
     log_view.add_css_class("card");
     log_view.set_margin_top(8);
     log_view.set_margin_bottom(8);
     log_view.set_margin_start(8);
     log_view.set_margin_end(8);
     let log_scroll = ScrolledWindow::builder().vexpand(true).child(&log_view).build();
-    let clear_btn = Button::builder()
-        .label("Clear Log")
-        .halign(Align::End)
-        .margin_end(8)
-        .margin_bottom(8)
-        .build();
+    let clear_btn = Button::builder().label("Clear Log").halign(Align::End).margin_end(8).margin_bottom(8).build();
     clear_btn.add_css_class("flat");
     log_page.append(&log_scroll);
     log_page.append(&clear_btn);
@@ -563,8 +511,7 @@ pub fn build_ui(app: &Application) {
 
             // File info
             if let Some(path) = &s.downloaded_path {
-                let fname = std::path::Path::new(path)
-                    .file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
+                let fname = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
                 file_row.set_title(&fname);
                 file_row.set_subtitle(path.as_str());
                 if let Some(cs) = s.expected_checksum.as_deref().filter(|c| is_sha256_hex(c)) {
@@ -577,16 +524,11 @@ pub fn build_ui(app: &Application) {
                 if parsed.is_none() {
                     // e.g. NVIDIA-Linux-x86_64-595.84-vulkan.run — don't guess.
                     version_status_row.set_subtitle("Unknown");
-                } else if let (Some(inst), Some(candidate)) =
-                    (s.sysinfo.installed_driver.as_ref(), parsed.as_deref())
-                {
+                } else if let (Some(inst), Some(candidate)) = (s.sysinfo.installed_driver.as_ref(), parsed.as_deref()) {
                     match compare_versions(inst, candidate) {
-                        VersionRelation::Newer => version_status_row.set_subtitle(
-                            &format!("Upgrade: {} → {}", inst, candidate)),
-                        VersionRelation::Same  => version_status_row.set_subtitle(
-                            &format!("Reinstall: same version ({})", inst)),
-                        VersionRelation::Older => version_status_row.set_subtitle(
-                            &format!("Downgrade: {} → {}", inst, candidate)),
+                        VersionRelation::Newer => version_status_row.set_subtitle(&format!("Upgrade: {} → {}", inst, candidate)),
+                        VersionRelation::Same => version_status_row.set_subtitle(&format!("Reinstall: same version ({})", inst)),
+                        VersionRelation::Older => version_status_row.set_subtitle(&format!("Downgrade: {} → {}", inst, candidate)),
                         VersionRelation::Unknown => version_status_row.set_subtitle("—"),
                     }
                 } else {
@@ -602,8 +544,7 @@ pub fn build_ui(app: &Application) {
             // Disk check
             match s.sysinfo.free_disk_bytes {
                 Some(free) if free < MIN_DISK_BYTES => {
-                    disk_warn_row.set_subtitle(&format!(
-                        "Low: {} free (2 GB recommended)", format_bytes(free)));
+                    disk_warn_row.set_subtitle(&format!("Low: {} free (2 GB recommended)", format_bytes(free)));
                 }
                 Some(free) => {
                     disk_warn_row.set_subtitle(&format!("{} free", format_bytes(free)));
@@ -614,21 +555,15 @@ pub fn build_ui(app: &Application) {
             // Secure boot check
             match &s.sysinfo.secure_boot {
                 SecureBootStatus::Enabled => sb_warn_row.set_subtitle(
-                    &secure_boot_advice(
-                        &s.sysinfo.secure_boot,
-                        &s.sysinfo.signing_key,
-                        s.sysinfo.signing_pair.as_ref(),
-                        s.use_dkms,
-                    )
-                    .unwrap_or_else(|| "Enabled".to_string())),
+                    &secure_boot_advice(&s.sysinfo.secure_boot, &s.sysinfo.signing_key, s.sysinfo.signing_pair.as_ref(), s.use_dkms)
+                        .unwrap_or_else(|| "Enabled".to_string()),
+                ),
                 SecureBootStatus::Disabled => sb_warn_row.set_subtitle("Disabled"),
-                SecureBootStatus::Unknown  => sb_warn_row.set_subtitle("Unknown"),
+                SecureBootStatus::Unknown => sb_warn_row.set_subtitle("Unknown"),
             }
 
             // Distro driver packages the install will remove
-            pkg_warn_row.set_subtitle(
-                &conflict_summary(&s.sysinfo.distro_packages)
-                    .unwrap_or_else(|| "None found".to_string()));
+            pkg_warn_row.set_subtitle(&conflict_summary(&s.sysinfo.distro_packages).unwrap_or_else(|| "None found".to_string()));
 
             // Kernel module flavor hint for the detected GPUs
             module_combo.set_subtitle(&module_hint(&s.sysinfo.gpu_compute_caps));
@@ -685,107 +620,102 @@ pub fn build_ui(app: &Application) {
             let block_switch = block_switch.clone();
             let block_opt_row = block_opt_row.clone();
 
-            spawn_async(
-                async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() },
-                move |info| {
-                    // GPU
-                    gpu_row.set_subtitle(info.gpu_name.as_deref().unwrap_or("Not detected"));
+            spawn_async(async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() }, move |info| {
+                // GPU
+                gpu_row.set_subtitle(info.gpu_name.as_deref().unwrap_or("Not detected"));
 
-                    // Driver
-                    if let Some(ref ver) = info.installed_driver {
-                        driver_row.set_subtitle(ver.as_str());
-                        driver_badge.set_label(&format!("Driver: {}", ver));
-                        log_fn(format!("Installed driver: {}", ver));
-                    } else {
-                        driver_row.set_subtitle("Not installed");
-                        driver_badge.set_label("Driver: not installed");
-                        log_fn("No NVIDIA driver detected".to_string());
-                    }
+                // Driver
+                if let Some(ref ver) = info.installed_driver {
+                    driver_row.set_subtitle(ver.as_str());
+                    driver_badge.set_label(&format!("Driver: {}", ver));
+                    log_fn(format!("Installed driver: {}", ver));
+                } else {
+                    driver_row.set_subtitle("Not installed");
+                    driver_badge.set_label("Driver: not installed");
+                    log_fn("No NVIDIA driver detected".to_string());
+                }
 
-                    // Kernel module flavor (loaded) and GPU generation
-                    let gens = if info.gpu_compute_caps.is_empty() {
-                        String::new()
-                    } else {
-                        let mut g: Vec<&str> = info.gpu_compute_caps.iter()
-                            .map(|c| crate::preflight::generation_name(*c)).collect();
-                        g.dedup();
-                        format!(" ({})", g.join(", "))
-                    };
-                    module_row.set_subtitle(&format!("{}{}", info.module_flavor, gens));
+                // Kernel module flavor (loaded) and GPU generation
+                let gens = if info.gpu_compute_caps.is_empty() {
+                    String::new()
+                } else {
+                    let mut g: Vec<&str> = info.gpu_compute_caps.iter().map(|c| crate::preflight::generation_name(*c)).collect();
+                    g.dedup();
+                    format!(" ({})", g.join(", "))
+                };
+                module_row.set_subtitle(&format!("{}{}", info.module_flavor, gens));
 
-                    // Kernel
-                    kernel_row.set_subtitle(&info.kernel_version);
+                // Kernel
+                kernel_row.set_subtitle(&info.kernel_version);
 
-                    // DKMS
-                    if info.dkms_status.is_empty() {
-                        dkms_row.set_subtitle("No NVIDIA DKMS modules registered");
-                    } else {
-                        let summary = info.dkms_status.iter()
-                            .map(|e| format!("{}/{} [{}] {}", e.module, e.version, e.kernel, e.status))
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        dkms_row.set_subtitle(&summary);
-                    }
+                // DKMS
+                if info.dkms_status.is_empty() {
+                    dkms_row.set_subtitle("No NVIDIA DKMS modules registered");
+                } else {
+                    let summary =
+                        info.dkms_status.iter().map(|e| format!("{}/{} [{}] {}", e.module, e.version, e.kernel, e.status)).collect::<Vec<_>>().join("\n");
+                    dkms_row.set_subtitle(&summary);
+                }
 
-                    // Secure boot
-                    secureboot_row.set_subtitle(&secure_boot_summary(&info.secure_boot, &info.signing_key));
+                // Secure boot
+                secureboot_row.set_subtitle(&secure_boot_summary(&info.secure_boot, &info.signing_key));
 
-                    // Module signing: key state, installed module's signer
-                    let mut signing_text = signing_summary(&info.signing_key, &info.module_signature);
-                    if info.signing_pair.as_ref().is_some_and(|p| p.key_hidden) {
-                        signing_text.push_str(
-                            "\nIts private key is readable only by root, so it is checked during the install.",
-                        );
-                    }
-                    signing_row.set_subtitle(&signing_text);
+                // Module signing: key state, installed module's signer
+                let mut signing_text = signing_summary(&info.signing_key, &info.module_signature);
+                if info.signing_pair.as_ref().is_some_and(|p| p.key_hidden) {
+                    signing_text.push_str("\nIts private key is readable only by root, so it is checked during the install.");
+                }
+                signing_row.set_subtitle(&signing_text);
 
-                    // Disk
-                    match info.free_disk_bytes {
-                        Some(free) => disk_row.set_subtitle(&format!("{} free on /", format_bytes(free))),
-                        None       => disk_row.set_subtitle("Could not determine"),
-                    }
+                // Disk
+                match info.free_disk_bytes {
+                    Some(free) => disk_row.set_subtitle(&format!("{} free on /", format_bytes(free))),
+                    None => disk_row.set_subtitle("Could not determine"),
+                }
 
-                    // Reboot
-                    if info.reboot_required {
-                        reboot_row.set_subtitle("Yes — new driver installed, reboot to activate");
-                        reboot_banner.set_revealed(true);
-                    } else {
-                        reboot_row.set_subtitle("No");
-                        reboot_banner.set_revealed(false);
-                    }
+                // Reboot
+                if info.reboot_required {
+                    reboot_row.set_subtitle("Yes — new driver installed, reboot to activate");
+                    reboot_banner.set_revealed(true);
+                } else {
+                    reboot_row.set_subtitle("No");
+                    reboot_banner.set_revealed(false);
+                }
 
-                    // The block option shows what is in place now: leaving it
-                    // on keeps an existing block, turning it off removes it.
-                    block_switch.set_active(info.distro_driver_blocked);
-                    block_switch.set_sensitive(info.block_supported);
-                    block_opt_row.set_subtitle(if info.block_supported {
-                        BLOCK_SUBTITLE
-                    } else {
-                        "Not available here: this dnf has no way to exclude packages for good"
-                    });
+                // The block option shows what is in place now: leaving it
+                // on keeps an existing block, turning it off removes it.
+                block_switch.set_active(info.distro_driver_blocked);
+                block_switch.set_sensitive(info.block_supported);
+                block_opt_row.set_subtitle(if info.block_supported {
+                    BLOCK_SUBTITLE
+                } else {
+                    "Not available here: this dnf has no way to exclude packages for good"
+                });
 
-                    {
-                        let mut s = state.borrow_mut();
-                        s.block_distro_driver = info.distro_driver_blocked && info.block_supported;
-                        s.sysinfo = info;
-                        s.sysinfo_loaded = true;
-                    }
-                    // Update configure tab with new disk/secureboot/version info
-                    update_config_tab();
-                    // Re-populate browse list with version badges now that driver is known
-                    let versions = state.borrow().versions.clone();
-                    if !versions.is_empty() {
-                        let installed = state.borrow().sysinfo.installed_driver.clone();
-                        populate_list(&list_box, &versions, &search_entry.text(), installed.as_deref());
-                    }
-                },
-            );
+                {
+                    let mut s = state.borrow_mut();
+                    s.block_distro_driver = info.distro_driver_blocked && info.block_supported;
+                    s.sysinfo = info;
+                    s.sysinfo_loaded = true;
+                }
+                // Update configure tab with new disk/secureboot/version info
+                update_config_tab();
+                // Re-populate browse list with version badges now that driver is known
+                let versions = state.borrow().versions.clone();
+                if !versions.is_empty() {
+                    let installed = state.borrow().sysinfo.installed_driver.clone();
+                    populate_list(&list_box, &versions, &search_entry.text(), installed.as_deref());
+                }
+            });
         }
     };
 
     load_sysinfo();
 
-    { let ls = load_sysinfo.clone(); refresh_sysinfo_btn.connect_clicked(move |_| ls()); }
+    {
+        let ls = load_sysinfo.clone();
+        refresh_sysinfo_btn.connect_clicked(move |_| ls());
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Set Up Signing: one-time MOK password, then the privileged setup
@@ -800,19 +730,9 @@ pub fn build_ui(app: &Application) {
         let refresh_actions = refresh_actions.clone();
 
         signing_btn.connect_clicked(move |_| {
-            let pw1 = gtk4::PasswordEntry::builder()
-                .placeholder_text("One-time password")
-                .show_peek_icon(true)
-                .build();
-            let pw2 = gtk4::PasswordEntry::builder()
-                .placeholder_text("Type it again")
-                .show_peek_icon(true)
-                .build();
-            let hint = Label::builder()
-                .label(MOK_PASSWORD_HINT)
-                .wrap(true)
-                .xalign(0.0)
-                .build();
+            let pw1 = gtk4::PasswordEntry::builder().placeholder_text("One-time password").show_peek_icon(true).build();
+            let pw2 = gtk4::PasswordEntry::builder().placeholder_text("Type it again").show_peek_icon(true).build();
+            let hint = Label::builder().label(MOK_PASSWORD_HINT).wrap(true).xalign(0.0).build();
             hint.add_css_class("dim-label");
             let fields = GtkBox::new(Orientation::Vertical, 8);
             fields.append(&pw1);
@@ -842,9 +762,7 @@ pub fn build_ui(app: &Application) {
                 let other = other.downgrade();
                 let hint = hint.downgrade();
                 entry.connect_changed(move |entry| {
-                    let (Some(dialog), Some(other), Some(hint)) =
-                        (dialog.upgrade(), other.upgrade(), hint.upgrade())
-                    else {
+                    let (Some(dialog), Some(other), Some(hint)) = (dialog.upgrade(), other.upgrade(), hint.upgrade()) else {
                         return;
                     };
                     match validate_mok_password(&entry.text(), &other.text()) {
@@ -882,36 +800,28 @@ pub fn build_ui(app: &Application) {
                 stack.set_visible_child_name("log");
                 log_fn("Setting up module signing…".to_string());
 
-                spawn_async(
-                    async move {
-                        tokio::task::spawn_blocking(move || run_privileged_setup_signing(&password))
-                            .await
-                    },
-                    move |outcome| {
-                        guard.release();
-                        match outcome {
-                            Ok(outcome) => {
-                                for line in &outcome.lines {
-                                    log_fn(line.clone());
+                spawn_async(async move { tokio::task::spawn_blocking(move || run_privileged_setup_signing(&password)).await }, move |outcome| {
+                    guard.release();
+                    match outcome {
+                        Ok(outcome) => {
+                            for line in &outcome.lines {
+                                log_fn(line.clone());
+                            }
+                            match outcome.result {
+                                Ok(()) => {
+                                    log_fn("Module signing setup finished.".to_string());
+                                    toast_overlay.add_toast(Toast::new("Module signing set up — see Log tab"));
                                 }
-                                match outcome.result {
-                                    Ok(()) => {
-                                        log_fn("Module signing setup finished.".to_string());
-                                        toast_overlay.add_toast(Toast::new(
-                                            "Module signing set up — see Log tab"));
-                                    }
-                                    Err(e) => {
-                                        log_fn(format!("Module signing setup failed: {}", e));
-                                        toast_overlay.add_toast(Toast::new(
-                                            "Signing setup failed — see Log tab"));
-                                    }
+                                Err(e) => {
+                                    log_fn(format!("Module signing setup failed: {}", e));
+                                    toast_overlay.add_toast(Toast::new("Signing setup failed — see Log tab"));
                                 }
                             }
-                            Err(e) => log_fn(format!("Task error: {}", e)),
                         }
-                        load_sysinfo();
-                    },
-                );
+                        Err(e) => log_fn(format!("Task error: {}", e)),
+                    }
+                    load_sysinfo();
+                });
             });
         });
     }
@@ -934,7 +844,9 @@ pub fn build_ui(app: &Application) {
             list_spinner.start();
             list_spinner.set_visible(true);
             banner.set_revealed(false);
-            while let Some(c) = list_box.first_child() { list_box.remove(&c); }
+            while let Some(c) = list_box.first_child() {
+                list_box.remove(&c);
+            }
             refresh_actions();
             selected_label.set_label("Loading…");
             log_fn("Fetching version list from NVIDIA…".to_string());
@@ -970,13 +882,7 @@ pub fn build_ui(app: &Application) {
                         let state = state.clone();
                         let log_fn = log_fn.clone();
                         spawn_async(
-                            async {
-                                tokio::time::timeout(
-                                    BRANCH_LABEL_TIMEOUT,
-                                    fetch_branches(UNIX_DRIVERS_PAGE),
-                                )
-                                .await
-                            },
+                            async { tokio::time::timeout(BRANCH_LABEL_TIMEOUT, fetch_branches(UNIX_DRIVERS_PAGE)).await },
                             move |result| match result {
                                 Ok(Ok(branches)) => {
                                     {
@@ -987,12 +893,8 @@ pub fn build_ui(app: &Application) {
                                     }
                                     add_branch_badges(&list_box, &state.borrow().versions);
                                 }
-                                Ok(Err(e)) => log_fn(format!(
-                                    "No branch labels: NVIDIA's branch data is unavailable ({e:#})"
-                                )),
-                                Err(_) => log_fn(
-                                    "No branch labels: NVIDIA's branch data took too long".to_string(),
-                                ),
+                                Ok(Err(e)) => log_fn(format!("No branch labels: NVIDIA's branch data is unavailable ({e:#})")),
+                                Err(_) => log_fn("No branch labels: NVIDIA's branch data took too long".to_string()),
                             },
                         );
                     }
@@ -1003,7 +905,10 @@ pub fn build_ui(app: &Application) {
 
     load_versions();
 
-    { let lv = load_versions.clone(); refresh_btn.connect_clicked(move |_| lv()); }
+    {
+        let lv = load_versions.clone();
+        refresh_btn.connect_clicked(move |_| lv());
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Row selection — connected exactly once. The version is looked up by the
@@ -1018,9 +923,7 @@ pub fn build_ui(app: &Application) {
         list_box.connect_row_selected(move |_, row| {
             let selected = row
                 .and_then(|r| r.downcast_ref::<ActionRow>().map(|ar| ar.title().to_string()))
-                .and_then(|title| {
-                    state.borrow().versions.iter().find(|v| v.version == title).cloned()
-                });
+                .and_then(|title| state.borrow().versions.iter().find(|v| v.version == title).cloned());
 
             match selected {
                 Some(ver) => {
@@ -1095,16 +998,12 @@ pub fn build_ui(app: &Application) {
             // XDG_DOWNLOAD_DIR normally lives only in ~/.config/user-dirs.dirs,
             // not the environment — ask GLib, which reads that file.
             let dest_dir = glib::user_special_dir(glib::UserDirectory::Downloads)
-                .unwrap_or_else(|| {
-                    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
-                        .join("Downloads")
-                });
+                .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join("Downloads"));
 
             // Progress channel — sent from the Tokio side, drained on the GTK
             // main context. The loop exits when the sender drops at download
             // end, so nothing is leaked.
-            let (prog_tx, mut prog_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
+            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
             let download_start = std::time::Instant::now();
             {
                 let progress = ui.progress.clone();
@@ -1112,7 +1011,9 @@ pub fn build_ui(app: &Application) {
                     let mut last_ui = std::time::Instant::now();
                     while let Some(mut msg) = prog_rx.recv().await {
                         // Coalesce bursts — jump to the newest queued update
-                        while let Ok(newer) = prog_rx.try_recv() { msg = newer; }
+                        while let Ok(newer) = prog_rx.try_recv() {
+                            msg = newer;
+                        }
                         // Throttle UI redraws to ~10 Hz
                         if last_ui.elapsed() < std::time::Duration::from_millis(100) {
                             continue;
@@ -1130,7 +1031,9 @@ pub fn build_ui(app: &Application) {
                                 } else {
                                     format!("{:.0}m remaining", remaining / 60.0)
                                 }
-                            } else { "calculating…".to_string() };
+                            } else {
+                                "calculating…".to_string()
+                            };
                             progress.set_text(Some(&format!(
                                 "{:.1} / {:.1} MB  ({:.1} MB/s)  {}",
                                 dl as f64 / 1_000_000.0,
@@ -1154,10 +1057,15 @@ pub fn build_ui(app: &Application) {
                     let checksum = fetch_checksum(&ver).await.map_err(|e| format!("{e:#}"));
                     let tx = prog_tx;
                     let result = download_run_file(
-                        &url, &dest_dir, &filename,
-                        move |dl, total| { let _ = tx.send((dl, total)); },
+                        &url,
+                        &dest_dir,
+                        &filename,
+                        move |dl, total| {
+                            let _ = tx.send((dl, total));
+                        },
                         cancel_flag,
-                    ).await;
+                    )
+                    .await;
                     (ver, checksum, result)
                 },
                 move |(ver, checksum, result)| {
@@ -1246,7 +1154,11 @@ pub fn build_ui(app: &Application) {
                             return;
                         }
                         log_fn(format!("Opened local file: {}", path_str));
-                        { let mut s = state.borrow_mut(); s.downloaded_path = Some(path_str); s.expected_checksum = None; }
+                        {
+                            let mut s = state.borrow_mut();
+                            s.downloaded_path = Some(path_str);
+                            s.expected_checksum = None;
+                        }
                         update_config_tab();
                         stack.set_visible_child_name("configure");
                     },
@@ -1277,7 +1189,12 @@ pub fn build_ui(app: &Application) {
             };
         });
     }
-    { let s = state.clone(); block_switch.connect_active_notify(move |sw| { s.borrow_mut().block_distro_driver = sw.is_active(); }); }
+    {
+        let s = state.clone();
+        block_switch.connect_active_notify(move |sw| {
+            s.borrow_mut().block_distro_driver = sw.is_active();
+        });
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Install
@@ -1302,8 +1219,7 @@ pub fn build_ui(app: &Application) {
 
             if let Some(free) = s.sysinfo.free_disk_bytes {
                 if free < MIN_DISK_BYTES {
-                    toast_overlay.add_toast(Toast::new(
-                        "Warning: low disk space — install may fail"));
+                    toast_overlay.add_toast(Toast::new("Warning: low disk space — install may fail"));
                 }
             }
 
@@ -1313,9 +1229,7 @@ pub fn build_ui(app: &Application) {
                 .and_then(|n| n.to_str())
                 .and_then(version_from_filename)
                 .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
-            if let Err(msg) = validate_module_choice(
-                s.module_choice, &s.sysinfo.gpu_compute_caps, driver_major,
-            ) {
+            if let Err(msg) = validate_module_choice(s.module_choice, &s.sysinfo.gpu_compute_caps, driver_major) {
                 log_fn(format!("Install not started: {}", msg));
                 toast_overlay.add_toast(Toast::new(&msg));
                 return;
@@ -1400,10 +1314,7 @@ pub fn build_ui(app: &Application) {
                         Ok(Err(e)) if e.downcast_ref::<StaleRecovery>().is_some() => {
                             log_fn(format!("Install not started: {e}"));
                             // Only on the user's word: install anyway, dropping that data.
-                            let dialog = libadwaita::AlertDialog::new(
-                                Some("Recovery data from an interrupted install"),
-                                Some(&e.to_string()),
-                            );
+                            let dialog = libadwaita::AlertDialog::new(Some("Recovery data from an interrupted install"), Some(&e.to_string()));
                             dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard and Install")]);
                             dialog.set_response_appearance("discard", libadwaita::ResponseAppearance::Destructive);
                             dialog.set_default_response(Some("cancel"));
@@ -1462,16 +1373,18 @@ pub fn build_ui(app: &Application) {
                     gpu, driver, kernel
                 ))
                 .build();
-            dialog.add_credit_section(
-                Some("Built with"),
-                &["Claude Code (Anthropic)", "Codex (OpenAI)"],
-            );
+            dialog.add_credit_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
             dialog.present(Some(&window));
         });
     }
 
     // Clear log
-    { let lv = log_view.clone(); clear_btn.connect_clicked(move |_| { lv.buffer().set_text(""); }); }
+    {
+        let lv = log_view.clone();
+        clear_btn.connect_clicked(move |_| {
+            lv.buffer().set_text("");
+        });
+    }
 
     // Closing the window doesn't stop a running install (it carries on, or
     // puts the previous driver back, on its own), but the user must not take
@@ -1601,11 +1514,7 @@ pub fn build_ui(app: &Application) {
                      Discard Recovery Data drops it for good, keeping the driver as it is.",
                 ),
             );
-            dialog.add_responses(&[
-                ("cancel", "Cancel"),
-                ("discard", "Discard Recovery Data"),
-                ("retry", "Retry Recovery"),
-            ]);
+            dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard Recovery Data"), ("retry", "Retry Recovery")]);
             dialog.set_response_appearance("discard", libadwaita::ResponseAppearance::Destructive);
             dialog.set_default_response(Some("retry"));
             dialog.set_close_response("cancel");
@@ -1641,11 +1550,7 @@ pub fn build_ui(app: &Application) {
                         "Retry or Discard…",
                         true,
                     ),
-                    Some(RecoveryNote::Failed(why)) => (
-                        format!("Restoring the driver from before an interrupted install failed: {why}."),
-                        "Try Again",
-                        false,
-                    ),
+                    Some(RecoveryNote::Failed(why)) => (format!("Restoring the driver from before an interrupted install failed: {why}."), "Try Again", false),
                     None => (RECOVER_TEXT.to_string(), "Restore Previous Driver", false),
                 };
                 recover_banner.set_title(&text);
@@ -1676,8 +1581,7 @@ pub fn build_ui(app: &Application) {
 const RECOVER_TEXT: &str = "An earlier driver install was cut off before it finished. Restore \
      the driver this computer had before (this also happens on its own at the next boot).";
 
-const BLOCK_SUBTITLE: &str =
-    "Keep apt or dnf from installing the distribution's NVIDIA driver over this one later";
+const BLOCK_SUBTITLE: &str = "Keep apt or dnf from installing the distribution's NVIDIA driver over this one later";
 
 /// A message the user has to see, in a dialog over the window.
 fn show_error(window: &ApplicationWindow, heading: &str, body: &str) {
@@ -1749,31 +1653,23 @@ impl DownloadUi {
 /// (`Ok(None)`) the user decides whether to use the file unverified; when
 /// the checksum couldn't be fetched (`Err`), the choice is to retry or to
 /// discard the file — never to skip the check.
-fn finish_download(
-    ui: DownloadUi,
-    ver: DriverVersion,
-    path: PathBuf,
-    checksum: Result<Option<String>, String>,
-) {
+fn finish_download(ui: DownloadUi, ver: DriverVersion, path: PathBuf, checksum: Result<Option<String>, String>) {
     match checksum {
         Ok(Some(cs)) => {
             (ui.log)("Verifying SHA256…".to_string());
             ui.progress.set_text(Some("Verifying…"));
             let file = path.clone();
             let expected = cs.clone();
-            spawn_async(
-                async move { verify_sha256(&file, &expected).await },
-                move |verified| match verified {
-                    Ok(()) => {
-                        (ui.log)("SHA256 verified OK".to_string());
-                        ui.accept(&path, Some(cs), "Verified", "Download complete");
-                    }
-                    Err(e) => {
-                        (ui.log)(format!("SHA256 FAILED: {}", e));
-                        ui.discard(&path, "Checksum mismatch — file deleted", "Checksum mismatch — do not install");
-                    }
-                },
-            );
+            spawn_async(async move { verify_sha256(&file, &expected).await }, move |verified| match verified {
+                Ok(()) => {
+                    (ui.log)("SHA256 verified OK".to_string());
+                    ui.accept(&path, Some(cs), "Verified", "Download complete");
+                }
+                Err(e) => {
+                    (ui.log)(format!("SHA256 FAILED: {}", e));
+                    ui.discard(&path, "Checksum mismatch — file deleted", "Checksum mismatch — do not install");
+                }
+            });
         }
         Ok(None) => {
             (ui.log)("NVIDIA publishes no SHA256 checksum for this version".to_string());
@@ -1823,10 +1719,7 @@ fn finish_download(
                 (ui.log)("Fetching the SHA256 checksum again…".to_string());
                 ui.progress.set_text(Some("Fetching checksum…"));
                 let v = ver.clone();
-                spawn_async(
-                    async move { fetch_checksum(&v).await.map_err(|e| format!("{e:#}")) },
-                    move |checksum| finish_download(ui, ver, path, checksum),
-                );
+                spawn_async(async move { fetch_checksum(&v).await.map_err(|e| format!("{e:#}")) }, move |checksum| finish_download(ui, ver, path, checksum));
             });
         }
     }
@@ -1836,34 +1729,29 @@ fn finish_download(
 //  Populate version list with version-status badges
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn populate_list(
-    list_box: &ListBox,
-    versions: &[DriverVersion],
-    filter: &str,
-    installed: Option<&str>,
-) {
-    while let Some(c) = list_box.first_child() { list_box.remove(&c); }
+fn populate_list(list_box: &ListBox, versions: &[DriverVersion], filter: &str, installed: Option<&str>) {
+    while let Some(c) = list_box.first_child() {
+        list_box.remove(&c);
+    }
     let filter = filter.to_lowercase();
 
     for ver in versions {
-        if !filter.is_empty() && !ver.version.contains(&filter) { continue; }
+        if !filter.is_empty() && !ver.version.contains(&filter) {
+            continue;
+        }
 
         let subtitle = if let Some(inst) = installed {
             match compare_versions(inst, &ver.version) {
-                VersionRelation::Newer  => format!("{} · Upgrade available", ver.filename),
-                VersionRelation::Same   => format!("{} · Currently installed", ver.filename),
-                VersionRelation::Older  => format!("{} · Older than installed", ver.filename),
+                VersionRelation::Newer => format!("{} · Upgrade available", ver.filename),
+                VersionRelation::Same => format!("{} · Currently installed", ver.filename),
+                VersionRelation::Older => format!("{} · Older than installed", ver.filename),
                 VersionRelation::Unknown => ver.filename.clone(),
             }
         } else {
             ver.filename.clone()
         };
 
-        let row = ActionRow::builder()
-            .title(&ver.version)
-            .subtitle(&subtitle)
-            .activatable(true)
-            .build();
+        let row = ActionRow::builder().title(&ver.version).subtitle(&subtitle).activatable(true).build();
 
         // Highlight the currently installed version
         if installed.map(|i| i == ver.version).unwrap_or(false) {
@@ -1931,18 +1819,8 @@ mod tests {
 
     #[test]
     fn one_operation_at_a_time() {
-        let ver = DriverVersion {
-            version: "595.84".into(),
-            filename: "NVIDIA-Linux-x86_64-595.84.run".into(),
-            url: String::new(),
-            branch: None,
-        };
-        let mut s = AppState {
-            selected_version: Some(ver),
-            downloaded_path: Some("/x.run".into()),
-            sysinfo_loaded: true,
-            ..AppState::default()
-        };
+        let ver = DriverVersion { version: "595.84".into(), filename: "NVIDIA-Linux-x86_64-595.84.run".into(), url: String::new(), branch: None };
+        let mut s = AppState { selected_version: Some(ver), downloaded_path: Some("/x.run".into()), sysinfo_loaded: true, ..AppState::default() };
         s.sysinfo.signing_key = SigningKeyState::NoKey;
         let all = ActionsEnabled { download: true, open_file: true, install: true, setup_signing: true };
         assert_eq!(actions_enabled(&s), all);

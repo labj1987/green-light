@@ -39,11 +39,7 @@ async fn fetch_versions_from(base: &str) -> Result<Vec<DriverVersion>> {
         .read_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let resp = client
-        .get(base)
-        .send()
-        .await
-        .context("Failed to reach NVIDIA download server")?;
+    let resp = client.get(base).send().await.context("Failed to reach NVIDIA download server")?;
     let status = resp.status();
     if !status.is_success() {
         bail!("NVIDIA's download server answered HTTP {}", status);
@@ -111,11 +107,7 @@ pub async fn fetch_checksum(version: &DriverVersion) -> Result<Option<String>> {
         .build()?;
 
     let sha_url = format!("{}.sha256sum", version.url);
-    let resp = client
-        .get(&sha_url)
-        .send()
-        .await
-        .context("Could not reach NVIDIA's download server for the checksum")?;
+    let resp = client.get(&sha_url).send().await.context("Could not reach NVIDIA's download server for the checksum")?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
@@ -136,14 +128,8 @@ mod tests {
 
     #[test]
     fn parses_version_from_official_filename() {
-        assert_eq!(
-            version_from_filename("NVIDIA-Linux-x86_64-595.84.run").as_deref(),
-            Some("595.84")
-        );
-        assert_eq!(
-            version_from_filename("NVIDIA-Linux-x86_64-580.178.04.run").as_deref(),
-            Some("580.178.04")
-        );
+        assert_eq!(version_from_filename("NVIDIA-Linux-x86_64-595.84.run").as_deref(), Some("595.84"));
+        assert_eq!(version_from_filename("NVIDIA-Linux-x86_64-580.178.04.run").as_deref(), Some("580.178.04"));
     }
 
     #[test]
@@ -171,12 +157,7 @@ mod tests {
 
     fn version_at(base: &str, v: &str) -> DriverVersion {
         let filename = format!("NVIDIA-Linux-x86_64-{v}.run");
-        DriverVersion {
-            version: v.to_string(),
-            url: format!("{base}{v}/{filename}"),
-            filename,
-            branch: None,
-        }
+        DriverVersion { version: v.to_string(), url: format!("{base}{v}/{filename}"), filename, branch: None }
     }
 
     #[tokio::test]
@@ -224,9 +205,7 @@ mod tests {
     async fn live_fetch_shows_branch_labels() {
         let mut versions = fetch_versions().await.expect("live fetch failed");
         assert!(!versions.is_empty());
-        let branches = crate::branches::fetch_branches(crate::branches::UNIX_DRIVERS_PAGE)
-            .await
-            .expect("live branch fetch failed");
+        let branches = crate::branches::fetch_branches(crate::branches::UNIX_DRIVERS_PAGE).await.expect("live branch fetch failed");
         for v in &mut versions {
             v.branch = branches.classify(&v.version);
         }

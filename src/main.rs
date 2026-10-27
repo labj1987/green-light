@@ -17,12 +17,7 @@ const APP_ID: &str = "io.github.labj1987.GreenLight";
 static TOKIO_RT: OnceLock<Runtime> = OnceLock::new();
 
 pub fn runtime() -> &'static Runtime {
-    TOKIO_RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build Tokio runtime")
-    })
+    TOKIO_RT.get_or_init(|| tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("Failed to build Tokio runtime"))
 }
 
 fn main() {
@@ -35,10 +30,7 @@ fn main() {
     glib::set_prgname(Some(APP_ID));
     glib::set_application_name("Green Light");
 
-    let app = libadwaita::Application::builder()
-        .application_id(APP_ID)
-        .flags(gio::ApplicationFlags::FLAGS_NONE)
-        .build();
+    let app = libadwaita::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::FLAGS_NONE).build();
 
     app.connect_activate(|app| {
         if let Some(window) = app.windows().first() {
