@@ -1253,6 +1253,9 @@ if [[ -d "$JOURNAL" ]]; then
             PLYMOUTH=0
         fi
     fi
+elif [[ $DISCARD_RECOVERY -eq 1 ]]; then
+    # No journal (removed by other means): a note left about it is stale too.
+    recovery_note ""
 fi
 if [[ "$MODE" != "install" ]]; then
     if [[ "$MODE" == "discard" ]]; then

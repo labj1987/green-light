@@ -1017,6 +1017,15 @@ tail -n +"$LAST_INSTALLER" "$T/calls" | grep -qxF "update-initramfs -u -k $KVER2
     || fail "the rollback did not rebuild the running kernel $KVER2"
 end
 
+begin "discarding with no journal left removes a stale recovery note"
+mkdir -p "$T/var/lib/green-light"
+echo "refused: the driver was changed since" > "$T/var/lib/green-light/recovery-status"
+run_script --discard-recovery
+expect_rc 0
+expect_out "Recovery data discarded."
+expect_no_file "$T/var/lib/green-light/recovery-status"
+end
+
 begin "--recover with no journal does nothing"
 recover
 expect_rc 0
