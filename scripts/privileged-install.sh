@@ -908,13 +908,17 @@ signer_trusted() { # <signer>
 }
 
 # Kernels whose module matters after a rollback: the one the journal was
-# written for, and the one running now if that is another (a recovery at
-# boot after a newer kernel was installed in the meantime).
+# written for, those of the earlier installs a carried journal was built on
+# (their baseline is the setup being restored), and the one running now if
+# that is another (a recovery at boot after a newer kernel was installed in
+# the meantime). Each once, and only while its module tree exists.
 restore_kernels() {
-    local boot
+    local boot k
     boot="$(uname -r)"
     printf '%s\n' "$KVER"
-    if [[ "$boot" != "$KVER" && -d "/lib/modules/$boot" ]]; then printf '%s\n' "$boot"; fi
+    for k in "${EARLIER_KERNELS[@]}" "$boot"; do
+        if [[ "$k" != "$KVER" && -d "/lib/modules/$k" ]]; then printf '%s\n' "$k"; fi
+    done | sort -u
 }
 
 initramfs_for() { # <kernel>
@@ -1193,12 +1197,14 @@ start_inhibitor() {
 # (Top level, not a function: sourcing the state must set globals.)
 RECOVER_RC=0
 CARRIED=0
+EARLIER_KERNELS=()
 # shellcheck source=/dev/null  # the state is written by this script, root-only
 if [[ -d "$JOURNAL" ]]; then
     PHASE="$(cat "$JOURNAL/phase" 2>/dev/null || echo armed)"
     TARGET_RUN_VER=""
     KNOWN_TARGETS=()
     EARLIER_INSTALLER_STARTED=0
+    EARLIER_KERNELS=()
     MOD_KERNELS_BEFORE=()
     if [[ "$PHASE" == "installer-done" ]]; then
         log "An earlier install had finished NVIDIA's installer before it was cut off; nothing to put back."
@@ -1271,6 +1277,11 @@ if [[ $RECOVER_RC -eq $EXIT_ROLLBACK_FAILED ]]; then
     # That install's driver, and whether its installer had run, stay known.
     if [[ -n "${TARGET_RUN_VER:-}" ]]; then KNOWN_TARGETS+=("$TARGET_RUN_VER"); fi
     if [[ "$PHASE" == "installer-started" ]]; then EARLIER_INSTALLER_STARTED=1; fi
+    # So does the kernel it was written for: this install's journal is
+    # written for the running one, and a rollback rebuilds and checks both.
+    if [[ -n "${KVER:-}" ]] && ! printf '%s\n' "${EARLIER_KERNELS[@]}" | grep -qxF -- "$KVER"; then
+        EARLIER_KERNELS+=("$KVER")
+    fi
 fi
 
 # ── Install mode ───────────────────────────────────────────────────────
@@ -1589,7 +1600,7 @@ if [[ $CARRIED -eq 1 ]]; then
         { cat "$JOURNAL.new/planned"; planned_removals "${PKGS[@]}"; } | sort -u > "$PRIV_DIR/planned"
         cp -- "$PRIV_DIR/planned" "$JOURNAL.new/planned"
     fi
-    declare -p KVER TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED >> "$JOURNAL.new/state"
+    declare -p KVER TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED EARLIER_KERNELS >> "$JOURNAL.new/state"
 else
     mkdir -m 700 "$JOURNAL.new" "$JOURNAL.new/backup"
     package_snapshot > "$JOURNAL.new/packages-before"
@@ -1612,8 +1623,9 @@ else
     backup_file /usr/lib/nvidia/alternate-install-present
     KNOWN_TARGETS=()
     EARLIER_INSTALLER_STARTED=0
+    EARLIER_KERNELS=()
     declare -p PKG_MGR KVER HELD BACKUPS WAS_BLOCKED RUN_VER_BEFORE MOD_VER_BEFORE MOD_SIGNER_BEFORE \
-        MOD_KERNELS_BEFORE TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED \
+        MOD_KERNELS_BEFORE TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED EARLIER_KERNELS \
         > "$JOURNAL.new/state"
     : > "$JOURNAL.new/cache-index"
 fi

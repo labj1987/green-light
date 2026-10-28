@@ -997,6 +997,26 @@ grep -q '|nvidia-driver-595|595.84-0ubuntu1' "$T/dpkg" || fail "not the original
 expect_no_journal
 end
 
+begin "a carried baseline's kernel is rebuilt by the rollback of an install on a newer one"
+cut_off_during_purge
+echo 2 > "$T/fail-reinstall-times"
+echo fail > "$T/installer-mode"
+mkdir -p "$T/modules/$KVER2/build/include/generated"
+touch "$T/modules/$KVER2/build/Makefile"
+echo '#define CONFIG_CC_IS_GCC 1' > "$T/modules/$KVER2/build/include/generated/autoconf.h"
+echo "$KVER2" > "$T/uname"
+: > "$T/calls"
+run_default
+expect_out "this install keeps its recovery data as the starting point to restore"
+# After this install's own installer: its rollback covers the kernel the
+# carried baseline was recorded on, not only the running one.
+LAST_INSTALLER="$(grep -n '^installer ' "$T/calls" | tail -1 | cut -d: -f1)"
+tail -n +"$LAST_INSTALLER" "$T/calls" | grep -qxF "update-initramfs -u -k $KVER" \
+    || fail "the rollback did not rebuild $KVER, the carried baseline's kernel"
+tail -n +"$LAST_INSTALLER" "$T/calls" | grep -qxF "update-initramfs -u -k $KVER2" \
+    || fail "the rollback did not rebuild the running kernel $KVER2"
+end
+
 begin "--recover with no journal does nothing"
 recover
 expect_rc 0
