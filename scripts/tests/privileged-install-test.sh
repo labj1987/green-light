@@ -1281,6 +1281,18 @@ list_size_ok || fail "the shared list must record MokNew's size: $(head -1 "$T/v
 grep -q pass1234 "$T/calls" && fail "the password reached an argument list"
 end
 
+begin "signing setup installs a missing mokutil without passing on the lock"
+mok_case
+mv "$T/bin/mokutil" "$T/mokutil.saved"
+stub apt-get '[[ -e /proc/self/fd/9 ]] && touch "$GLT/lock-leaked-to-apt"
+[[ "$1 $3" == "install mokutil" ]] && cp "$GLT/mokutil.saved" "$GLT/bin/mokutil"
+exit 0'
+setup_signing pass1234
+expect_rc 0
+expect_call "apt-get install -y mokutil"
+expect_no_file "$T/lock-leaked-to-apt"
+end
+
 begin "signing setup re-queues its own waiting key under the new password"
 mok_case
 write_moknew x509 "$T/var/lib/shim-signed/mok/MOK.der"

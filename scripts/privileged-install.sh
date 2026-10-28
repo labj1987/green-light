@@ -302,6 +302,19 @@ cert_subject_cn() { # <cert>
     return 0
 }
 
+# Run a command without the lock's file descriptor, so nothing it leaves
+# running in the background (akmods from an rpm scriptlet, a DKMS build)
+# keeps the lock, and with it the "install running" state, after this run;
+# and with SIGTERM/SIGINT at their defaults, whatever this script does with
+# them (it ignores them while putting things back). Used by the signing
+# setup below too, which holds the same lock.
+# (env resets dispositions bash can't: a signal already ignored when the
+# script started, like SIGPIPE under some service managers, stays ignored
+# for bash itself.)
+ENV_DEFAULT_SIGNALS=()
+if env --default-signal=PIPE true 2>/dev/null; then ENV_DEFAULT_SIGNALS=(env "--default-signal=PIPE,TERM,INT"); fi
+nolock() { ( trap - TERM INT; exec "${ENV_DEFAULT_SIGNALS[@]}" "$@" ) 9>&-; }
+
 # ── Setup mode: --setup-signing ────────────────────────────────────────
 # The list of waiting keys the apps read (MokNew itself is readable by root
 # only). It is shared: another app's signing setup rebuilds the same request
@@ -389,10 +402,10 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
         log "Installing ${MISSING_PKGS[*]}…"
         if [[ "$PKG_MGR" == "apt" ]]; then
-            apt-get install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
+            nolock apt-get install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
                 || { log "ERROR: apt-get could not install ${MISSING_PKGS[*]}"; exit 1; }
         else
-            dnf install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
+            nolock dnf install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
                 || { log "ERROR: dnf could not install ${MISSING_PKGS[*]}"; exit 1; }
         fi
     fi
@@ -586,18 +599,6 @@ if [[ "$OWN_SID" != "$$" ]] && command -v setsid >/dev/null 2>&1; then
 fi
 
 usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
-
-# Run a command without the lock's file descriptor, so nothing it leaves
-# running in the background (akmods from an rpm scriptlet, a DKMS build)
-# keeps the lock, and with it the "install running" state, after this run;
-# and with SIGTERM/SIGINT at their defaults, whatever this script does with
-# them (it ignores them while putting things back).
-# (env resets dispositions bash can't: a signal already ignored when the
-# script started, like SIGPIPE under some service managers, stays ignored
-# for bash itself.)
-ENV_DEFAULT_SIGNALS=()
-if env --default-signal=PIPE true 2>/dev/null; then ENV_DEFAULT_SIGNALS=(env "--default-signal=PIPE,TERM,INT"); fi
-nolock() { ( trap - TERM INT; exec "${ENV_DEFAULT_SIGNALS[@]}" "$@" ) 9>&-; }
 
 # One install at a time. The app also checks this lock to tell that an
 # install is still running (for example after it was closed and reopened).
