@@ -997,6 +997,35 @@ grep -q '|nvidia-driver-595|595.84-0ubuntu1' "$T/dpkg" || fail "not the original
 expect_no_journal
 end
 
+begin "a carried baseline's kernel is rebuilt by the rollback of an install on a newer one"
+cut_off_during_purge
+echo 2 > "$T/fail-reinstall-times"
+echo fail > "$T/installer-mode"
+mkdir -p "$T/modules/$KVER2/build/include/generated"
+touch "$T/modules/$KVER2/build/Makefile"
+echo '#define CONFIG_CC_IS_GCC 1' > "$T/modules/$KVER2/build/include/generated/autoconf.h"
+echo "$KVER2" > "$T/uname"
+: > "$T/calls"
+run_default
+expect_out "this install keeps its recovery data as the starting point to restore"
+# After this install's own installer: its rollback covers the kernel the
+# carried baseline was recorded on, not only the running one.
+LAST_INSTALLER="$(grep -n '^installer ' "$T/calls" | tail -1 | cut -d: -f1)"
+tail -n +"$LAST_INSTALLER" "$T/calls" | grep -qxF "update-initramfs -u -k $KVER" \
+    || fail "the rollback did not rebuild $KVER, the carried baseline's kernel"
+tail -n +"$LAST_INSTALLER" "$T/calls" | grep -qxF "update-initramfs -u -k $KVER2" \
+    || fail "the rollback did not rebuild the running kernel $KVER2"
+end
+
+begin "discarding with no journal left removes a stale recovery note"
+mkdir -p "$T/var/lib/green-light"
+echo "refused: the driver was changed since" > "$T/var/lib/green-light/recovery-status"
+run_script --discard-recovery
+expect_rc 0
+expect_out "Recovery data discarded."
+expect_no_file "$T/var/lib/green-light/recovery-status"
+end
+
 begin "--recover with no journal does nothing"
 recover
 expect_rc 0
@@ -1259,6 +1288,18 @@ list_size_ok || fail "the shared list must record MokNew's size: $(head -1 "$T/v
     || fail "the shared list must be readable by the apps"
 [[ -z "$(compgen -G "$T/var/lib/mok-pending/.list.*")" ]] || fail "a temp list was left behind"
 grep -q pass1234 "$T/calls" && fail "the password reached an argument list"
+end
+
+begin "signing setup installs a missing mokutil without passing on the lock"
+mok_case
+mv "$T/bin/mokutil" "$T/mokutil.saved"
+stub apt-get '[[ -e /proc/self/fd/9 ]] && touch "$GLT/lock-leaked-to-apt"
+[[ "$1 $3" == "install mokutil" ]] && cp "$GLT/mokutil.saved" "$GLT/bin/mokutil"
+exit 0'
+setup_signing pass1234
+expect_rc 0
+expect_call "apt-get install -y mokutil"
+expect_no_file "$T/lock-leaked-to-apt"
 end
 
 begin "signing setup re-queues its own waiting key under the new password"

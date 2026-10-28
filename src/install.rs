@@ -307,10 +307,15 @@ pub fn run_privileged_discard_recovery(mut on_line: impl FnMut(&str)) -> Result<
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--discard-recovery".to_string()];
     let run = run_pkexec(&args, None, &mut on_line)?;
-    match run.code {
+    discard_result(run.code, &run.lines)
+}
+
+fn discard_result(code: Option<i32>, lines: &[String]) -> Result<()> {
+    match code {
         Some(0) => Ok(()),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
-        code => bail!("Discarding the recovery data failed (exit code {code:?}){}", first_error(&run.lines).map(|e| format!(": {e}")).unwrap_or_default()),
+        Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
+        code => bail!("Discarding the recovery data failed (exit code {code:?}){}", first_error(lines).map(|e| format!(": {e}")).unwrap_or_default()),
     }
 }
 
@@ -539,6 +544,16 @@ mod tests {
         let failed = recover_result(Some(4), &lines(&["ERROR: no module"])).unwrap_err().to_string();
         assert!(failed.contains("Don't reboot") && failed.contains("no module"), "{failed}");
         assert!(recover_result(Some(126), &[]).unwrap_err().to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn discard_codes() {
+        assert!(discard_result(Some(0), &[]).is_ok());
+        assert!(discard_result(Some(126), &[]).unwrap_err().to_string().contains("cancelled"));
+        let refused = discard_result(Some(127), &[]).unwrap_err().to_string();
+        assert!(refused.contains("Not authorized") && !refused.contains("exit code"), "{refused}");
+        let failed = discard_result(Some(1), &lines(&["ERROR: busy"])).unwrap_err().to_string();
+        assert!(failed.contains("exit code Some(1)") && failed.contains("busy"), "{failed}");
     }
 
     #[test]

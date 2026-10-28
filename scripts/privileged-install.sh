@@ -302,6 +302,19 @@ cert_subject_cn() { # <cert>
     return 0
 }
 
+# Run a command without the lock's file descriptor, so nothing it leaves
+# running in the background (akmods from an rpm scriptlet, a DKMS build)
+# keeps the lock, and with it the "install running" state, after this run;
+# and with SIGTERM/SIGINT at their defaults, whatever this script does with
+# them (it ignores them while putting things back). Used by the signing
+# setup below too, which holds the same lock.
+# (env resets dispositions bash can't: a signal already ignored when the
+# script started, like SIGPIPE under some service managers, stays ignored
+# for bash itself.)
+ENV_DEFAULT_SIGNALS=()
+if env --default-signal=PIPE true 2>/dev/null; then ENV_DEFAULT_SIGNALS=(env "--default-signal=PIPE,TERM,INT"); fi
+nolock() { ( trap - TERM INT; exec "${ENV_DEFAULT_SIGNALS[@]}" "$@" ) 9>&-; }
+
 # ── Setup mode: --setup-signing ────────────────────────────────────────
 # The list of waiting keys the apps read (MokNew itself is readable by root
 # only). It is shared: another app's signing setup rebuilds the same request
@@ -389,10 +402,10 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
         log "Installing ${MISSING_PKGS[*]}…"
         if [[ "$PKG_MGR" == "apt" ]]; then
-            apt-get install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
+            nolock apt-get install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
                 || { log "ERROR: apt-get could not install ${MISSING_PKGS[*]}"; exit 1; }
         else
-            dnf install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
+            nolock dnf install -y "${MISSING_PKGS[@]}" >>"$LOGFILE" 2>&1 \
                 || { log "ERROR: dnf could not install ${MISSING_PKGS[*]}"; exit 1; }
         fi
     fi
@@ -586,18 +599,6 @@ if [[ "$OWN_SID" != "$$" ]] && command -v setsid >/dev/null 2>&1; then
 fi
 
 usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
-
-# Run a command without the lock's file descriptor, so nothing it leaves
-# running in the background (akmods from an rpm scriptlet, a DKMS build)
-# keeps the lock, and with it the "install running" state, after this run;
-# and with SIGTERM/SIGINT at their defaults, whatever this script does with
-# them (it ignores them while putting things back).
-# (env resets dispositions bash can't: a signal already ignored when the
-# script started, like SIGPIPE under some service managers, stays ignored
-# for bash itself.)
-ENV_DEFAULT_SIGNALS=()
-if env --default-signal=PIPE true 2>/dev/null; then ENV_DEFAULT_SIGNALS=(env "--default-signal=PIPE,TERM,INT"); fi
-nolock() { ( trap - TERM INT; exec "${ENV_DEFAULT_SIGNALS[@]}" "$@" ) 9>&-; }
 
 # One install at a time. The app also checks this lock to tell that an
 # install is still running (for example after it was closed and reopened).
@@ -908,13 +909,17 @@ signer_trusted() { # <signer>
 }
 
 # Kernels whose module matters after a rollback: the one the journal was
-# written for, and the one running now if that is another (a recovery at
-# boot after a newer kernel was installed in the meantime).
+# written for, those of the earlier installs a carried journal was built on
+# (their baseline is the setup being restored), and the one running now if
+# that is another (a recovery at boot after a newer kernel was installed in
+# the meantime). Each once, and only while its module tree exists.
 restore_kernels() {
-    local boot
+    local boot k
     boot="$(uname -r)"
     printf '%s\n' "$KVER"
-    if [[ "$boot" != "$KVER" && -d "/lib/modules/$boot" ]]; then printf '%s\n' "$boot"; fi
+    for k in "${EARLIER_KERNELS[@]}" "$boot"; do
+        if [[ "$k" != "$KVER" && -d "/lib/modules/$k" ]]; then printf '%s\n' "$k"; fi
+    done | sort -u
 }
 
 initramfs_for() { # <kernel>
@@ -1193,12 +1198,14 @@ start_inhibitor() {
 # (Top level, not a function: sourcing the state must set globals.)
 RECOVER_RC=0
 CARRIED=0
+EARLIER_KERNELS=()
 # shellcheck source=/dev/null  # the state is written by this script, root-only
 if [[ -d "$JOURNAL" ]]; then
     PHASE="$(cat "$JOURNAL/phase" 2>/dev/null || echo armed)"
     TARGET_RUN_VER=""
     KNOWN_TARGETS=()
     EARLIER_INSTALLER_STARTED=0
+    EARLIER_KERNELS=()
     MOD_KERNELS_BEFORE=()
     if [[ "$PHASE" == "installer-done" ]]; then
         log "An earlier install had finished NVIDIA's installer before it was cut off; nothing to put back."
@@ -1246,6 +1253,9 @@ if [[ -d "$JOURNAL" ]]; then
             PLYMOUTH=0
         fi
     fi
+elif [[ $DISCARD_RECOVERY -eq 1 ]]; then
+    # No journal (removed by other means): a note left about it is stale too.
+    recovery_note ""
 fi
 if [[ "$MODE" != "install" ]]; then
     if [[ "$MODE" == "discard" ]]; then
@@ -1271,6 +1281,11 @@ if [[ $RECOVER_RC -eq $EXIT_ROLLBACK_FAILED ]]; then
     # That install's driver, and whether its installer had run, stay known.
     if [[ -n "${TARGET_RUN_VER:-}" ]]; then KNOWN_TARGETS+=("$TARGET_RUN_VER"); fi
     if [[ "$PHASE" == "installer-started" ]]; then EARLIER_INSTALLER_STARTED=1; fi
+    # So does the kernel it was written for: this install's journal is
+    # written for the running one, and a rollback rebuilds and checks both.
+    if [[ -n "${KVER:-}" ]] && ! printf '%s\n' "${EARLIER_KERNELS[@]}" | grep -qxF -- "$KVER"; then
+        EARLIER_KERNELS+=("$KVER")
+    fi
 fi
 
 # ── Install mode ───────────────────────────────────────────────────────
@@ -1589,7 +1604,7 @@ if [[ $CARRIED -eq 1 ]]; then
         { cat "$JOURNAL.new/planned"; planned_removals "${PKGS[@]}"; } | sort -u > "$PRIV_DIR/planned"
         cp -- "$PRIV_DIR/planned" "$JOURNAL.new/planned"
     fi
-    declare -p KVER TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED >> "$JOURNAL.new/state"
+    declare -p KVER TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED EARLIER_KERNELS >> "$JOURNAL.new/state"
 else
     mkdir -m 700 "$JOURNAL.new" "$JOURNAL.new/backup"
     package_snapshot > "$JOURNAL.new/packages-before"
@@ -1612,8 +1627,9 @@ else
     backup_file /usr/lib/nvidia/alternate-install-present
     KNOWN_TARGETS=()
     EARLIER_INSTALLER_STARTED=0
+    EARLIER_KERNELS=()
     declare -p PKG_MGR KVER HELD BACKUPS WAS_BLOCKED RUN_VER_BEFORE MOD_VER_BEFORE MOD_SIGNER_BEFORE \
-        MOD_KERNELS_BEFORE TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED \
+        MOD_KERNELS_BEFORE TARGET_RUN_VER BOOT_ID KNOWN_TARGETS EARLIER_INSTALLER_STARTED EARLIER_KERNELS \
         > "$JOURNAL.new/state"
     : > "$JOURNAL.new/cache-index"
 fi

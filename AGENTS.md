@@ -236,7 +236,9 @@ copy of that logic.
 - At the start of an install, a journal whose rollback fails again is
   carried over: the new journal is built on it (its snapshot, plan, copies,
   holds, block, backups and driver state stay the baseline; this install's
-  removals are added; the earlier target joins `KNOWN_TARGETS` and an
+  removals are added; the earlier target joins `KNOWN_TARGETS`, the kernel
+  it was written for joins `EARLIER_KERNELS` (a rollback rebuilds and checks
+  the module for each of them too), and an
   earlier `installer-started` is kept as `EARLIER_INSTALLER_STARTED`), so
   rolling back the new install restores the setup from before the first
   one. A stale journal stops the install (exit 6).
