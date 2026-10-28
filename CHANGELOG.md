@@ -5,6 +5,21 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.5 — 2026-10-28
+
+- On a machine with more than one NVIDIA GPU, the System tab no longer says Reboot Required:
+  Yes forever and shows the installed driver's version twice, and the Browse tab marks the
+  installed version again.
+- When putting back the previous driver failed and a later install also had to be undone
+  after you had booted another kernel, the driver is now restored for the kernel the first
+  install was made on too, not only for the one you are running.
+- Set Up Signing no longer lets software it installs (mokutil, openssl) keep other installs
+  from starting.
+- Discard Recovery Data now also clears an old note about recovery data that is already
+  gone.
+- When Discard Recovery Data is not authorized, it now says so and that nothing was
+  changed, instead of showing an exit code.
+
 ## 2.10.4 — 2026-10-27
 
 **Fixed: keys enrolled at boot still showing as waiting**, and this app and other apps that
