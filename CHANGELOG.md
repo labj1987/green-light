@@ -5,6 +5,14 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.6 — 2026-10-28
+
+- **Fixed: newer kernels coming up without the NVIDIA driver.** Linux 6.15 and later ship
+  nova-core, a new in-kernel NVIDIA driver. When it took the GPU first at boot, NVIDIA's driver
+  found it taken, the screen froze during boot and nothing that needs the GPU worked. Green Light
+  now blocks nova-core alongside nouveau in the same blacklist file, includes it in the
+  initramfs, and checks it after the install.
+
 ## 2.10.5 — 2026-10-28
 
 - On a machine with more than one NVIDIA GPU, the System tab no longer says Reboot Required:

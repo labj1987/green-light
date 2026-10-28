@@ -1715,10 +1715,15 @@ if [[ ${#ALSO_REMOVED[@]} -gt 0 ]]; then
 fi
 
 # ── Step 4: On-disk boot config (takes effect at next boot) ───────────
-log "Writing nouveau blacklist and nvidia modeset config…"
+log "Writing nouveau and nova blacklist and nvidia modeset config…"
+# nova_core/nova_drm: the in-kernel Rust NVIDIA driver (Linux 6.15+). When it
+# binds the GPU first, NVIDIA's module finds it taken ("already bound to
+# nova-core") and the machine comes up without the driver.
 cat > /etc/modprobe.d/blacklist-nouveau.conf << 'BLACKLIST'
 blacklist nouveau
 options nouveau modeset=0
+blacklist nova_core
+blacklist nova_drm
 BLACKLIST
 cat > /etc/modprobe.d/nvidia-drm-modeset.conf << 'MODESET'
 options nvidia_drm modeset=1
@@ -1819,10 +1824,11 @@ SIGN_CERT="$INSTALL_SIGN_CERT"
 VERIFY_WARNINGS=0
 verify_warn() { log "Verify: WARNING $*"; VERIFY_WARNINGS=$((VERIFY_WARNINGS + 1)); }
 
-if grep -qs '^blacklist nouveau' /etc/modprobe.d/blacklist-nouveau.conf; then
-    log "Verify: nouveau blacklist present"
+if grep -qs '^blacklist nouveau' /etc/modprobe.d/blacklist-nouveau.conf \
+    && grep -qs '^blacklist nova_core' /etc/modprobe.d/blacklist-nouveau.conf; then
+    log "Verify: nouveau and nova blacklist present"
 else
-    verify_warn "nouveau blacklist file is missing or empty"
+    verify_warn "nouveau/nova blacklist file is missing or incomplete"
 fi
 
 # initramfs: confirm it was built and carries the blacklist.

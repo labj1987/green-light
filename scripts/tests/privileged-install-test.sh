@@ -345,6 +345,9 @@ expect_call_like "^make -C .*/kernel .*KERNEL_UNAME=$KVER modules"
 expect_call_like "^installer --silent .*--dkms"
 expect_call "update-initramfs -u -k $KVER"
 expect_file "$T/etc/modprobe.d/blacklist-nouveau.conf"
+grep -qx 'blacklist nova_core' "$T/etc/modprobe.d/blacklist-nouveau.conf" \
+    && grep -qx 'blacklist nova_drm' "$T/etc/modprobe.d/blacklist-nouveau.conf" \
+    || fail "the blacklist file should also block nova_core and nova_drm"
 expect_no_file "$T/etc/apt/preferences.d/green-light-nvidia"
 expect_out "Verify: all checks passed"
 expect_no_journal

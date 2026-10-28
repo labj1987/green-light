@@ -31,7 +31,7 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 - Lets you choose open or proprietary kernel modules (Automatic by default) and refuses combinations that cannot work, such as open modules on a pre-Turing GPU
 - Lists the distro driver packages the install will remove, and can block apt or dnf5 from installing the distro's NVIDIA driver over yours later
 - Signs the kernel module with your machine's existing module-signing key; Set Up Signing creates and enrolls one if you have none (see below)
-- Checks the result after install (nouveau blacklist, initramfs, DKMS build, module signer) and shows the findings in the Log tab, with the DKMS build log tail if a build fails
+- Checks the result after install (nouveau and nova-core blacklist, initramfs, DKMS build, module signer) and shows the findings in the Log tab, with the DKMS build log tail if a build fails
 - The GUI never runs as root. Only the install script does, through polkit, and you can read every line of it in `scripts/privileged-install.sh`
 
 ## Requirements
@@ -126,7 +126,7 @@ To remove the driver itself:
 sudo nvidia-uninstall
 ```
 
-To get nouveau or the distro's driver back afterwards, also delete `/etc/modprobe.d/blacklist-nouveau.conf` and any block file (`/etc/apt/preferences.d/green-light-nvidia` or `/etc/dnf/libdnf5.conf.d/90-green-light-nvidia.conf`), then rebuild the initramfs.
+To get nouveau, nova-core or the distro's driver back afterwards, also delete `/etc/modprobe.d/blacklist-nouveau.conf` and any block file (`/etc/apt/preferences.d/green-light-nvidia` or `/etc/dnf/libdnf5.conf.d/90-green-light-nvidia.conf`), then rebuild the initramfs.
 
 To remove this app, delete the AppImage and optionally the helper files it installed:
 
@@ -154,7 +154,7 @@ The output lands in the project directory. `Cargo.lock` is committed, so builds 
 
 ## How the install actually works
 
-The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers, the kernel's compiler and make (and DKMS when that option is on) are present (and stops if they aren't), test-builds the module, clears any conflicting distro driver packages, blacklists nouveau, signs the module with your machine's signing key if it has one, and rebuilds the initramfs afterward. All plain bash, all readable.
+The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers, the kernel's compiler and make (and DKMS when that option is on) are present (and stops if they aren't), test-builds the module, clears any conflicting distro driver packages, blacklists nouveau and nova-core (the in-kernel Rust NVIDIA driver in Linux 6.15+), signs the module with your machine's signing key if it has one, and rebuilds the initramfs afterward. All plain bash, all readable.
 
 ## Acknowledgements
 
