@@ -200,9 +200,8 @@ fn get_module_signature() -> ModuleSignature {
 fn get_installed_driver() -> Option<String> {
     // Try nvidia-smi first
     if let Ok(out) = Command::new("nvidia-smi").args(["--query-gpu=driver_version", "--format=csv,noheader"]).output() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !s.is_empty() && out.status.success() {
-            return Some(s);
+        if let Some(v) = parse_smi_driver_version(&String::from_utf8_lossy(&out.stdout)).filter(|_| out.status.success()) {
+            return Some(v);
         }
     }
 
@@ -212,6 +211,12 @@ fn get_installed_driver() -> Option<String> {
     }
 
     None
+}
+
+/// The driver version from `nvidia-smi --query-gpu=driver_version`, which
+/// prints one line per GPU: every GPU runs the same driver, so the first.
+fn parse_smi_driver_version(stdout: &str) -> Option<String> {
+    stdout.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string)
 }
 
 /// Extract the version from /proc/driver/nvidia/version. Proprietary format:
@@ -375,6 +380,14 @@ mod tests {
         assert_eq!(format_bytes(1_572_864), "1.5 MB");
         assert_eq!(format_bytes(1_073_741_824), "1.0 GB");
         assert_eq!(format_bytes(5 * 1_073_741_824 / 2), "2.5 GB");
+    }
+
+    #[test]
+    fn smi_driver_version_with_several_gpus() {
+        assert_eq!(parse_smi_driver_version("595.84\n").as_deref(), Some("595.84"));
+        // One line per GPU: still one version, comparable with modinfo's.
+        assert_eq!(parse_smi_driver_version("595.84\n595.84\n").as_deref(), Some("595.84"));
+        assert_eq!(parse_smi_driver_version("\n"), None);
     }
 
     #[test]
