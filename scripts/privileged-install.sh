@@ -1793,6 +1793,30 @@ if [[ $STOP_REQUESTED -eq 1 ]]; then
     log "A stop was requested while NVIDIA's installer ran; it had already succeeded, so the install is finished rather than undone."
 fi
 
+# ── Step 5b: DKMS builds the module for every kernel, signed ──────────
+# With --dkms, NVIDIA's installer compiles the module for the running kernel
+# itself, unsigned (it signs only without DKMS), and only registers the
+# sources with DKMS. DKMS signs with the machine's key when it builds, so the
+# module is built again through DKMS for every installed kernel that has
+# headers: the running kernel gets a signed module, and the other kernels
+# get one at all (the installer removed the old driver's module there).
+DKMS_OTHER_KERNELS=()
+DKMS_BUILT_KERNELS=()
+if [[ $USE_DKMS -eq 1 ]] && command -v dkms >/dev/null 2>&1 && [[ -n "$TARGET_RUN_VER" ]]; then
+    for kdir in /lib/modules/*/; do
+        kdir="${kdir%/}"; k="${kdir##*/}"
+        [[ -e "$kdir/build" ]] || continue
+        if nolock dkms build --force -m nvidia -v "$TARGET_RUN_VER" -k "$k" >>"$LOGFILE" 2>&1 \
+            && nolock dkms install --force -m nvidia -v "$TARGET_RUN_VER" -k "$k" >>"$LOGFILE" 2>&1; then
+            log "DKMS: nvidia $TARGET_RUN_VER built for $k"
+            DKMS_BUILT_KERNELS+=("$k")
+            [[ "$k" == "$KVER" ]] || DKMS_OTHER_KERNELS+=("$k")
+        else
+            log "WARNING: DKMS could not build nvidia $TARGET_RUN_VER for kernel $k (see $LOGFILE); that kernel has no NVIDIA driver until it does"
+        fi
+    done
+fi
+
 # ── Step 6: Keep the distro driver from coming back (optional) ────────
 # Right after the install, so every later exit (initramfs failure included)
 # leaves the block as asked.
@@ -1813,6 +1837,13 @@ if ! nolock "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
     log "       blacklist may not apply at boot. Run: ${INITRAMFS_CMD[*]}"
     exit "$EXIT_INITRAMFS"
 fi
+# The other kernels DKMS built the module for carry it (and the blacklist)
+# in their initramfs too.
+for k in "${DKMS_OTHER_KERNELS[@]}"; do
+    if [[ "$PKG_MGR" == "apt" ]]; then other_cmd=(update-initramfs -u -k "$k"); else other_cmd=(dracut --force --kver "$k"); fi
+    nolock "${other_cmd[@]}" >>"$LOGFILE" 2>&1 \
+        || log "WARNING: initramfs rebuild failed for kernel $k. Run: ${other_cmd[*]}"
+done
 if [[ -n "$INHIBIT_PID" ]]; then kill "$INHIBIT_PID" 2>/dev/null || true; INHIBIT_PID=""; fi
 
 # ── Step 8: Verify the result (report only; never fails the install) ──
@@ -1883,6 +1914,16 @@ if [[ -n "$SIGN_KEY" ]]; then
     else
         log "Verify: nvidia module is signed by: $MODULE_SIGNER"
     fi
+    for k in "${DKMS_OTHER_KERNELS[@]}"; do
+        k_signer="$(module_signer "$k")"
+        if [[ -z "$k_signer" ]]; then
+            verify_warn "the nvidia module for $k is unsigned; expected a signature from ${EXPECTED_SIGNER:-$SIGN_CERT}"
+        elif [[ -n "$EXPECTED_SIGNER" && "$k_signer" != "$EXPECTED_SIGNER" ]]; then
+            verify_warn "the nvidia module for $k is signed by \"$k_signer\", not by \"$EXPECTED_SIGNER\""
+        else
+            log "Verify: nvidia module for $k is signed by: $k_signer"
+        fi
+    done
     if command -v mokutil >/dev/null 2>&1; then
         MOK_CERT="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR" || printf '%s' "$SIGN_CERT")"
         MOK_TEST="$(mokutil --test-key "$MOK_CERT" 2>&1 | head -n 1 || true)"

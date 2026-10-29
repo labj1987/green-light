@@ -154,7 +154,7 @@ The output lands in the project directory. `Cargo.lock` is committed, so builds 
 
 ## How the install actually works
 
-The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers, the kernel's compiler and make (and DKMS when that option is on) are present (and stops if they aren't), test-builds the module, clears any conflicting distro driver packages, blacklists nouveau and nova-core (the in-kernel Rust NVIDIA driver in Linux 6.15+), signs the module with your machine's signing key if it has one, and rebuilds the initramfs afterward. All plain bash, all readable.
+The script runs NVIDIA's installer with `--allow-installation-with-running-driver`, which is the same behavior your package manager relies on: files and the DKMS module go to disk, nothing touches the loaded driver, and the new one takes over at boot. Before that it verifies the archive with `--check`, makes sure headers, the kernel's compiler and make (and DKMS when that option is on) are present (and stops if they aren't), test-builds the module, clears any conflicting distro driver packages, blacklists nouveau and nova-core (the in-kernel Rust NVIDIA driver in Linux 6.15+), signs the module with your machine's signing key if it has one (with DKMS on, DKMS builds and signs it for every installed kernel that has headers), and rebuilds the initramfs afterward. All plain bash, all readable.
 
 ## Acknowledgements
 

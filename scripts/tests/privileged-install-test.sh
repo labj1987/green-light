@@ -362,6 +362,26 @@ grep -qE '^[0-9-]+ [0-9:]+ \[green-light [0-9]+\] ==== NVIDIA driver install sta
 expect_no_file "$T/lock-leaked-to-make"
 end
 
+begin "dkms builds the module for every kernel, signed with the machine key"
+mkdir -p "$T/var/lib/shim-signed/mok" "$T/modules/6.99.1-test/build"
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=test Secure Boot Module Signature key" \
+    -keyout "$T/var/lib/shim-signed/mok/MOK.priv" -outform DER -out "$T/var/lib/shim-signed/mok/MOK.der" >/dev/null 2>&1
+# DKMS signs what it builds: install puts a module signed by the machine key
+stub dkms 'case "$1" in
+  status) echo "nvidia/595.84, '"$KVER"', x86_64: installed" ;;
+  install) k="${*: -1}"; if [[ "$k" == '"$KVER"' ]]; then echo 595.84 > "$GLT/mod-version"; echo "test Secure Boot Module Signature key" > "$GLT/mod-signer"; else echo 595.84 > "$GLT/mod-version.$k"; echo "test Secure Boot Module Signature key" > "$GLT/mod-signer.$k"; fi ;;
+esac'
+run_default --dkms
+expect_rc 0
+expect_call "dkms build --force -m nvidia -v 595.84 -k $KVER"
+expect_call "dkms install --force -m nvidia -v 595.84 -k $KVER"
+expect_call "dkms build --force -m nvidia -v 595.84 -k 6.99.1-test"
+expect_call "update-initramfs -u -k 6.99.1-test"
+expect_out "Verify: nvidia module is signed by: test Secure Boot Module Signature key"
+expect_out "Verify: nvidia module for 6.99.1-test is signed by: test Secure Boot Module Signature key"
+expect_no_out "is unsigned"
+end
+
 begin "the test build uses the kernel's compiler: versioned gcc, or LLVM=1 for clang"
 printf '#define CONFIG_CC_IS_GCC 1\n#define CONFIG_CC_VERSION_TEXT "x86_64-linux-gnu-gcc-15 (Ubuntu 15.2.0) 15.2.0"\n' \
     > "$T/modules/$KVER/build/include/generated/autoconf.h"

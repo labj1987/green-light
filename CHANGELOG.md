@@ -5,6 +5,15 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.7 — 2026-10-28
+
+- **Fixed: with DKMS on, the new driver's module unsigned and missing for other kernels.**
+  NVIDIA's installer builds the module for the running kernel itself, unsigned, and only
+  registers it with DKMS, so with Secure Boot on the driver would not load after the reboot, and
+  every other installed kernel was left without an NVIDIA module. Green Light now has DKMS build
+  the module for every installed kernel that has headers, which signs it with the machine's key,
+  rebuilds those kernels' initramfs, and checks each kernel's signature after the install.
+
 ## 2.10.6 — 2026-10-28
 
 - **Fixed: newer kernels coming up without the NVIDIA driver.** Linux 6.15 and later ship
