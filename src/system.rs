@@ -177,12 +177,15 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
     let moknew_size = std::fs::metadata(MOK_NEW).ok().map(|m| m.len());
     let pending = std::fs::read_to_string(MOK_PENDING_LIST).map(|t| parse_pending_list(&t, moknew_size)).unwrap_or_default();
     let efi_firmware = std::path::Path::new("/sys/firmware/efi").exists();
-    let sha1 = Command::new("sha1sum")
-        .arg(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().next().map(str::to_string));
+    // The certificate's own SHA1 (of its DER form), as the script lists it: a PEM file's bytes would not match.
+    let sha1 = ["DER", "PEM"].iter().find_map(|form| {
+        Command::new("openssl")
+            .args(["x509", "-inform", form, "-in", path, "-noout", "-fingerprint", "-sha1"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| crate::preflight::parse_openssl_sha1(&String::from_utf8_lossy(&o.stdout)))
+    });
     command_text("mokutil", &["--test-key", path])
         .and_then(|t| classify_signing_key(path, &t, efi_firmware, &pending, sha1.as_deref()))
         .unwrap_or_else(|| SigningKeyState::Untested(path.to_string()))

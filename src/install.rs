@@ -244,7 +244,8 @@ pub const JOURNAL_DIR: &str = "/var/lib/green-light/journal";
 /// An install was cut off (power loss, crash) and its changes are waiting to
 /// be rolled back, with no install running now.
 pub fn recovery_pending() -> bool {
-    Path::new(JOURNAL_DIR).exists() && !install_running()
+    // ".old": a run cut off while it replaced the journal (the script puts it back first).
+    (Path::new(JOURNAL_DIR).exists() || Path::new(&format!("{JOURNAL_DIR}.old")).exists()) && !install_running()
 }
 
 /// How `--recover` ended, when it didn't fail.
@@ -254,6 +255,8 @@ pub enum Recovered {
     Nothing,
     /// Rolled back and checked.
     Restored,
+    /// The recovery data was discarded as asked (`--discard-recovery`); the driver is left as it is.
+    Discarded,
 }
 
 fn recover_result(code: Option<i32>, lines: &[String]) -> Result<Recovered> {
@@ -563,7 +566,9 @@ mod tests {
         assert!(script.contains("\nJOURNAL=\"$STATE_DIR/journal\"\n"));
         assert_eq!(JOURNAL_DIR, "/var/lib/green-light/journal");
         let unit = include_str!("../data/green-light-recover.service");
-        assert!(unit.contains(&format!("ConditionPathExists={JOURNAL_DIR}\n")));
+        assert!(unit.contains(&format!("ConditionPathExists=|{JOURNAL_DIR}\n")));
+        assert!(unit.contains(&format!("ConditionPathExists=|{JOURNAL_DIR}.old\n")));
+        assert!(script.contains("\nif [[ ! -d \"$JOURNAL\" && -d \"$JOURNAL.old\" ]]; then\n"));
         assert!(unit.contains(&format!("ExecStart={PRIVILEGED_SCRIPT} --recover\n")));
     }
 

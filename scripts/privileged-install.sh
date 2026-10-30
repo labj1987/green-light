@@ -89,6 +89,8 @@ LOGFILE="/var/log/green-light.log"
 # the console, which don't go away; keep them.)
 if [[ ! -t 1 && -z "${INVOCATION_ID:-}" ]]; then exec >/dev/null; fi
 if [[ ! -t 2 && -z "${INVOCATION_ID:-}" ]]; then exec 2>>"$LOGFILE"; fi
+# Readable whatever umask pkexec passed on: the app follows this log.
+touch "$LOGFILE" 2>/dev/null && chmod 0644 "$LOGFILE" 2>/dev/null || true
 trap '' HUP
 
 # Each log line carries this run's PID: the app shows only the lines of the
@@ -489,7 +491,11 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
         cn="$(cert_subject_cn "$der")"
         # Enrolled ("already enrolled") or trusted another way ("already in
         # db", "already in the built-in trusted keyring"): nothing to queue.
-        if mokutil --test-key "$der" 2>&1 | grep -qiE 'already enrolled|already in db|built-in'; then
+        # Read first, then matched: mokutil exits non-zero for some of these answers
+        # ("already in the built-in trusted keyring"), which pipefail would count.
+        local test_out
+        test_out="$(mokutil --test-key "$der" 2>&1 || true)"
+        if grep -qiE 'already enrolled|already in db|built-in' <<<"$test_out"; then
             log "Already enrolled: ${cn:-$der}"
             return 0
         fi
@@ -605,6 +611,8 @@ usage_error() { log "ERROR: $*"; exit "$EXIT_USAGE"; }
 # Keep the path in step with INSTALL_LOCK in install.rs.
 INSTALL_LOCK="/run/green-light-install.lock"
 exec 9>>"$INSTALL_LOCK"
+# Readable whatever umask pkexec passed on: the app takes the lock to tell an install is running.
+chmod 0644 "$INSTALL_LOCK" 2>/dev/null || true
 if ! flock -n 9; then
     usage_error "Another Green Light install is still running; wait for it to finish."
 fi
@@ -768,8 +776,12 @@ journal_set_phase() { # armed | installer-started | installer-done
 
 journal_clear() {
     if [[ -d "$JOURNAL" ]]; then
-        rm -rf "$JOURNAL"
+        # Renamed aside first, in one step: a run cut off here leaves either the
+        # whole journal or none, never one with some of its files gone.
+        rm -rf "$JOURNAL.dead"
+        mv -f -T "$JOURNAL" "$JOURNAL.dead" || rm -rf "$JOURNAL"
         durable "$STATE_DIR"
+        rm -rf "$JOURNAL.dead"
     fi
     rm -f "$STATE_DIR/recovery-status"
     return 0
@@ -887,7 +899,8 @@ restore_backups() {
         path="${entry%%|*}"
         saved="${entry#*|}"
         if [[ -n "$saved" ]]; then
-            cp -a -- "$JOURNAL/backup/$saved" "$path" || { log "ERROR: Could not restore $path"; rc=1; }
+            # The purge may have removed the directory along with the packages' files.
+            { mkdir -p -- "${path%/*}" && cp -a -- "$JOURNAL/backup/$saved" "$path"; } || { log "ERROR: Could not restore $path"; rc=1; }
         else
             rm -f -- "$path" || { log "ERROR: Could not remove $path"; rc=1; }
         fi
@@ -905,7 +918,9 @@ signer_trusted() { # <signer>
     [[ "$(cert_subject_cn "$SIGN_CERT")" == "$1" ]] || return 1
     local der
     der="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")" || return 1
-    mokutil --test-key "$der" 2>&1 | grep -qiE 'already (enrolled|in )'
+    local test_out
+    test_out="$(mokutil --test-key "$der" 2>&1 || true)"
+    grep -qiE 'already (enrolled|in )' <<<"$test_out"
 }
 
 # Kernels whose module matters after a rollback: the one the journal was
@@ -1199,6 +1214,14 @@ start_inhibitor() {
 RECOVER_RC=0
 CARRIED=0
 EARLIER_KERNELS=()
+# A run cut off while it replaced the journal left the old one aside: it is
+# the journal still. One cut off while it cleared the journal left the
+# cleared one aside: it is gone.
+if [[ ! -d "$JOURNAL" && -d "$JOURNAL.old" ]]; then
+    mv -T "$JOURNAL.old" "$JOURNAL"
+    durable "$STATE_DIR"
+fi
+rm -rf "$JOURNAL.old" "$JOURNAL.dead"
 # shellcheck source=/dev/null  # the state is written by this script, root-only
 if [[ -d "$JOURNAL" ]]; then
     PHASE="$(cat "$JOURNAL/phase" 2>/dev/null || echo armed)"
@@ -1637,9 +1660,16 @@ printf 'armed\n' > "$JOURNAL.new/phase"
 shopt -s nullglob
 durable "$JOURNAL.new"/* "$JOURNAL.new"/backup/* "$JOURNAL.new"/cache/* "$JOURNAL.new/backup" "$JOURNAL.new"
 shopt -u nullglob
-rm -rf "$JOURNAL"
-mv "$JOURNAL.new" "$JOURNAL"
+# The old journal (a carried one) is moved aside, not deleted, until the new
+# one is in place: a run cut off in between finds it again (below, and the
+# boot unit looks for it too).
+if [[ -d "$JOURNAL" ]]; then
+    mv -f -T "$JOURNAL" "$JOURNAL.old"
+    durable "$STATE_DIR"
+fi
+mv -T "$JOURNAL.new" "$JOURNAL"
 durable "$STATE_DIR"
+rm -rf "$JOURNAL.old"
 # A journal made by this run may go when it ends before changing anything;
 # a carried one still describes an unrestored setup and stays.
 if [[ $CARRIED -eq 0 ]]; then JOURNAL_OURS=1; fi

@@ -499,6 +499,13 @@ pub fn parse_pending_list(text: &str, moknew_size: Option<u64>) -> Vec<String> {
     lines.map(|l| l.chars().filter(char::is_ascii_hexdigit).collect::<String>().to_lowercase()).filter(|f| f.len() == 40).collect()
 }
 
+/// The fingerprint `openssl x509 -noout -fingerprint -sha1` printed ("SHA1 Fingerprint=AB:CD:..."), as the
+/// shared list of waiting keys writes it: 40 lowercase hex digits without colons.
+pub fn parse_openssl_sha1(output: &str) -> Option<String> {
+    let hex: String = output.trim().rsplit('=').next()?.chars().filter(|c| *c != ':').collect::<String>().to_ascii_lowercase();
+    (hex.len() == 40 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(hex)
+}
+
 /// State of the certificate at `path` from the mokutil results. Enrolled
 /// (or otherwise trusted) per `--test-key` wins; then its SHA1 among the
 /// pending fingerprints means queued; otherwise the `--test-key` answer
@@ -985,6 +992,46 @@ mod tests {
         assert_eq!(pairs, ours);
         assert_eq!(script_value("DKMS_DEFAULT_KEY"), DKMS_DEFAULT_KEY);
         assert_eq!(script_value("DKMS_DEFAULT_CERT"), DKMS_DEFAULT_CERT);
+    }
+
+    #[test]
+    fn openssl_sha1_fingerprint() {
+        assert_eq!(
+            parse_openssl_sha1("SHA1 Fingerprint=5B:E0:2A:3B:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF\n").as_deref(),
+            Some("5be02a3b00112233445566778899aabbccddeeff")
+        );
+        assert_eq!(parse_openssl_sha1("sha1 Fingerprint=5BE02A3B"), None, "too short");
+        assert_eq!(parse_openssl_sha1(""), None);
+    }
+
+    /// A PEM certificate's fingerprint is its DER form's SHA1 (what the script lists), not the PEM file's.
+    #[test]
+    fn pem_certificate_fingerprint_is_the_der_sha1() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("gl-fp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (key, pem, der) = (dir.join("k.pem"), dir.join("c.pem"), dir.join("c.der"));
+        let made = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=test", "-days", "1", "-keyout"])
+            .arg(&key)
+            .arg("-out")
+            .arg(&pem)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("openssl not available: skipped");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(Command::new("openssl").args(["x509", "-in"]).arg(&pem).args(["-outform", "DER", "-out"]).arg(&der).status().unwrap().success());
+        let sha1 = |path: &std::path::Path| {
+            String::from_utf8_lossy(&Command::new("sha1sum").arg(path).output().unwrap().stdout).split_whitespace().next().unwrap().to_string()
+        };
+        let out = Command::new("openssl").args(["x509", "-inform", "PEM", "-in"]).arg(&pem).args(["-noout", "-fingerprint", "-sha1"]).output().unwrap();
+        let fp = parse_openssl_sha1(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert_eq!(fp, sha1(&der), "the DER form's SHA1");
+        assert_ne!(fp, sha1(&pem), "not the PEM file's");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -7,7 +7,8 @@
 [Unit]
 Description=Green Light: restore the previous NVIDIA driver after an interrupted install
 Documentation=https://github.com/labj1987/green-light
-ConditionPathExists=/var/lib/green-light/journal
+ConditionPathExists=|/var/lib/green-light/journal
+ConditionPathExists=|/var/lib/green-light/journal.old
 RequiresMountsFor=/var/lib/green-light /var/log
 # After the services that build missing modules at boot, so they don't work
 # on the package database at the same time; before anything graphical.
