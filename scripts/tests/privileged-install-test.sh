@@ -331,6 +331,15 @@ end() {
 
 # ── Cases ──────────────────────────────────────────────────────────────
 
+begin "the log is readable by the app whatever umask the script gets"
+rm -f "$T/var/log/green-light.log"
+RC=0
+(umask 077; sandbox "$T/bin/bash" "$SCRIPT" "$RUN" "$(sha "$RUN")" > "$T/stdout" 2>&1) || RC=$?
+OUT="$(cat "$T/var/log/green-light.log" 2>/dev/null)"
+expect_rc 0
+[[ "$(stat -c %a "$T/var/log/green-light.log")" == 644 ]] || fail "log mode $(stat -c %a "$T/var/log/green-light.log"), expected 644"
+end
+
 begin "apt install succeeds"
 run_default --dkms
 expect_rc 0
@@ -805,7 +814,8 @@ chmod 755 "$T/bin/nvidia-uninstall"
 : > "$T/calls"
 EXEC="$(grep '^ExecStart=' "$UNIT" | cut -d= -f2-)"
 [[ "$EXEC" == "/usr/lib/green-light/privileged-install.sh --recover" ]] || fail "unexpected ExecStart: $EXEC"
-grep -qx 'ConditionPathExists=/var/lib/green-light/journal' "$UNIT" || fail "unit not conditional on the journal"
+grep -qx 'ConditionPathExists=|/var/lib/green-light/journal' "$UNIT" || fail "unit not conditional on the journal"
+grep -qx 'ConditionPathExists=|/var/lib/green-light/journal.old' "$UNIT" || fail "unit not conditional on a journal moved aside"
 grep -qx 'SuccessExitStatus=3 6' "$UNIT" || fail "unit's success codes"
 # As systemd runs it: INVOCATION_ID set, output kept for the journal.
 SANDBOX_EXTRA=(--setenv INVOCATION_ID test)
@@ -831,6 +841,28 @@ expect_rc 0
 expect_out "nothing to put back"
 expect_no_call_like "^apt-get install"
 expect_no_journal
+end
+
+begin "cut off while the journal was replaced: the one moved aside is recovered"
+cut_off_during_purge
+mv "$T/var/lib/green-light/journal" "$T/var/lib/green-light/journal.old"
+: > "$T/calls"
+recover
+expect_rc 3
+expect_pkg nvidia-driver-595
+expect_no_journal
+expect_no_file "$T/var/lib/green-light/journal.old"
+end
+
+begin "cut off while the journal was cleared: the cleared one is not rolled back"
+mkdir -p "$T/var/lib/green-light/journal.dead"
+echo armed > "$T/var/lib/green-light/journal.dead/phase"
+: > "$T/calls"
+recover
+expect_rc 0
+expect_no_call_like "^apt-get install"
+expect_no_journal
+expect_no_file "$T/var/lib/green-light/journal.dead"
 end
 
 begin "recovery at boot into a newer kernel: that kernel gets its module too"
@@ -1239,7 +1271,10 @@ mok_case() {   # sets up the tools, a module-signing key and an efivars dir
     # --import: records the subjects and writes a MokNew holding the
     # certificates; $GLT/import-fails: how many imports fail before one works.
     stub mokutil 'case "$1" in
-  --test-key) if [[ -e "$GLT/enrolled" ]]; then echo "$2 is already enrolled"; else echo "$2 is not enrolled"; fi ;;
+  --test-key)
+    # Like mokutil: a key in the built-in keyring is reported on stderr with exit 255.
+    if [[ -e "$GLT/builtin" ]]; then echo "$2 is already in the built-in trusted keyring" >&2; exit 255; fi
+    if [[ -e "$GLT/enrolled" ]]; then echo "$2 is already enrolled"; else echo "$2 is not enrolled"; fi ;;
   --generate-hash) read -r a; read -r b; printf "\x246\x24salt\x24hash\n" ;;
   --revoke-import) rm -f /sys/firmware/efi/efivars/MokNew-* ;;
   --import)
@@ -1334,6 +1369,17 @@ OUT="$(cat "$T/var/log/green-light.log")"
 expect_rc 0
 expect_call "mokutil --revoke-import"
 [[ "$(cat "$T/imported")" == "subject=CN=Test Module Signing key" ]] || fail "imported [$(cat "$T/imported" 2>/dev/null)]"
+end
+
+begin "signing setup with every key in the built-in keyring queues nothing (mokutil exits 255)"
+mok_case
+touch "$T/builtin"
+RC=0
+sandbox "$T/bin/bash" -c 'echo pass5678 | "$0" --setup-signing' "$SCRIPT" > /dev/null 2>&1 || RC=$?
+OUT="$(cat "$T/var/log/green-light.log")"
+expect_rc 0
+expect_out "already enrolled; nothing to do"
+expect_no_call_like "^mokutil --import"
 end
 
 begin "signing setup with every key enrolled queues nothing"

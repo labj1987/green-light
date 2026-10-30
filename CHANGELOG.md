@@ -5,6 +5,27 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.8 — 2026-10-30
+
+Fixes from a review of the whole code base:
+
+- **Fixed: an install cut off at the wrong moment could lose what it needs to put the previous driver
+  back.** Replacing or clearing the recovery data is now done so that a power cut at any point leaves
+  it complete or gone, never half deleted, and a cut while it was replaced is still found at the next
+  boot.
+- **Fixed: a failed rollback when the driver's packages took a folder with them.** Restoring a saved
+  file now creates its folder again first, so the rollback no longer reports a failure for a driver it
+  put back.
+- **Fixed: a signing key in the built-in trusted keyring was queued for enrollment again.**
+- **Fixed: with a PEM signing certificate, a key waiting for enrollment was shown as not set up**, and
+  you were told to run Set Up Signing again.
+- **Fixed: with a restrictive umask, the Log tab stayed empty during an install**, failure messages
+  lost their reason, and Restore Previous Driver could be offered while an install was running.
+- Discarding recovery data now says so, instead of "Nothing needed restoring", and a failed discard is
+  reported as one.
+- Refresh System Info no longer drops the version you selected, the recovery banner says why nothing
+  happens while another operation runs, and a long install log no longer slows the window down.
+
 ## 2.10.7 — 2026-10-28
 
 - **Fixed: with DKMS on, the new driver's module unsigned and missing for other kernels.**

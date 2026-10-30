@@ -471,7 +471,9 @@ pub fn build_ui(app: &Application) {
             let buf = log_view.buffer();
             let mut end = buf.end_iter();
             buf.insert(&mut end, &format!("{}\n", msg));
-            let mark = buf.create_mark(None, &buf.end_iter(), false);
+            // One mark, moved to the end: a new one per line would stay in the buffer for good.
+            let mark = buf.mark("log-end").unwrap_or_else(|| buf.create_mark(Some("log-end"), &buf.end_iter(), false));
+            buf.move_mark(&mark, &buf.end_iter());
             log_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
         })
     };
@@ -704,7 +706,12 @@ pub fn build_ui(app: &Application) {
                 let versions = state.borrow().versions.clone();
                 if !versions.is_empty() {
                     let installed = state.borrow().sysinfo.installed_driver.clone();
+                    // Rebuilding the rows clears the selection: the version chosen stays chosen.
+                    let selected = state.borrow().selected_version.as_ref().map(|v| v.version.clone());
                     populate_list(&list_box, &versions, &search_entry.text(), installed.as_deref());
+                    if let Some(selected) = selected {
+                        select_row_titled(&list_box, &selected);
+                    }
                 }
             });
         }
@@ -1437,6 +1444,8 @@ pub fn build_ui(app: &Application) {
         // Restore (false) or discard (true) the recovery data.
         let run_op: Rc<dyn Fn(bool)> = Rc::new(move |discard: bool| {
             let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
+                // The banner stays up while something else runs: say why nothing happened.
+                toast_overlay.add_toast(Toast::new("Wait until the running operation has finished"));
                 return;
             };
             banner.set_revealed(false);
@@ -1457,7 +1466,7 @@ pub fn build_ui(app: &Application) {
                         let _ = line_tx.send(line.to_string());
                     };
                     if discard {
-                        run_privileged_discard_recovery(send).map(|()| Recovered::Nothing)
+                        run_privileged_discard_recovery(send).map(|()| Recovered::Discarded)
                     } else {
                         run_privileged_recover(send)
                     }
@@ -1489,6 +1498,14 @@ pub fn build_ui(app: &Application) {
                     Ok(Recovered::Nothing) => {
                         log_fn("Nothing needed putting back: that install had finished.".to_string());
                         toast_overlay.add_toast(Toast::new("Nothing needed restoring"));
+                    }
+                    Ok(Recovered::Discarded) => {
+                        log_fn("The recovery data was discarded; the driver is left as it is.".to_string());
+                        toast_overlay.add_toast(Toast::new("Recovery data discarded"));
+                    }
+                    Err(e) if discard => {
+                        log_fn(format!("Discarding failed: {e}"));
+                        show_error(&window, "Discarding the recovery data failed", &e);
                     }
                     Err(e) => {
                         log_fn(format!("Restoring failed: {e}"));
@@ -1728,6 +1745,20 @@ fn finish_download(ui: DownloadUi, ver: DriverVersion, path: PathBuf, checksum: 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Populate version list with version-status badges
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Selects the row whose title is `title`, if the list shows it.
+fn select_row_titled(list_box: &ListBox, title: &str) {
+    let mut child = list_box.first_child();
+    while let Some(c) = child {
+        if let Some(row) = c.downcast_ref::<ActionRow>() {
+            if row.title() == title {
+                list_box.select_row(Some(row));
+                return;
+            }
+        }
+        child = c.next_sibling();
+    }
+}
 
 fn populate_list(list_box: &ListBox, versions: &[DriverVersion], filter: &str, installed: Option<&str>) {
     while let Some(c) = list_box.first_child() {
