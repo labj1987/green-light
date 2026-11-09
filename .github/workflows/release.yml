@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - 'v*'
+  # A test build of a fix branch for the person who reported the issue (AGENTS.md, "Test builds"):
+  # the same build, published as a pre-release, never as the latest release.
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: The issue number this test build is for
+        required: true
+        type: number
 
 # Nothing here can write to the repository except the `publish` job, which only downloads the
 # build job's files and attaches them to the release. The `build` job runs the whole toolchain
@@ -50,6 +58,7 @@ jobs:
       # The tag names the version that is released: refuse a tag that is not the Cargo
       # version before anything is built.
       - name: Tag matches the Cargo version
+        if: github.event_name == 'push'
         run: |
           version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
           if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
@@ -60,7 +69,7 @@ jobs:
       # The release page carries this version's changes in full, from CHANGELOG.md: no link to it.
       # The release fails here, before the build, when the section is missing.
       - name: Release notes from the changelog
-        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME#v}" > release-notes.md && cat release-notes.md
+        run: python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" > release-notes.md && cat release-notes.md
 
       # The version in rust-toolchain.toml; keep the two in step (the build fails on a mismatch).
       - name: Set up Rust Toolchain
@@ -114,6 +123,7 @@ jobs:
           name: release-files
 
       - name: Create Release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
@@ -121,3 +131,19 @@ jobs:
             green-light-*-x86_64.AppImage.zsync
           fail_on_unmatched_files: true
           body_path: release-notes.md
+
+      - name: Create the test build (a pre-release)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: test-${{ github.ref_name }}-${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          name: "Test build for #${{ inputs.issue }} (${{ github.ref_name }})"
+          prerelease: true
+          make_latest: false
+          files: |
+            green-light-*-x86_64.AppImage
+            green-light-*-x86_64.AppImage.zsync
+          fail_on_unmatched_files: true
+          body: |
+            **Not a release.** A test build of the branch `${{ github.ref_name }}` (commit ${{ github.sha }}) for issue #${{ inputs.issue }}, so the fix can be tried before it is released. Install it like a release; please say in the issue whether it fixes the problem. Once the fix is released, update to that release; this test build is then deleted. The version number is the one the fix will be released as.

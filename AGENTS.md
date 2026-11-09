@@ -325,6 +325,17 @@ build only warns.
 Rust is pinned in `rust-toolchain.toml`; bump it there and in both
 workflows together (each checks the two agree).
 
+## Test builds
+
+- A fix for an issue someone else reported goes to them before it reaches `main`: push it on its own branch,
+  carrying the version bump and CHANGELOG section it will be released with, open a PR (CI must pass), then run
+  `gh workflow run release.yml --ref BRANCH -f issue=N`. The Build and Release workflow builds that branch
+  exactly as a release and publishes it as a pre-release named "Test build for #N (BRANCH)" with the tag
+  `test-BRANCH-RUN` (never `v*`, never the latest release, so the AppImage updater does not offer it).
+- Link the pre-release in the issue and ask the reporter to try it. Merge and release only once they confirm
+  it fixes the problem (or say plainly why you release without that). After the release, delete the test
+  pre-releases and their tags (`gh release delete TAG --cleanup-tag --yes`).
+
 ## Release process
 
 1. Bump `version` in `Cargo.toml`.
