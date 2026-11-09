@@ -1,0 +1,104 @@
+name: Bug report
+description: Something in Green Light doesn't work as it should
+labels:
+- bug
+body:
+- type: markdown
+  attributes:
+    value: |-
+      Thanks for taking the time to report this. Before you start:
+      - **Try the [newest release](https://github.com/labj1987/green-light/releases/latest) first.** Every release includes the fixes before it, and yours may already be fixed.
+      - **Search the [open issues](https://github.com/labj1987/green-light/issues).** If yours is there, add your details to it instead.
+      - English, please.
+      - If an install failed, **don't reboot until the app or its log says it is safe**; the logs below say what happened.
+- type: input
+  id: version
+  attributes:
+    label: Green Light version
+    description: Shown in the app's About window, or in the AppImage's file name (`green-light-X.Y.Z-x86_64.AppImage`).
+    placeholder: 1.2.3
+  validations:
+    required: true
+- type: dropdown
+  id: kind
+  attributes:
+    label: What kind of problem
+    options:
+    - Driver install or update failed
+    - Driver uninstall or Restore Previous Driver failed
+    - The system doesn't boot or has no display after an install
+    - Secure Boot or module signing
+    - The app (lists, downloads, display)
+    - Something else
+  validations:
+    required: true
+- type: textarea
+  id: what
+  attributes:
+    label: What happened
+    description: What you did, what you saw, and what you expected instead.
+  validations:
+    required: true
+- type: input
+  id: driver
+  attributes:
+    label: Driver versions
+    description: The driver you had before, and the one you tried to install.
+    placeholder: 580.95.05 to 620.70.06
+  validations:
+    required: true
+- type: input
+  id: gpu
+  attributes:
+    label: Graphics card
+    placeholder: RTX 5070 12 GB
+  validations:
+    required: true
+- type: input
+  id: system
+  attributes:
+    label: Distribution, kernel and desktop
+    description: For example from `uname -r` and your desktop's About page.
+    placeholder: Ubuntu 26.04, kernel 7.3.0, GNOME Wayland
+  validations:
+    required: true
+- type: dropdown
+  id: secureboot
+  attributes:
+    label: Secure Boot
+    options:
+    - 'On'
+    - 'Off'
+    - Not sure
+  validations:
+    required: true
+- type: textarea
+  id: options
+  attributes:
+    label: Install options
+    description: DKMS, kernel module type (open or proprietary), Block Distro Driver Packages, and anything else you changed. Leave empty if none.
+  validations:
+    required: false
+- type: textarea
+  id: logs
+  attributes:
+    label: Logs
+    description: Attach `/var/log/green-light.log` (this app's install script) and `/var/log/nvidia-installer.log` (NVIDIA's installer). The Log tab's text helps too.
+  validations:
+    required: true
+- type: textarea
+  id: media
+  attributes:
+    label: Screenshots
+    description: For problems in the app.
+  validations:
+    required: false
+- type: checkboxes
+  id: checks
+  attributes:
+    label: Before you send it
+    options:
+    - label: I'm on the newest release, or the problem is still there on it.
+      required: true
+    - label: I searched the open issues for this problem.
+      required: true
