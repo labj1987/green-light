@@ -1,0 +1,40 @@
+name: Idea or feature request
+description: Something Green Light could do, or do better
+labels:
+- enhancement
+body:
+- type: markdown
+  attributes:
+    value: 'Search the [open issues](https://github.com/labj1987/green-light/issues) first: if the idea is there, add to it instead. English, please.'
+- type: textarea
+  id: idea
+  attributes:
+    label: The idea
+    description: What you'd like, and what it would let you do.
+  validations:
+    required: true
+- type: dropdown
+  id: part
+  attributes:
+    label: Which part
+    options:
+    - Installing or removing drivers
+    - The app
+    - Secure Boot and signing
+    - Documentation
+  validations:
+    required: true
+- type: textarea
+  id: now
+  attributes:
+    label: How you do it now
+    description: Your current workaround, if any.
+  validations:
+    required: false
+- type: textarea
+  id: more
+  attributes:
+    label: Anything else
+    description: Links, examples from other software, screenshots.
+  validations:
+    required: false

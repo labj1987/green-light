@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+- name: Newest release
+  url: https://github.com/labj1987/green-light/releases/latest
+  about: Every release includes the fixes before it. Try the newest before reporting.
+- name: README and troubleshooting
+  url: https://github.com/labj1987/green-light#readme
+  about: Setup, known issues and troubleshooting.
