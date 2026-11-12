@@ -5,6 +5,12 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.10.9 — 2026-11-12
+
+Build only, nothing changes in the app:
+
+- The project builds with Rust 1.100, takes only crate versions at least 3 days old, and has Cargo's own lints on.
+
 ## 2.10.8 — 2026-10-30
 
 Fixes from a review of the whole code base:

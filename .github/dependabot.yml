@@ -15,6 +15,9 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 0
+    # Matches .cargo/config.toml (global-min-publish-age).
+    cooldown:
+      default-days: 3
     # Indirect crates are included: a gtk-rs release has to move its -sys crates with it
     # (gio 0.22.10 does not build against gio-sys 0.22.8), and a direct-only update leaves them
     # behind. Patch and minor updates are grouped separately because Dependabot counts a 0.x

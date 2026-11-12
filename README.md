@@ -144,7 +144,7 @@ sudo systemctl daemon-reload
 
 ## Building from source
 
-Needs Rust 1.96 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils` and `zsync`. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
+Needs Rust 1.100 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils` and `zsync`. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
 
 ```bash
 bash build-appimage.sh
