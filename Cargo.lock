@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "green-light"
-version = "2.10.8"
+version = "2.10.9"
 dependencies = [
  "anyhow",
  "futures-util",

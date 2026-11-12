@@ -1,7 +1,8 @@
 [package]
 name = "green-light"
-version = "2.10.8"
+version = "2.10.9"
 edition = "2021"
+rust-version = "1.100"
 description = "Green Light — GTK4 GUI for installing NVIDIA drivers on Linux"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"
@@ -30,3 +31,6 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[lints.cargo]
+unused_dependencies = "warn"
