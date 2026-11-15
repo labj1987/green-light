@@ -279,6 +279,33 @@ copy of that logic.
 
 ## Build process
 
+GTK 4 and libadwaita come from the system when it has them, with a bundled copy as the fallback.
+The AppDir holds the binary twice: `usr/bin/green-light` as cargo built it (no rpath; the build fails if it
+has one), which loads the system's GTK like releases before the bundle, and `usr/bin/bundled/green-light`,
+patched to the bundled runtime. AppRun's `gtk_choice` picks one at launch: the plain binary when
+`ldd -r` on it prints no `not found` line and no unresolved symbol of the binary itself (`undefined
+symbol: X (binary)` or `symbol X version Y not defined ... (binary)`; a system library's own lazy
+symbols don't count) (that also catches a libadwaita
+older than 1.5), the bundled one otherwise and when ldd is absent. `GREEN_LIGHT_GTK=host|bundled` overrides the
+check; one stderr line names the copy taken and why. `libcheck_run` then checks the chosen binary
+before any password prompt. The bundle (`bundle_gtk_runtime` in `build-appimage.sh`) is the ldd closure of
+the bundled binary minus the AppImage excludelist (glibc, libstdc++/libgcc_s, GL/EGL/DRM, X11/xcb, Wayland,
+fonts; the script cites the excludelist version) and the Vulkan loader, which also come from the
+system; plus the SVG pixbuf loader only (Ubuntu builds PNG and JPEG into gdk-pixbuf; the build fails
+if that changes), the dconf GIO module and the IBus IM module, with compiled schemas. Licences go to
+`usr/share/doc/bundled-libraries`: each package's copyright file, the `common-licenses` texts they
+name, and `PACKAGES` (the Ubuntu 24.04 source packages and versions they come from; the only change is the ELF rpath). AppRun's
+`libcheck_run` fails on any `not found` line of `ldd -r`, and on unresolved symbols of the binary or of
+anything inside the AppImage (a system library's own lazy ones don't count); when ldd fails without
+naming anything, it asks the loader directly. It names the glibc version needed and found. `gio-launch-desktop` is copied into `usr/bin` (GLib runs every GIO launch
+through it; AppRun puts `usr/bin` on PATH), and `bundle_env` also saves and unsets the system's
+`GTK_PATH` and `GIO_EXTRA_MODULES` (restored for child programs like the others). Libraries are found through
+`$ORIGIN` rpaths set with patchelf, never `LD_LIBRARY_PATH`. On the bundled path only, AppRun's `bundle_env` sets
+`GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`, `GIO_MODULE_DIR` and `GSETTINGS_SCHEMA_DIR` and keeps the
+earlier values in `APPIMAGE_ORIG_*`; every program the app starts must be built with
+`host_env::command` (a test fails on a bare `Command::new` outside test code), which puts them back
+(on the host path nothing is set, so it changes nothing).
+
 `build-appimage.sh` builds the AppImage — `appimagetool`-direct,
 not `linuxdeploy` (an earlier version of this doc claimed otherwise;
 the script itself never has):
@@ -345,6 +372,8 @@ workflows together (each checks the two agree).
   pre-releases and their tags (`gh release delete TAG --cleanup-tag --yes`).
 
 ## Release process
+
+Dry run (the release build of a branch, nothing published, nobody notified): `gh workflow run release.yml --ref BRANCH -f dry_run=true`; the AppImage and .zsync are the run's `release-files` artifact.
 
 1. Bump `version` in `Cargo.toml`.
 2. Add a `CHANGELOG.md` entry (see Changelog below).

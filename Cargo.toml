@@ -1,6 +1,6 @@
 [package]
 name = "green-light"
-version = "2.10.9"
+version = "2.11.0"
 edition = "2021"
 rust-version = "1.100"
 description = "Green Light — GTK4 GUI for installing NVIDIA drivers on Linux"

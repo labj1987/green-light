@@ -38,10 +38,12 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 
 - x86_64 Linux with systemd and polkit
 - Either an apt-based distro (Ubuntu, Debian, Mint) or a dnf-based distro (Fedora, RHEL, Nobara). The install script detects which one you have and uses the right package manager. Anything else, the GUI runs fine through the AppImage but the install script will refuse to run.
-- GTK 4.12+ and libadwaita 1.5+ installed: the AppImage uses the system's libraries
+- GTK 4.12+ and libadwaita 1.5+ from the system are used when they are there, so the window looks like the rest of your desktop (theme, accent colour). Without them, or with older ones, the AppImage uses the GTK 4 and libadwaita it brings, so it also runs on desktops that ship neither (a stock KDE Plasma or Hyprland install); that copy (libadwaita 1.5) follows dark mode but not the desktop's accent colour. `GREEN_LIGHT_GTK=bundled` or `GREEN_LIGHT_GTK=host` forces one or the other. Either way it takes the basics every desktop has from the system: glibc 2.39 or newer, OpenGL/EGL drivers and the Vulkan loader, X11 or Wayland client libraries, and fontconfig, freetype, harfbuzz and fribidi. If one of those is missing, Green Light names it before it asks for a password
 - Kernel headers and DKMS, which the script installs for you if missing (`linux-headers`/`build-essential` on apt, `kernel-devel`/`kernel-headers` on dnf)
 
 Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver branch. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.
+
+Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC. Other Wayland and X11 desktops should work too.
 
 ## Install
 
@@ -52,7 +54,7 @@ chmod +x green-light-*-x86_64.AppImage
 ./green-light-*-x86_64.AppImage
 ```
 
-The first launch asks for your password once so it can place the install helper at `/usr/lib/green-light/`, register its polkit policy and enable the boot-time restore service (`green-light-recover.service`). After that it starts like any other app. If you later download a newer AppImage, it detects the change and refreshes those files on its own. Each release also ships a `.zsync` file, so AppImageUpdate can update the AppImage in place.
+The first launch asks for your password once so it can place the install helper at `/usr/lib/green-light/`, register its polkit policy and enable the boot-time restore service (`green-light-recover.service`). After that it starts like any other app. If you later download a newer AppImage, it detects the change and refreshes those files on its own. If that password prompt is cancelled or can't appear, the window shows a banner with the reason; restart Green Light to try again. Each release also ships a `.zsync` file, so AppImageUpdate can update the AppImage in place.
 
 ## Using it
 
@@ -118,6 +120,8 @@ Two files tell you everything:
 
 If an install fails, the reason is in one of those, and the Log tab shows the script's output as it runs. The most common cause is missing kernel headers for a brand new kernel, which resolves once your distro publishes them; the script checks for headers and a compiler before it removes anything, and stops without changes if they're missing. Before it removes anything it also test-builds the new driver's kernel module for your kernel. Before the first change it saves everything needed to undo it, including copies of the packages it is about to remove. If NVIDIA's installer then fails, or the install is stopped before the installer has run, the script removes what the installer had put in place, reinstalls the removed packages (and the packages that depend on them) from those copies, puts back holds, block and boot configuration, and checks that the previous driver is back (signed, under Secure Boot) before it says so; if it can't confirm that, it says not to reboot yet. If the computer loses power or the install is killed partway, the same happens at the next boot (`green-light-recover.service`), or from Restore Previous Driver in the app, or at the start of the next install. Closing Green Light or logging out doesn't interrupt an install, and while it is changing the system, shutting down or suspending is blocked (an administrator can still force it). If the driver was changed by other means after an install was cut off, Green Light leaves that alone and offers to discard the old recovery data instead.
 
+If a password dialog never appears and Green Light says that no polkit authentication agent is running, start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use `hyprpolkitagent`, on sway or i3 use `polkit-gnome` (`policykit-1-gnome` on Debian/Ubuntu) or `lxqt-policykit`.
+
 ## Uninstalling
 
 To remove the driver itself:
@@ -144,7 +148,7 @@ sudo systemctl daemon-reload
 
 ## Building from source
 
-Needs Rust 1.100 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils` and `zsync`. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
+Needs Rust 1.100 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils`, `zsync`, `patchelf`, and the GTK runtime pieces it bundles: `librsvg2-common`, `dconf-gsettings-backend`, `ibus-gtk4`, `libgdk-pixbuf2.0-bin` and `gsettings-desktop-schemas`. Release builds run on Ubuntu 24.04, whose GTK and glibc set the floor above. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
 
 ```bash
 bash build-appimage.sh

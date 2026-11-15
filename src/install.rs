@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const PRIVILEGED_SCRIPT: &str = "/usr/lib/green-light/privileged-install.sh";
 /// Held (flock) by the install script for as long as it runs; keep in step
@@ -58,7 +58,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
+    let out = crate::host_env::command(cmd).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -177,7 +177,7 @@ impl LogTail {
 /// messages (from before the script starts) come on stderr.
 fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
     let mut tail = LogTail::at_end(INSTALL_LOG);
-    let mut child = Command::new("pkexec")
+    let mut child = crate::host_env::command("pkexec")
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::null())
@@ -265,6 +265,7 @@ fn recover_result(code: Option<i32>, lines: &[String]) -> Result<Recovered> {
         Some(0) => Ok(Recovered::Nothing),
         Some(3) => Ok(Recovered::Restored),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
+        Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         Some(4) => bail!(
             "The previous driver could not be fully restored{detail}. Don't reboot until a \
@@ -306,7 +307,7 @@ pub fn recovery_note() -> Option<RecoveryNote> {
 /// `--discard-recovery`).
 pub fn run_privileged_discard_recovery(mut on_line: impl FnMut(&str)) -> Result<()> {
     if !Path::new(PRIVILEGED_SCRIPT).exists() {
-        bail!("Privileged install script not found at {}", PRIVILEGED_SCRIPT);
+        return Err(missing_script_error());
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--discard-recovery".to_string()];
     let run = run_pkexec(&args, None, &mut on_line)?;
@@ -317,6 +318,7 @@ fn discard_result(code: Option<i32>, lines: &[String]) -> Result<()> {
     match code {
         Some(0) => Ok(()),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
+        Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         code => bail!("Discarding the recovery data failed (exit code {code:?}){}", first_error(lines).map(|e| format!(": {e}")).unwrap_or_default()),
     }
@@ -326,11 +328,57 @@ fn discard_result(code: Option<i32>, lines: &[String]) -> Result<()> {
 /// `--recover`, which the boot unit also runs).
 pub fn run_privileged_recover(mut on_line: impl FnMut(&str)) -> Result<Recovered> {
     if !Path::new(PRIVILEGED_SCRIPT).exists() {
-        bail!("Privileged install script not found at {}", PRIVILEGED_SCRIPT);
+        return Err(missing_script_error());
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--recover".to_string()];
     let run = run_pkexec(&args, None, &mut on_line)?;
     recover_result(run.code, &run.lines)
+}
+
+/// pkexec's own complaint when no polkit authentication agent (the program
+/// that shows the admin password dialog) is running, as on a bare Hyprland,
+/// sway or i3 session. It exits 127 with this on stderr.
+const NO_AGENT_TEXTS: [&str; 2] = [
+    // With --disable-internal-agent, or when no agent is registered.
+    "No authentication agent found",
+    // What an app started from a launcher (no terminal) gets: pkexec's own
+    // text agent can't open /dev/tty.
+    "Error creating textual authentication agent",
+];
+
+const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed. Start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use hyprpolkitagent; on sway or i3 use polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit.";
+
+fn no_agent(lines: &[String]) -> bool {
+    lines.iter().any(|l| NO_AGENT_TEXTS.iter().any(|t| l.contains(t)))
+}
+
+/// AppRun's setup (it puts the install script and polkit policy in place at
+/// launch) failed or was cancelled: AppRun hands over why in this variable.
+const SETUP_FAILURE_VAR: &str = "GREEN_LIGHT_SETUP_FAILURE";
+
+fn setup_failure() -> Option<String> {
+    std::env::var(SETUP_FAILURE_VAR).ok().filter(|r| !r.trim().is_empty())
+}
+
+fn setup_problem_text(reason: Option<&str>) -> Option<String> {
+    reason.map(|r| format!("Setup did not complete: {r}. Installing a driver and setting up signing will not work until it does; restart Green Light and authenticate when asked."))
+}
+
+/// For the window's banner: why the launch-time setup did not complete, or None.
+pub fn setup_problem() -> Option<String> {
+    setup_problem_text(setup_failure().as_deref())
+}
+
+fn script_missing_message(reason: Option<&str>) -> String {
+    match reason {
+        Some(r) => format!("Setup didn't complete: {r}; restart Green Light and authenticate when asked to retry."),
+        None => format!("Privileged install script not found at {PRIVILEGED_SCRIPT}"),
+    }
+}
+
+/// The error for an action that needs the install script when it is not there.
+fn missing_script_error() -> anyhow::Error {
+    anyhow::anyhow!(script_missing_message(setup_failure().as_deref()))
 }
 
 /// The first "ERROR:" message of a run, if any: the cause (later ones are
@@ -346,6 +394,7 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
     let detail = first_error(lines).map(|e| format!(": {e}")).unwrap_or_default();
     match code {
         Some(126) => "Authentication was cancelled; nothing was changed.".to_string(),
+        Some(127) if no_agent(lines) => NO_AGENT_MESSAGE.to_string(),
         Some(127) => "Not authorized, or pkexec could not start the install script; nothing was changed.".to_string(),
         Some(1) => format!("The install stopped before changing anything{detail}"),
         Some(2) => format!("The install script refused to start{detail}"),
@@ -378,7 +427,7 @@ pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&st
     let script = PRIVILEGED_SCRIPT;
 
     if !Path::new(script).exists() {
-        bail!("Privileged install script not found at {}", script);
+        return Err(missing_script_error());
     }
     check_run_file(&opts.run_file)?;
 
@@ -425,7 +474,7 @@ pub struct SetupOutcome {
 pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
     let fail = |e: anyhow::Error| SetupOutcome { result: Err(e), lines: vec![] };
     if !Path::new(PRIVILEGED_SCRIPT).exists() {
-        return fail(anyhow::anyhow!("Privileged install script not found at {}", PRIVILEGED_SCRIPT));
+        return fail(missing_script_error());
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--setup-signing".to_string()];
     let run = match run_pkexec(&args, Some(password), &mut |_| {}) {
@@ -435,6 +484,7 @@ pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
     let result = match run.code {
         Some(0) => Ok(()),
         Some(126) => Err(anyhow::anyhow!("Authentication was cancelled.")),
+        Some(127) if no_agent(&run.lines) => Err(anyhow::anyhow!(NO_AGENT_MESSAGE)),
         Some(127) => Err(anyhow::anyhow!("Not authorized, or pkexec could not start the script.")),
         code => Err(anyhow::anyhow!(
             "Signing setup failed{}",
@@ -461,6 +511,38 @@ mod tests {
             let msg = install_failure(Some(code), &out);
             assert!(!msg.contains("cancelled") && !msg.contains("Not authorized"), "{code}: {msg}");
         }
+    }
+
+    #[test]
+    fn a_failed_setup_is_the_reason_not_a_missing_script() {
+        let why = "no polkit authentication agent is running";
+        let banner = setup_problem_text(Some(why)).unwrap();
+        assert!(banner.starts_with("Setup did not complete: no polkit") && banner.contains("restart Green Light"), "{banner}");
+        assert_eq!(setup_problem_text(None), None);
+        let msg = script_missing_message(Some(why));
+        assert!(msg.starts_with("Setup didn't complete: no polkit") && msg.contains("restart"), "{msg}");
+        assert!(!msg.contains("not found"), "{msg}");
+        assert!(script_missing_message(None).contains("not found at /usr/lib/green-light/privileged-install.sh"));
+    }
+
+    #[test]
+    fn missing_polkit_agent_is_named() {
+        let err = lines(&["Error executing command as another user: No authentication agent found."]);
+        let tty = lines(&[
+            "Error creating textual authentication agent: Error opening current controlling terminal for the process (`/dev/tty'): No such device or address",
+        ]);
+        assert!(install_failure(Some(127), &tty).contains("No polkit authentication agent"));
+        for msg in [
+            install_failure(Some(127), &err),
+            recover_result(Some(127), &err).unwrap_err().to_string(),
+            discard_result(Some(127), &err).unwrap_err().to_string(),
+        ] {
+            assert!(msg.contains("No polkit authentication agent") && msg.contains("hyprpolkitagent"), "{msg}");
+            assert!(!msg.contains("Not authorized"), "{msg}");
+        }
+        // Other 127s keep the generic message, and the text only counts with 127.
+        assert!(install_failure(Some(127), &lines(&["Error executing command as another user: Not authorized"])).contains("Not authorized"));
+        assert!(!install_failure(Some(1), &err).contains("polkit authentication agent"));
     }
 
     #[test]
