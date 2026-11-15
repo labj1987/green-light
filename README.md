@@ -38,7 +38,7 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 
 - x86_64 Linux with systemd and polkit
 - Either an apt-based distro (Ubuntu, Debian, Mint) or a dnf-based distro (Fedora, RHEL, Nobara). The install script detects which one you have and uses the right package manager. Anything else, the GUI runs fine through the AppImage but the install script will refuse to run.
-- GTK 4.12+ and libadwaita 1.5+ installed: the AppImage uses the system's libraries (without them, Green Light says which are missing and which packages to install, before it asks for a password)
+- Nothing else to install for the window itself: the AppImage brings its own GTK 4 and libadwaita, so it also runs on desktops that ship neither (a stock KDE Plasma or Hyprland install). It takes the basics every desktop has from the system: glibc 2.39 or newer, OpenGL/EGL drivers, X11 or Wayland client libraries, and fontconfig, freetype, harfbuzz and fribidi. If one of those is missing, Green Light names it before it asks for a password
 - Kernel headers and DKMS, which the script installs for you if missing (`linux-headers`/`build-essential` on apt, `kernel-devel`/`kernel-headers` on dnf)
 
 Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver branch. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.
@@ -146,7 +146,7 @@ sudo systemctl daemon-reload
 
 ## Building from source
 
-Needs Rust 1.100 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils` and `zsync`. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
+Needs Rust 1.100 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils`, `zsync`, `patchelf`, and the GTK runtime pieces it bundles: `librsvg2-common`, `dconf-gsettings-backend`, `ibus-gtk4`, `libgdk-pixbuf2.0-bin` and `gsettings-desktop-schemas`. Release builds run on Ubuntu 24.04, whose GTK and glibc set the floor above. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
 
 ```bash
 bash build-appimage.sh

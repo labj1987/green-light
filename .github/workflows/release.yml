@@ -87,7 +87,8 @@ jobs:
         run: |
           sudo apt-get update -qq || true
           sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config \
-            zsync wget file desktop-file-utils
+            zsync wget file desktop-file-utils \
+            patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas
 
       - name: Build AppImage
         run: bash build-appimage.sh

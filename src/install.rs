@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 const PRIVILEGED_SCRIPT: &str = "/usr/lib/green-light/privileged-install.sh";
 /// Held (flock) by the install script for as long as it runs; keep in step
@@ -58,7 +58,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(cmd).args(args).output().ok()?;
+    let out = crate::host_env::command(cmd).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -177,7 +177,7 @@ impl LogTail {
 /// messages (from before the script starts) come on stderr.
 fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
     let mut tail = LogTail::at_end(INSTALL_LOG);
-    let mut child = Command::new("pkexec")
+    let mut child = crate::host_env::command("pkexec")
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::null())

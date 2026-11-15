@@ -1,5 +1,6 @@
 mod branches;
 mod download;
+mod host_env;
 mod install;
 mod preflight;
 mod system;

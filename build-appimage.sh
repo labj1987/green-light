@@ -7,68 +7,6 @@ set -euo pipefail
 
 APP="green-light"
 
-# >>> libcheck: before any setup, make sure the app's shared libraries resolve.
-# LIBCHECK_LDD, LIBCHECK_OS_RELEASE and LIBCHECK_DIALOG=none exist for the tests.
-libcheck_missing() {
-    local out
-    if [[ -n "${LIBCHECK_LDD:-}" ]]; then
-        out="$("$LIBCHECK_LDD" "$1" 2>/dev/null)"
-    elif command -v ldd >/dev/null 2>&1; then
-        out="$(ldd "$1" 2>/dev/null)"
-    else
-        out="$(LD_TRACE_LOADED_OBJECTS=1 "$1" 2>/dev/null)"
-    fi
-    sed -n 's/^[[:space:]]*\([^[:space:]]*\) => not found.*/\1/p' <<<"$out"
-}
-
-libcheck_install_hint() {
-    local f="${LIBCHECK_OS_RELEASE:-/etc/os-release}" ids id
-    [[ -r "$f" ]] || return 0
-    # shellcheck disable=SC1090
-    ids="$(. "$f" 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}")"
-    for id in $ids; do
-        case "$id" in
-            debian|ubuntu|linuxmint|pop) echo "sudo apt install libgtk-4-1 libadwaita-1-0"; return 0 ;;
-            fedora|rhel|centos|rocky|almalinux) echo "sudo dnf install gtk4 libadwaita"; return 0 ;;
-            arch|cachyos|manjaro|endeavouros) echo "sudo pacman -S gtk4 libadwaita"; return 0 ;;
-            opensuse*|suse|sles) echo "sudo zypper install libgtk-4-1 libadwaita-1-0"; return 0 ;;
-        esac
-    done
-}
-
-libcheck_show() {
-    printf '%s: %s\n' "$1" "$2" >&2
-    [[ "${LIBCHECK_DIALOG:-}" == none ]] && return 0
-    [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
-    if command -v zenity >/dev/null 2>&1; then
-        zenity --error --title="$1" --text="$2" --width=460 >/dev/null 2>&1
-    elif command -v kdialog >/dev/null 2>&1; then
-        kdialog --error "$2" --title "$1" >/dev/null 2>&1
-    elif command -v notify-send >/dev/null 2>&1; then
-        notify-send -u critical "$1" "$2" >/dev/null 2>&1
-    fi
-    return 0
-}
-
-# libcheck_run NAME BINARY: returns 1 (after showing why) when libraries are missing.
-libcheck_run() {
-    local missing list hint msg
-    missing="$(libcheck_missing "$2")"
-    [[ -n "$missing" ]] || return 0
-    list="$(paste -sd, - <<<"$missing" | sed 's/,/, /g')"
-    hint="$(libcheck_install_hint)"
-    msg="$1 can't start because these system libraries are missing: $list."
-    if [[ -n "$hint" ]]; then
-        msg+=" They come with GTK 4 and libadwaita. Install them with: $hint, then start $1 again."
-    else
-        msg+=" They come with GTK 4 (4.12 or newer) and libadwaita (1.5 or newer): install both with your package manager, then start $1 again."
-    fi
-    libcheck_show "$1" "$msg"
-    return 1
-}
-# <<< libcheck
-
-libcheck_run "Green Light" "$HERE/usr/bin/$APP" || exit 1
 # Single source of truth: the version in Cargo.toml
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
@@ -76,6 +14,166 @@ BUILD_DIR="build-appimage"
 APPDIR="$BUILD_DIR/AppDir"
 
 echo "==> Building $APP $VERSION AppImage"
+
+# ── Bundled GTK 4 / libadwaita runtime ───────────────────────────────
+# The AppImage carries GTK 4, libadwaita and everything they link, taken from the build machine
+# (the release runner, Ubuntu 24.04, glibc 2.39), so it starts on desktops that ship neither
+# (a stock KDE or Hyprland install). What stays on the host is the AppImage project's excludelist
+# (github.com/AppImageCommunity/pkg2appimage, file `excludelist` at commit 15a64c2, 2024-11-03):
+# glibc, libstdc++/libgcc_s, the GL/EGL/GLX/glvnd and DRM/GBM stack, libX11/libxcb, Wayland's
+# client library, fontconfig/freetype/harfbuzz/fribidi, zlib, expat and the rest of that list,
+# plus our own additions below: the Vulkan loader (its drivers and layers are the host's) and
+# Wayland's other client libraries (they pair with the host's libwayland-client and Mesa).
+# Nothing is found through LD_LIBRARY_PATH: every bundled ELF file gets an rpath relative to
+# itself ($ORIGIN), so the programs the app starts never load a bundled library.
+BUNDLE_EXCLUDE=(
+    ld-linux.so.2 ld-linux-x86-64.so.2 libanl.so.1 libBrokenLocale.so.1 libcidn.so.1 libc.so.6
+    libdl.so.2 libm.so.6 libmvec.so.1 libnss_compat.so.2 libnss_dns.so.2 libnss_files.so.2
+    libnss_hesiod.so.2 libnss_nisplus.so.2 libnss_nis.so.2 libpthread.so.0 libresolv.so.2
+    librt.so.1 libthread_db.so.1 libutil.so.1 libstdc++.so.6 libGL.so.1 libEGL.so.1
+    libGLdispatch.so.0 libGLX.so.0 libOpenGL.so.0 libdrm.so.2 libglapi.so.0 libgbm.so.1
+    libxcb.so.1 libX11.so.6 libX11-xcb.so.1 libwayland-client.so.0 libasound.so.2
+    libfontconfig.so.1 libfreetype.so.6 libharfbuzz.so.0 libcom_err.so.2 libexpat.so.1
+    libgcc_s.so.1 libgpg-error.so.0 libICE.so.6 libSM.so.6 libusb-1.0.so.0 libuuid.so.1
+    libz.so.1 libjack.so.0 libpipewire-0.3.so.0 libxcb-dri3.so.0 libxcb-dri2.so.0
+    libfribidi.so.0 libgmp.so.10
+    # Ours:
+    libvulkan.so.1 libwayland-egl.so.1 libwayland-cursor.so.0 libwayland-server.so.0
+)
+
+bundle_excluded() { [[ " ${BUNDLE_EXCLUDE[*]} " == *" $1 "* ]]; }
+
+# bundle_ldd FILE: prints "soname path" for each library FILE loads (its whole closure, as ldd
+# resolves it right now); fails, naming them, when one cannot be found.
+bundle_ldd() {
+    local out
+    out="$(ldd "$1")" || return 1
+    if grep -q '=> not found' <<<"$out"; then
+        echo "==> ERROR: $1 needs libraries this machine does not have:" >&2
+        grep '=> not found' <<<"$out" >&2
+        return 1
+    fi
+    awk '$2 == "=>" && $3 ~ /^\// { print $1, $3 }' <<<"$out"
+}
+
+# bundle_gtk_runtime APPDIR BINARY...: puts the GTK 4 + libadwaita runtime the given binaries
+# (already in APPDIR/usr/bin) need into APPDIR/usr:
+#   lib/                                the libraries (rpath $ORIGIN)
+#   lib/gdk-pixbuf-2.0/2.10.0/          image loaders (SVG icons) and their loaders.cache
+#   lib/gio/modules/                    the dconf GSettings backend, so settings live in the
+#                                       host's dconf like every other GTK app's
+#   lib/gtk-4.0/4.0.0/immodules/        the IBus input method module (X11 sessions; on Wayland
+#                                       GTK speaks to the input method itself)
+#   share/glib-2.0/schemas/             GTK's and the desktop's GSettings schemas, compiled
+# AppRun's bundle_env block points GTK at them (GTK_EXE_PREFIX, GDK_PIXBUF_MODULE_FILE,
+# GIO_MODULE_DIR, GSETTINGS_SCHEMA_DIR), and the app gives every program it starts the host's
+# values of those back.
+bundle_gtk_runtime() {
+    local appdir="$1"; shift
+    local usr="$appdir/usr" syslib pixver pixdir loaders giomods immods f soname path pkg
+    local work="$appdir/.."
+    syslib="$(pkg-config --variable=libdir gtk4)"
+    pixver="$(pkg-config --variable=gdk_pixbuf_binary_version gdk-pixbuf-2.0)"
+    pixdir="$(pkg-config --variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0)"
+    loaders="$usr/lib/gdk-pixbuf-2.0/$pixver/loaders"
+    giomods="$usr/lib/gio/modules"
+    immods="$usr/lib/gtk-4.0/4.0.0/immodules"
+    local modules=("$pixdir/libpixbufloader-svg.so" "$syslib/gio/modules/libdconfsettings.so"
+        "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so")
+    for f in "${modules[@]}" "$syslib/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders"; do
+        [[ -e "$f" ]] && continue
+        echo "==> ERROR: $f is missing (packages librsvg2-common, dconf-gsettings-backend, ibus-gtk4, libgdk-pixbuf2.0-bin)" >&2
+        return 1
+    done
+    for f in patchelf glib-compile-schemas gio-querymodules dpkg; do
+        command -v "$f" >/dev/null 2>&1 || { echo "==> ERROR: $f is not installed" >&2; return 1; }
+    done
+
+    echo "==> Bundling GTK 4 and libadwaita"
+    mkdir -p "$usr/lib" "$loaders" "$giomods" "$immods" "$usr/share/glib-2.0/schemas"
+    cp "$pixdir"/*.so "$loaders/"
+    cp "$syslib/gio/modules/libdconfsettings.so" "$giomods/"
+    cp "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so" "$immods/"
+    printf '%s\n' "$pixdir"/*.so "${modules[@]:1}" > "$work/bundle-sources"
+
+    # The libraries: the ldd closure of the binaries and the modules, minus the excludelist.
+    local elves=()
+    for f in "$@"; do elves+=("$usr/bin/$f"); done
+    elves+=("$loaders"/*.so "$giomods"/*.so "$immods"/*.so)
+    for f in "${elves[@]}"; do
+        bundle_ldd "$f" > "$work/bundle-closure" || return 1
+        while read -r soname path; do
+            bundle_excluded "$soname" && continue
+            if [[ ! -e "$usr/lib/$soname" ]]; then
+                cp -L "$path" "$usr/lib/$soname"
+                echo "$path" >> "$work/bundle-sources"
+            fi
+        done < "$work/bundle-closure"
+    done
+
+    # rpath, not LD_LIBRARY_PATH. DT_RPATH (--force-rpath), not DT_RUNPATH, so that a
+    # LD_LIBRARY_PATH the user has set cannot swap in a host library the bundle wasn't built with.
+    # The binaries' rpath also names the loader directory: loaders.cache lists bare file names,
+    # which dlopen() finds there wherever the AppImage is mounted.
+    for f in "$@"; do
+        patchelf --force-rpath --set-rpath "\$ORIGIN/../lib:\$ORIGIN/../lib/gdk-pixbuf-2.0/$pixver/loaders" "$usr/bin/$f"
+    done
+    # shellcheck disable=SC2016 # $ORIGIN is for the dynamic linker, not the shell
+    for f in "$usr/lib"/*.so*; do patchelf --force-rpath --set-rpath '$ORIGIN' "$f"; done
+    # shellcheck disable=SC2016
+    for f in "$loaders"/*.so "$immods"/*.so; do patchelf --force-rpath --set-rpath '$ORIGIN/../../..' "$f"; done
+    # shellcheck disable=SC2016
+    for f in "$giomods"/*.so; do patchelf --force-rpath --set-rpath '$ORIGIN/../..' "$f"; done
+
+    # Check: everything bundled now loads its libraries from the AppDir, or from the host only
+    # when the excludelist says so.
+    local inside bad=0
+    inside="$(realpath "$usr/lib")"
+    for f in "${elves[@]}" "$usr/lib"/*.so*; do
+        bundle_ldd "$f" > "$work/bundle-closure" || return 1
+        while read -r soname path; do
+            bundle_excluded "$soname" && continue
+            [[ "$(realpath "$path")" == "$inside/"* ]] && continue
+            echo "==> ERROR: $f loads $soname from $path, not from the AppDir" >&2
+            bad=1
+        done < "$work/bundle-closure"
+    done
+    rm -f "$work/bundle-closure"
+    [[ $bad -eq 0 ]] || return 1
+
+    local cache
+    cache="$("$syslib/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders" "$loaders"/*.so)"
+    cache="${cache//\"$(realpath "$loaders")\//\"}"
+    cache="${cache//\"$loaders\//\"}"
+    printf '%s\n' "$cache" > "$loaders/../loaders.cache"
+    if grep -q '^"/.*\.so"$' "$loaders/../loaders.cache"; then
+        echo "==> ERROR: loaders.cache still names absolute paths" >&2
+        return 1
+    fi
+    gio-querymodules "$giomods"
+
+    # GSettings schemas: GTK's own (its file, colour and emoji choosers abort without them) and the
+    # desktop ones GTK reads when there is no settings portal.
+    cp /usr/share/glib-2.0/schemas/org.gtk.gtk4.*.gschema.xml \
+       /usr/share/glib-2.0/schemas/org.gnome.desktop.*.xml "$usr/share/glib-2.0/schemas/"
+    glib-compile-schemas --strict "$usr/share/glib-2.0/schemas"
+
+    # The bundled libraries' copyright and licence notices, from their packages.
+    local docs="$usr/share/doc/bundled-libraries"
+    mkdir -p "$docs"
+    while read -r path; do
+        pkg="$(dpkg -S "$path" 2>/dev/null || dpkg -S "$(realpath "$path")" 2>/dev/null \
+            || dpkg -S "${path#/usr}" 2>/dev/null || true)"
+        pkg="${pkg%%:*}"
+        if [[ -z "$pkg" || ! -f "/usr/share/doc/$pkg/copyright" ]]; then
+            echo "==> ERROR: no copyright notice found for $path" >&2
+            return 1
+        fi
+        cp "/usr/share/doc/$pkg/copyright" "$docs/$pkg.copyright"
+    done < <(sort -u "$work/bundle-sources")
+    rm -f "$work/bundle-sources"
+    echo "==> Bundled $(find "$usr/lib" -name '*.so*' | wc -l) libraries and modules ($(du -sh "$usr/lib" | cut -f1))"
+}
 
 # ── Build dependencies ────────────────────────────────────────────────
 # Only on a machine with no toolchain (this block needs root, through sudo when the
@@ -89,10 +187,11 @@ if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null;
     # to its cached index for it. Only the install failing should be fatal.
     "${AS_ROOT[@]}" apt-get update -qq || true
     "${AS_ROOT[@]}" apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
-        pkg-config zsync wget file desktop-file-utils
+        pkg-config zsync wget file desktop-file-utils \
+        patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas
 fi
 
-for tool in wget file desktop-file-validate; do
+for tool in wget file desktop-file-validate patchelf; do
     command -v "$tool" >/dev/null 2>&1 || { echo "==> ERROR: $tool is not installed" >&2; exit 1; }
 done
 
@@ -110,6 +209,7 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/metainfo"
 
 cp "${CARGO_TARGET_DIR:-target}/release/$APP" "$APPDIR/usr/bin/"
+bundle_gtk_runtime "$APPDIR" "$APP"
 cp scripts/privileged-install.sh            "$APPDIR/usr/lib/$APP/"
 cp data/green-light-recover.service         "$APPDIR/usr/lib/$APP/"
 chmod 755 "$APPDIR/usr/lib/$APP/privileged-install.sh"
@@ -154,6 +254,101 @@ cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
 APP="green-light"
+
+# >>> libcheck: before any setup, make sure the app's shared libraries resolve. GTK 4 and
+# libadwaita are bundled and found through the binary's rpath (ldd follows it), so what can be
+# missing here is only what the AppImage deliberately takes from the system: glibc, the
+# graphics stack (OpenGL/EGL, DRM), X11/xcb and Wayland client libraries, fonts (fontconfig,
+# freetype, harfbuzz, fribidi), zlib and expat.
+# LIBCHECK_LDD, LIBCHECK_OS_RELEASE and LIBCHECK_DIALOG=none exist for the tests.
+libcheck_missing() {
+    local out
+    if [[ -n "${LIBCHECK_LDD:-}" ]]; then
+        out="$("$LIBCHECK_LDD" "$1" 2>/dev/null)"
+    elif command -v ldd >/dev/null 2>&1; then
+        out="$(ldd "$1" 2>/dev/null)"
+    else
+        out="$(LD_TRACE_LOADED_OBJECTS=1 "$1" 2>/dev/null)"
+    fi
+    sed -n 's/^[[:space:]]*\([^[:space:]]*\) => not found.*/\1/p' <<<"$out"
+}
+
+# libcheck_install_hint LIBRARY...: a command that installs the packages providing LIBRARY...,
+# on distributions whose package manager installs by library name (rpm's provides).
+libcheck_install_hint() {
+    local f="${LIBCHECK_OS_RELEASE:-/etc/os-release}" ids id cmd lib
+    [[ -r "$f" ]] || return 0
+    # shellcheck disable=SC1090
+    ids="$(. "$f" 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}")"
+    for id in $ids; do
+        case "$id" in
+            fedora|rhel|centos|rocky|almalinux) cmd="sudo dnf install" ;;
+            opensuse*|suse|sles) cmd="sudo zypper install" ;;
+            *) continue ;;
+        esac
+        for lib in "$@"; do cmd+=" '$lib()(64bit)'"; done
+        echo "$cmd"
+        return 0
+    done
+}
+
+libcheck_show() {
+    printf '%s: %s\n' "$1" "$2" >&2
+    [[ "${LIBCHECK_DIALOG:-}" == none ]] && return 0
+    [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="$1" --text="$2" --width=460 >/dev/null 2>&1
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --error "$2" --title "$1" >/dev/null 2>&1
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "$1" "$2" >/dev/null 2>&1
+    fi
+    return 0
+}
+
+# libcheck_run NAME BINARY: returns 1 (after showing why) when libraries are missing.
+libcheck_run() {
+    local missing list hint msg
+    missing="$(libcheck_missing "$2")"
+    [[ -n "$missing" ]] || return 0
+    local libs=()
+    mapfile -t libs <<<"$missing"
+    list="$(paste -sd, - <<<"$missing" | sed 's/,/, /g')"
+    hint="$(libcheck_install_hint "${libs[@]}")"
+    msg="$1 can't start because these system libraries are missing: $list."
+    msg+=" $1 brings GTK 4 and libadwaita with it, but takes these from the system (graphics, windowing and font libraries every desktop normally has)."
+    if [[ -n "$hint" ]]; then
+        msg+=" Install them with: $hint, then start $1 again."
+    else
+        msg+=" Install the packages that provide them with your package manager, then start $1 again."
+    fi
+    libcheck_show "$1" "$msg"
+    return 1
+}
+# <<< libcheck
+
+# >>> bundle_env: point the bundled GTK 4 at its own modules, image loaders and schemas
+# (build-appimage.sh, bundle_gtk_runtime). The names go in APPIMAGE_BUNDLE_ENV and each one's
+# earlier value in APPIMAGE_ORIG_<NAME> (left unset when it had none), so the app can start other
+# programs with the environment they would have had without the AppImage.
+bundle_env() {
+    local var
+    export APPIMAGE_BUNDLE_ENV="GTK_EXE_PREFIX GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR"
+    for var in $APPIMAGE_BUNDLE_ENV; do
+        if [[ -n "${!var+set}" ]]; then
+            export "APPIMAGE_ORIG_$var=${!var}"
+        else
+            unset "APPIMAGE_ORIG_$var"
+        fi
+    done
+    export GTK_EXE_PREFIX="$1/usr"
+    export GDK_PIXBUF_MODULE_FILE="$1/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+    export GIO_MODULE_DIR="$1/usr/lib/gio/modules"
+    export GSETTINGS_SCHEMA_DIR="$1/usr/share/glib-2.0/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+}
+# <<< bundle_env
+
+libcheck_run "Green Light" "$HERE/usr/bin/$APP" || exit 1
 
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
 SRC_HELPER="$HERE/usr/lib/$APP/green-light-setup"
@@ -218,6 +413,7 @@ if [[ $needs_install -eq 1 ]]; then
     rm -f "$ERRF"
 fi
 
+bundle_env "$HERE"
 export PATH="$HERE/usr/bin:$PATH"
 exec "$HERE/usr/bin/$APP" "$@"
 APPRUN
