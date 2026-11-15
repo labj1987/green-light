@@ -338,12 +338,18 @@ pub fn run_privileged_recover(mut on_line: impl FnMut(&str)) -> Result<Recovered
 /// pkexec's own complaint when no polkit authentication agent (the program
 /// that shows the admin password dialog) is running, as on a bare Hyprland,
 /// sway or i3 session. It exits 127 with this on stderr.
-const NO_AGENT_TEXT: &str = "No authentication agent found";
+const NO_AGENT_TEXTS: [&str; 2] = [
+    // With --disable-internal-agent, or when no agent is registered.
+    "No authentication agent found",
+    // What an app started from a launcher (no terminal) gets: pkexec's own
+    // text agent can't open /dev/tty.
+    "Error creating textual authentication agent",
+];
 
-const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed. Start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use hyprpolkitagent; on sway or i3 use polkit-gnome or lxqt-policykit.";
+const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed. Start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use hyprpolkitagent; on sway or i3 use polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit.";
 
 fn no_agent(lines: &[String]) -> bool {
-    lines.iter().any(|l| l.contains(NO_AGENT_TEXT))
+    lines.iter().any(|l| NO_AGENT_TEXTS.iter().any(|t| l.contains(t)))
 }
 
 /// The first "ERROR:" message of a run, if any: the cause (later ones are
@@ -481,6 +487,10 @@ mod tests {
     #[test]
     fn missing_polkit_agent_is_named() {
         let err = lines(&["Error executing command as another user: No authentication agent found."]);
+        let tty = lines(&[
+            "Error creating textual authentication agent: Error opening current controlling terminal for the process (`/dev/tty'): No such device or address",
+        ]);
+        assert!(install_failure(Some(127), &tty).contains("No polkit authentication agent"));
         for msg in [
             install_failure(Some(127), &err),
             recover_result(Some(127), &err).unwrap_err().to_string(),

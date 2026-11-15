@@ -11,7 +11,7 @@ under 2.3.0.
   agent (the program that shows the admin password dialog, often missing on Hyprland, sway and i3), the
   install used to fail with "Not authorized, or pkexec could not start the script". It now says that no
   agent is running, that nothing was changed, and which one to start (for example hyprpolkitagent on
-  Hyprland, or polkit-gnome or lxqt-policykit on sway and i3).
+  Hyprland, or polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway and i3).
 
 ## 2.10.9 — 2026-11-12
 
