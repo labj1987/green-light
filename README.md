@@ -43,6 +43,8 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 
 Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver branch. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.
 
+Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC. Other Wayland and X11 desktops should work too.
+
 ## Install
 
 Download the AppImage from [Releases](../../releases):
@@ -52,7 +54,7 @@ chmod +x green-light-*-x86_64.AppImage
 ./green-light-*-x86_64.AppImage
 ```
 
-The first launch asks for your password once so it can place the install helper at `/usr/lib/green-light/`, register its polkit policy and enable the boot-time restore service (`green-light-recover.service`). After that it starts like any other app. If you later download a newer AppImage, it detects the change and refreshes those files on its own. Each release also ships a `.zsync` file, so AppImageUpdate can update the AppImage in place.
+The first launch asks for your password once so it can place the install helper at `/usr/lib/green-light/`, register its polkit policy and enable the boot-time restore service (`green-light-recover.service`). After that it starts like any other app. If you later download a newer AppImage, it detects the change and refreshes those files on its own. If that password prompt is cancelled or can't appear, the window shows a banner with the reason; restart Green Light to try again. Each release also ships a `.zsync` file, so AppImageUpdate can update the AppImage in place.
 
 ## Using it
 

@@ -294,7 +294,7 @@ fonts; the script cites the excludelist version) and the Vulkan loader, which al
 system; plus the SVG pixbuf loader only (Ubuntu builds PNG and JPEG into gdk-pixbuf; the build fails
 if that changes), the dconf GIO module and the IBus IM module, with compiled schemas. Licences go to
 `usr/share/doc/bundled-libraries`: each package's copyright file, the `common-licenses` texts they
-name, and `PACKAGES` (source packages and versions, unmodified Ubuntu 24.04 builds). AppRun's
+name, and `PACKAGES` (the Ubuntu 24.04 source packages and versions they come from; the only change is the ELF rpath). AppRun's
 `libcheck_run` fails on any `not found` line of `ldd -r`, and on unresolved symbols of the binary or of
 anything inside the AppImage (a system library's own lazy ones don't count); when ldd fails without
 naming anything, it asks the loader directly. It names the glibc version needed and found. `gio-launch-desktop` is copied into `usr/bin` (GLib runs every GIO launch
