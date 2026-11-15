@@ -265,6 +265,7 @@ fn recover_result(code: Option<i32>, lines: &[String]) -> Result<Recovered> {
         Some(0) => Ok(Recovered::Nothing),
         Some(3) => Ok(Recovered::Restored),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
+        Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         Some(4) => bail!(
             "The previous driver could not be fully restored{detail}. Don't reboot until a \
@@ -317,6 +318,7 @@ fn discard_result(code: Option<i32>, lines: &[String]) -> Result<()> {
     match code {
         Some(0) => Ok(()),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
+        Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         code => bail!("Discarding the recovery data failed (exit code {code:?}){}", first_error(lines).map(|e| format!(": {e}")).unwrap_or_default()),
     }
@@ -333,6 +335,17 @@ pub fn run_privileged_recover(mut on_line: impl FnMut(&str)) -> Result<Recovered
     recover_result(run.code, &run.lines)
 }
 
+/// pkexec's own complaint when no polkit authentication agent (the program
+/// that shows the admin password dialog) is running, as on a bare Hyprland,
+/// sway or i3 session. It exits 127 with this on stderr.
+const NO_AGENT_TEXT: &str = "No authentication agent found";
+
+const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed. Start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use hyprpolkitagent; on sway or i3 use polkit-gnome or lxqt-policykit.";
+
+fn no_agent(lines: &[String]) -> bool {
+    lines.iter().any(|l| l.contains(NO_AGENT_TEXT))
+}
+
 /// The first "ERROR:" message of a run, if any: the cause (later ones are
 /// about putting things back).
 fn first_error(lines: &[String]) -> Option<&str> {
@@ -346,6 +359,7 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
     let detail = first_error(lines).map(|e| format!(": {e}")).unwrap_or_default();
     match code {
         Some(126) => "Authentication was cancelled; nothing was changed.".to_string(),
+        Some(127) if no_agent(lines) => NO_AGENT_MESSAGE.to_string(),
         Some(127) => "Not authorized, or pkexec could not start the install script; nothing was changed.".to_string(),
         Some(1) => format!("The install stopped before changing anything{detail}"),
         Some(2) => format!("The install script refused to start{detail}"),
@@ -435,6 +449,7 @@ pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
     let result = match run.code {
         Some(0) => Ok(()),
         Some(126) => Err(anyhow::anyhow!("Authentication was cancelled.")),
+        Some(127) if no_agent(&run.lines) => Err(anyhow::anyhow!(NO_AGENT_MESSAGE)),
         Some(127) => Err(anyhow::anyhow!("Not authorized, or pkexec could not start the script.")),
         code => Err(anyhow::anyhow!(
             "Signing setup failed{}",
@@ -461,6 +476,22 @@ mod tests {
             let msg = install_failure(Some(code), &out);
             assert!(!msg.contains("cancelled") && !msg.contains("Not authorized"), "{code}: {msg}");
         }
+    }
+
+    #[test]
+    fn missing_polkit_agent_is_named() {
+        let err = lines(&["Error executing command as another user: No authentication agent found."]);
+        for msg in [
+            install_failure(Some(127), &err),
+            recover_result(Some(127), &err).unwrap_err().to_string(),
+            discard_result(Some(127), &err).unwrap_err().to_string(),
+        ] {
+            assert!(msg.contains("No polkit authentication agent") && msg.contains("hyprpolkitagent"), "{msg}");
+            assert!(!msg.contains("Not authorized"), "{msg}");
+        }
+        // Other 127s keep the generic message, and the text only counts with 127.
+        assert!(install_failure(Some(127), &lines(&["Error executing command as another user: Not authorized"])).contains("Not authorized"));
+        assert!(!install_failure(Some(1), &err).contains("polkit authentication agent"));
     }
 
     #[test]

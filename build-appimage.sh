@@ -138,7 +138,7 @@ if [[ $needs_install -eq 1 ]]; then
     if [[ $rc -ne 0 ]]; then
         case $rc in
             126) echo "Green Light: authorization was cancelled; system components were not updated." >&2 ;;
-            127) echo "Green Light: authorization failed, or pkexec could not run the setup helper; system components were not updated." >&2 ;;
+            127) echo "Green Light: authorization failed, or pkexec could not run the setup helper; system components were not updated. If pkexec said \"No authentication agent found\", start a polkit authentication agent (hyprpolkitagent on Hyprland, polkit-gnome or lxqt-policykit on sway or i3) and relaunch." >&2 ;;
             *)   echo "Green Light: installing system components failed (exit $rc)." >&2 ;;
         esac
         if [[ ! -f "$DST_SCRIPT" ]]; then

@@ -5,6 +5,14 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## Unreleased
+
+- **A missing password dialog is now named as the problem.** On a desktop with no polkit authentication
+  agent (the program that shows the admin password dialog, often missing on Hyprland, sway and i3), the
+  install used to fail with "Not authorized, or pkexec could not start the script". It now says that no
+  agent is running, that nothing was changed, and which one to start (for example hyprpolkitagent on
+  Hyprland, or polkit-gnome or lxqt-policykit on sway and i3).
+
 ## 2.10.9 — 2026-11-12
 
 Build only, nothing changes in the app:
