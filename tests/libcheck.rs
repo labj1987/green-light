@@ -89,13 +89,13 @@ fn apt_and_pacman_name_the_packages_and_how_to_find_the_rest() {
     let (_, out, _) = run("hint-apt", "", "ID=debian\n", "libcheck_install_hint libEGL.so.1 libvulkan.so.1 libfoo.so.2 libbar.so.1");
     assert_eq!(
         out.trim(),
-        "Install them with: sudo apt install libegl1 libvulkan1. Find the package that provides libfoo.so.2, libbar.so.1 with: apt-file search <library>."
+        "Install them with: sudo apt install libegl1 libvulkan1. Find the package that provides each of the others with: apt-file search libfoo.so.2; apt-file search libbar.so.1."
     );
     // libEGL and libGL are both in libglvnd: named once.
     let (_, out, _) = run("hint-arch", "", "ID=arch\n", "libcheck_install_hint libEGL.so.1 libGL.so.1 libfoo.so.2");
-    assert_eq!(out.trim(), "Install them with: sudo pacman -S libglvnd. Find the package that provides libfoo.so.2 with: pacman -F <library>.");
+    assert_eq!(out.trim(), "Install them with: sudo pacman -S libglvnd. Find the package that provides each of the others with: pacman -F libfoo.so.2.");
     let (_, out, _) = run("hint-none", "", "ID=ubuntu\n", "libcheck_install_hint libfoo.so.2");
-    assert_eq!(out.trim(), "Find the package that provides libfoo.so.2 with: apt-file search <library>.");
+    assert_eq!(out.trim(), "Find the package that provides each of them with: apt-file search libfoo.so.2.");
     let (ok, _, err) = run("hint-msg", "\tlibz.so.1 => not found", "ID=ubuntu\n", "libcheck_run 'Test App' /x");
     assert!(!ok);
     assert!(err.contains("missing: libz.so.1.") && err.ends_with("Install them with: sudo apt install zlib1g. Then start Test App again.\n"), "{err}");
@@ -328,14 +328,61 @@ fn undefined_symbols_stop_the_launch() {
 }
 
 #[test]
-fn other_missing_versions_and_a_failing_ldd_stop_the_launch() {
+fn other_missing_versions_stop_the_launch() {
     let ldd = "/x: /lib/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /x)";
     let (ok, _, err) = run("other", ldd, "ID=debian\n", "export LDD_EXIT=1; libcheck_run 'Test App' /x");
     assert!(!ok);
     assert!(err.contains("too old: /x: /lib/libstdc++.so.6: version `GLIBCXX_3.4.32' not found (required by /x)."), "{err}");
-    let (ok, _, err) = run("rc", "", "ID=debian\n", "export LDD_EXIT=3; libcheck_run 'Test App' /x");
+}
+
+/// A fake loader for libcheck's fallback, printing `out`.
+fn loader(dir: &Path, out: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("loader");
+    std::fs::write(&path, format!("#!/bin/sh\ncat <<'OUT'\n{out}\nOUT\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn a_failing_ldd_alone_does_not_stop_the_launch() {
+    // ldd fails without naming anything: the loader is asked, and finds nothing wrong.
+    let dir = std::env::temp_dir().join(format!("libcheck-loader-ok-{}", std::process::id()));
+    let ok_loader = loader(&dir, "\tlibc.so.6 => /lib64/libc.so.6 (0x1)");
+    let (ok, _, err) = run("rc-ok", "", "ID=debian\n", &format!("export LDD_EXIT=3 LIBCHECK_LOADER={}; libcheck_run 'Test App' /x", ok_loader.display()));
+    assert!(ok, "{err}");
+    // The loader names a problem: that stops it.
+    let bad_loader = loader(&dir.join("bad"), "\tlibEGL.so.1 => not found");
+    let (ok, _, err) = run("rc-bad", "", "ID=debian\n", &format!("export LDD_EXIT=3 LIBCHECK_LOADER={}; libcheck_run 'Test App' /x", bad_loader.display()));
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(!ok);
-    assert!(err.contains("Test App can't start: checking its libraries with ldd failed (exit 3)."), "{err}");
+    assert!(err.contains("these system libraries are missing: libEGL.so.1."), "{err}");
+}
+
+#[test]
+fn the_bundled_librarys_unresolved_symbols_count_too() {
+    // On the bundled path, a library inside the AppImage with an unresolved symbol (most are
+    // BIND_NOW) stops the start; a system library's own does not.
+    let bin = "/tmp/.mount_x/usr/bin/bundled/app";
+    let ldd = "undefined symbol: wl_proxy_new\t(/tmp/.mount_x/usr/bin/bundled/../../lib/libgtk-4.so.1)\nundefined symbol: _lazy\t(/lib/libfoo.so.1)";
+    let (ok, _, err) = run("bundled-undef", ldd, "ID=debian\n", &format!("libcheck_run 'Test App' {bin}"));
+    assert!(!ok);
+    assert!(err.contains("they lack wl_proxy_new."), "{err}");
+    let ldd = "symbol x version Y not defined in file libz.so.1 with link time reference\t(/tmp/.mount_x/usr/lib/libpng16.so.16)";
+    let (ok, _, err) = run("bundled-version", ldd, "ID=debian\n", &format!("libcheck_run 'Test App' {bin}"));
+    assert!(!ok && err.contains("they lack x."), "{err}");
+    let (ok, _, err) = run("bundled-lazy", "undefined symbol: _lazy\t(/lib/libfoo.so.1)", "ID=debian\n", &format!("libcheck_run 'Test App' {bin}"));
+    assert!(ok, "{err}");
+}
+
+#[test]
+fn the_dialogs_get_plain_text() {
+    let script = include_str!("../build-appimage.sh");
+    assert!(script.contains("zenity --error --no-markup "));
+    let (ok, out, _) = run("plain", "", "ID=debian\n", "libcheck_plain 'a <b> & c'");
+    assert!(ok);
+    assert_eq!(out, "a ‹b› and c\n");
 }
 
 #[test]

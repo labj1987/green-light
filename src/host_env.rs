@@ -52,6 +52,15 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
 /// fallback, when no portal answers, would start the browser with the bundle's). False when
 /// xdg-open can't be started, so that GTK can try its own way.
 pub fn open_uri(uri: &str) -> bool {
+    open_uri_with(&restored(), uri)
+}
+
+/// On the host path (`restored` empty: nothing to put back) GTK opens links itself, as any other
+/// app's; only the bundled path needs xdg-open with the system's environment.
+fn open_uri_with(restored: &[(OsString, Option<OsString>)], uri: &str) -> bool {
+    if restored.is_empty() {
+        return false;
+    }
     match open_command(uri).spawn() {
         Ok(mut child) => {
             // xdg-open returns once the browser is started; reap it off the GTK thread.
@@ -126,6 +135,12 @@ mod tests {
         assert_eq!(production_code(text), "mod a;\n#[cfg(test)]\nmod test_http;\nfn f() { x(); }\n");
         assert_eq!(production_code("fn f() {}\n"), "fn f() {}\n");
         assert_eq!(production_code("fn f() {}\n#[cfg(test)]\npub mod tests {\n}\n"), "fn f() {}\n");
+    }
+
+    #[test]
+    fn on_the_host_path_gtk_opens_links_itself() {
+        // Nothing to restore: false without starting anything, so GTK handles the link.
+        assert!(!open_uri_with(&[], "https://example.org/x"));
     }
 
     #[test]

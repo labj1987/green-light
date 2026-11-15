@@ -207,7 +207,7 @@ bundle_gtk_runtime() {
         cp -L "$lic" "$docs/common-licenses/"
     done < <(grep -oh '/usr/share/common-licenses/[A-Za-z0-9][A-Za-z0-9._+-]*' "$docs"/*.copyright | sort -u)
     {
-        echo "The libraries and modules in usr/lib are unmodified files from these $(. /etc/os-release && echo "$PRETTY_NAME") packages"
+        echo "The libraries and modules in usr/lib are files from these $(. /etc/os-release && echo "$PRETTY_NAME") packages; the only change is the ELF rpath (patchelf)"
         echo "(source package and version, then the binary package). Each one's copyright file is <package>.copyright"
         echo "here; the licence texts they name under /usr/share/common-licenses/ are in common-licenses/."
         echo
@@ -318,11 +318,18 @@ APP="green-light"
 # libcheck_scan BINARY: sorts what `ldd -r BINARY` reports into LIBCHECK_LIBS (libraries not
 # found), LIBCHECK_GLIBC (the newest GLIBC_x.y version that is needed but missing),
 # LIBCHECK_OTHER (other "not found" lines), LIBCHECK_SYMBOLS (undefined symbols) and LIBCHECK_RC
-# (ldd's exit status). Without ldd, the dynamic loader is asked directly, as ldd -r does.
+# (ldd's exit status). Without ldd, or with "loader" as the second argument, the dynamic loader
+# is asked directly, as ldd -r does (LIBCHECK_LOADER replaces it in the tests).
 libcheck_scan() {
     local out line rc=0 re='version .GLIBC_([0-9]+(\.[0-9]+)*). not found'
     LIBCHECK_LIBS=(); LIBCHECK_GLIBC=""; LIBCHECK_OTHER=(); LIBCHECK_SYMBOLS=()
-    if [[ -n "${LIBCHECK_LDD:-}" ]]; then
+    if [[ "${2:-}" == loader ]]; then
+        if [[ -n "${LIBCHECK_LOADER:-}" ]]; then
+            out="$("$LIBCHECK_LOADER" "$1" 2>&1)" || rc=$?
+        else
+            out="$(LD_TRACE_LOADED_OBJECTS=1 LD_WARN=yes LD_BIND_NOW=yes "$1" 2>&1)" || rc=$?
+        fi
+    elif [[ -n "${LIBCHECK_LDD:-}" ]]; then
         out="$("$LIBCHECK_LDD" -r "$1" 2>&1)" || rc=$?
     elif command -v ldd >/dev/null 2>&1; then
         out="$(ldd -r "$1" 2>&1)" || rc=$?
@@ -339,16 +346,26 @@ libcheck_scan() {
             fi
         elif [[ "$line" == *"not found"* ]]; then
             LIBCHECK_OTHER+=("$line")
-        elif [[ "$line" == "undefined symbol: "*"($1)" ]]; then
-            # Only the binary's own: a system library's unresolved (lazy) symbol is its business.
+        elif [[ "$line" == "undefined symbol: "* ]] && libcheck_ours "$line" "$1"; then
             line="${line#undefined symbol: }"
             LIBCHECK_SYMBOLS+=("${line%%[[:space:]]*}")
-        elif [[ "$line" == "symbol "*" version "*" not defined in file "*"($1)" ]]; then
+        elif [[ "$line" == "symbol "*" version "*" not defined in file "* ]] && libcheck_ours "$line" "$1"; then
             line="${line#symbol }"
             LIBCHECK_SYMBOLS+=("${line%% *}")
         fi
     done <<<"$out"
     LIBCHECK_RC=$rc
+}
+
+# libcheck_ours LINE BINARY: whether the object an unresolved-symbol line ends with, "(OBJECT)", is
+# BINARY or anything else inside the AppImage (BINARY's tree above usr/bin): the bundled libraries
+# are mostly BIND_NOW, so their unresolved symbols stop the start too. A system library's own
+# unresolved (lazy) symbol is its business.
+libcheck_ours() {
+    local obj="${1##*(}"
+    obj="${obj%)}"
+    [[ "$obj" == "$2" ]] && return 0
+    [[ "$2" == */usr/bin/* && "$obj" == "${2%/usr/bin/*}/"* ]]
 }
 
 # libcheck_glibc_version: the system's glibc version, or nothing when it can't be told.
@@ -432,7 +449,10 @@ libcheck_install_hint() {
             fi
             if ((${#unknown[@]})); then
                 if [[ "$mgr" == apt ]]; then cmd="apt-file search"; else cmd="pacman -F"; fi
-                out+="${out:+ }Find the package that provides $(libcheck_list "${unknown[@]}") with: $cmd <library>."
+                if ((${#pkgs[@]})); then lib="each of the others"; else lib="each of them"; fi
+                out+="${out:+ }Find the package that provides $lib with:"
+                for lib in "${unknown[@]}"; do out+=" $cmd $lib;"; done
+                out="${out%;}."
             fi
             echo "$out"
             ;;
@@ -446,16 +466,24 @@ libcheck_list() {
     echo "${s//,/, }"
 }
 
+# libcheck_plain TEXT: TEXT with nothing kdialog (Qt rich text) or a notification server (body
+# markup) would take as markup: no &, < or >.
+libcheck_plain() {
+    local t="${1//&/and}"
+    t="${t//</‹}"
+    echo "${t//>/›}"
+}
+
 libcheck_show() {
     printf '%s: %s\n' "$1" "$2" >&2
     [[ "${LIBCHECK_DIALOG:-}" == none ]] && return 0
     [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
     if command -v zenity >/dev/null 2>&1; then
-        zenity --error --title="$1" --text="$2" --width=460 >/dev/null 2>&1
+        zenity --error --no-markup --title="$1" --text="$2" --width=460 >/dev/null 2>&1
     elif command -v kdialog >/dev/null 2>&1; then
-        kdialog --error "$2" --title "$1" >/dev/null 2>&1
+        kdialog --error "$(libcheck_plain "$2")" --title "$1" >/dev/null 2>&1
     elif command -v notify-send >/dev/null 2>&1; then
-        notify-send -u critical "$1" "$2" >/dev/null 2>&1
+        notify-send -u critical "$1" "$(libcheck_plain "$2")" >/dev/null 2>&1
     fi
     return 0
 }
@@ -465,6 +493,10 @@ libcheck_show() {
 libcheck_run() {
     local msg have hint more=""
     libcheck_scan "$2"
+    if ((LIBCHECK_RC != 0)) && [[ -z "$LIBCHECK_GLIBC" ]] && ((${#LIBCHECK_LIBS[@]} + ${#LIBCHECK_OTHER[@]} + ${#LIBCHECK_SYMBOLS[@]} == 0)); then
+        # ldd failed without saying why: ask the loader itself, and stop only if it names a problem.
+        libcheck_scan "$2" loader
+    fi
     if [[ -n "$LIBCHECK_GLIBC" ]]; then
         have="$(libcheck_glibc_version)"
         msg="$1 can't start: it needs glibc $LIBCHECK_GLIBC or newer; this system has ${have:-an older one}."
@@ -486,8 +518,6 @@ libcheck_run() {
             msg="$1 can't start because the system's libraries are too old: ${LIBCHECK_OTHER[0]}."
         fi
         msg+=" ${3:-Update the system, then start $1 again.}"
-    elif ((LIBCHECK_RC != 0)); then
-        msg="$1 can't start: checking its libraries with ldd failed (exit $LIBCHECK_RC)."
     else
         return 0
     fi

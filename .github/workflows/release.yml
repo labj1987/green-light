@@ -131,7 +131,7 @@ jobs:
   # Skipped in a dry run: nothing public is created and nobody is notified.
   publish:
     needs: build
-    if: ${{ !inputs.dry_run }}
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.dry_run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
