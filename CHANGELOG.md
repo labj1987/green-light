@@ -13,11 +13,13 @@ under 2.3.0.
   agent is running, that nothing was changed, and which one to start (for example hyprpolkitagent on
   Hyprland, or polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway and i3).
 
-- **Runs on desktops without GTK 4 or libadwaita.** The AppImage now brings its own GTK 4 and libadwaita,
-  so it starts on a stock KDE Plasma or Hyprland install (a fresh Fedora KDE, for one), where it used to
-  ask for your password and then not start at all. It still follows your desktop's dark mode, accent
-  colour and cursor theme. If a basic system library is missing (graphics drivers, fonts), Green Light
-  names it before asking for anything. The AppImage is larger: about 36 MB instead of 4 MB.
+- **Runs on desktops without GTK 4 or libadwaita.** The AppImage now also carries its own GTK 4 and
+  libadwaita, for systems that have none or too old a copy (older than GTK 4.12 or libadwaita 1.5), so it
+  starts on a stock KDE Plasma or Hyprland install (a fresh Fedora KDE, for one), where it used to ask for
+  your password and then not start at all. Where the system has them, as on any current GNOME, Green
+  Light uses the system's, as before, with your theme and accent colour. If a basic system library is
+  missing (graphics drivers, fonts), Green Light names it before asking for anything. `GREEN_LIGHT_GTK=bundled`
+  or `GREEN_LIGHT_GTK=host` forces one or the other. The AppImage is larger: about 38 MB instead of 4 MB.
 - **A failed first-launch setup now says why.** When the password prompt at launch was cancelled or
   could not appear, the window showed nothing and "Set Up Signing" later claimed the install script was
   not found. The window now shows a banner with the real reason (including a missing polkit

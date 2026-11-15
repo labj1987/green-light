@@ -279,14 +279,22 @@ copy of that logic.
 
 ## Build process
 
-GTK 4 and libadwaita are bundled (`bundle_gtk_runtime` in `build-appimage.sh`): the ldd closure of
-the binary minus the AppImage excludelist (glibc, libstdc++/libgcc_s, GL/EGL/DRM, X11/xcb, Wayland,
+GTK 4 and libadwaita come from the system when it has them, with a bundled copy as the fallback.
+The AppDir holds the binary twice: `usr/bin/green-light` as cargo built it (no rpath; the build fails if it
+has one), which loads the system's GTK like releases before the bundle, and `usr/bin/bundled/green-light`,
+patched to the bundled runtime. AppRun's `gtk_choice` picks one at launch: the plain binary when
+`ldd -r` on it prints no `not found` and no `undefined symbol` line (that also catches a libadwaita
+older than 1.5), the bundled one otherwise and when ldd is absent. `GREEN_LIGHT_GTK=host|bundled` overrides the
+check; one stderr line names the copy taken and why. `libcheck_run` then checks the chosen binary
+before any password prompt. The bundle (`bundle_gtk_runtime` in `build-appimage.sh`) is the ldd closure of
+the bundled binary minus the AppImage excludelist (glibc, libstdc++/libgcc_s, GL/EGL/DRM, X11/xcb, Wayland,
 fonts; the script cites the excludelist version) plus the Vulkan loader, the SVG pixbuf loader, the
 dconf GIO module and the IBus IM module, with compiled schemas. Libraries are found through
-`$ORIGIN` rpaths set with patchelf, never `LD_LIBRARY_PATH`. AppRun's `bundle_env` sets
+`$ORIGIN` rpaths set with patchelf, never `LD_LIBRARY_PATH`. On the bundled path only, AppRun's `bundle_env` sets
 `GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`, `GIO_MODULE_DIR` and `GSETTINGS_SCHEMA_DIR` and keeps the
 earlier values in `APPIMAGE_ORIG_*`; every program the app starts must be built with
-`host_env::command` (a test fails on a bare `Command::new` outside test code), which puts them back.
+`host_env::command` (a test fails on a bare `Command::new` outside test code), which puts them back
+(on the host path nothing is set, so it changes nothing).
 
 `build-appimage.sh` builds the AppImage — `appimagetool`-direct,
 not `linuxdeploy` (an earlier version of this doc claimed otherwise;

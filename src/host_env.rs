@@ -1,13 +1,14 @@
 //! Programs the app starts get the system's environment, not the AppImage's.
 //!
-//! The AppImage bundles GTK 4 and libadwaita, and its AppRun points them at their own modules
+//! The AppImage bundles GTK 4 and libadwaita as a fallback, and when it uses them its AppRun points them at their own modules
 //! and schemas through a few environment variables (`GTK_EXE_PREFIX`, `GIO_MODULE_DIR`, ...).
 //! A program started with those set would load the bundle's modules into its own GTK or GLib,
 //! so AppRun names them in `APPIMAGE_BUNDLE_ENV` and keeps each one's earlier value in
 //! `APPIMAGE_ORIG_<NAME>` (absent when it had none). [`command`] builds a
-//! [`std::process::Command`] with those values put back. Outside the AppImage nothing is set and
-//! nothing changes. The libraries themselves are found through the binary's rpath, never
-//! `LD_LIBRARY_PATH`, so nothing else leaks.
+//! [`std::process::Command`] with those values put back. Outside the AppImage, and inside it when
+//! AppRun runs the app on the system's GTK (its `gtk_choice`; the usual case on an up-to-date
+//! desktop), nothing is set and nothing changes. The libraries themselves are found through the
+//! binary's rpath, never `LD_LIBRARY_PATH`, so nothing else leaks.
 
 use std::ffi::{OsStr, OsString};
 
@@ -58,7 +59,7 @@ mod tests {
     }
 
     #[test]
-    fn outside_the_appimage_nothing_changes() {
+    fn outside_the_appimage_or_on_the_host_path_nothing_changes() {
         assert!(restored_from(env(&[("GIO_MODULE_DIR", "/x")])).is_empty());
     }
 

@@ -26,6 +26,8 @@ echo "==> Building $APP $VERSION AppImage"
 # Wayland's other client libraries (they pair with the host's libwayland-client and Mesa).
 # Nothing is found through LD_LIBRARY_PATH: every bundled ELF file gets an rpath relative to
 # itself ($ORIGIN), so the programs the app starts never load a bundled library.
+# The bundle is the fallback: AppRun's gtk_choice runs the plain binary on the system's GTK 4 and
+# libadwaita whenever they are there and new enough, and the rpath-patched copy otherwise.
 BUNDLE_EXCLUDE=(
     ld-linux.so.2 ld-linux-x86-64.so.2 libanl.so.1 libBrokenLocale.so.1 libcidn.so.1 libc.so.6
     libdl.so.2 libm.so.6 libmvec.so.1 libnss_compat.so.2 libnss_dns.so.2 libnss_files.so.2
@@ -57,7 +59,7 @@ bundle_ldd() {
 }
 
 # bundle_gtk_runtime APPDIR BINARY...: puts the GTK 4 + libadwaita runtime the given binaries
-# (already in APPDIR/usr/bin) need into APPDIR/usr:
+# (paths under APPDIR/usr/bin, already copied there) need into APPDIR/usr:
 #   lib/                                the libraries (rpath $ORIGIN)
 #   lib/gdk-pixbuf-2.0/2.10.0/          image loaders (SVG icons) and their loaders.cache
 #   lib/gio/modules/                    the dconf GSettings backend, so settings live in the
@@ -115,8 +117,10 @@ bundle_gtk_runtime() {
     # LD_LIBRARY_PATH the user has set cannot swap in a host library the bundle wasn't built with.
     # The binaries' rpath also names the loader directory: loaders.cache lists bare file names,
     # which dlopen() finds there wherever the AppImage is mounted.
+    local rel
     for f in "$@"; do
-        patchelf --force-rpath --set-rpath "\$ORIGIN/../lib:\$ORIGIN/../lib/gdk-pixbuf-2.0/$pixver/loaders" "$usr/bin/$f"
+        rel="$(realpath --relative-to="$(dirname "$usr/bin/$f")" "$usr/lib")"
+        patchelf --force-rpath --set-rpath "\$ORIGIN/$rel:\$ORIGIN/$rel/gdk-pixbuf-2.0/$pixver/loaders" "$usr/bin/$f"
     done
     # shellcheck disable=SC2016 # $ORIGIN is for the dynamic linker, not the shell
     for f in "$usr/lib"/*.so*; do patchelf --force-rpath --set-rpath '$ORIGIN' "$f"; done
@@ -208,8 +212,17 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/polkit-1/actions" \
          "$APPDIR/usr/share/metainfo"
 
+# Two copies of the binary; AppRun's gtk_choice picks one at launch. usr/bin/$APP stays as cargo
+# built it and loads the system's GTK 4 and libadwaita, like releases before the bundle;
+# usr/bin/bundled/$APP gets the rpath into the bundled copy.
+mkdir -p "$APPDIR/usr/bin/bundled"
 cp "${CARGO_TARGET_DIR:-target}/release/$APP" "$APPDIR/usr/bin/"
-bundle_gtk_runtime "$APPDIR" "$APP"
+cp "${CARGO_TARGET_DIR:-target}/release/$APP" "$APPDIR/usr/bin/bundled/"
+bundle_gtk_runtime "$APPDIR" "bundled/$APP"
+if [[ -n "$(patchelf --print-rpath "$APPDIR/usr/bin/$APP")" ]]; then
+    echo "==> ERROR: usr/bin/$APP must load the system's libraries, but it has an rpath" >&2
+    exit 1
+fi
 cp scripts/privileged-install.sh            "$APPDIR/usr/lib/$APP/"
 cp data/green-light-recover.service         "$APPDIR/usr/lib/$APP/"
 chmod 755 "$APPDIR/usr/lib/$APP/privileged-install.sh"
@@ -255,9 +268,10 @@ cat > "$APPDIR/AppRun" << 'APPRUN'
 HERE="$(dirname "$(readlink -f "$0")")"
 APP="green-light"
 
-# >>> libcheck: before any setup, make sure the app's shared libraries resolve. GTK 4 and
-# libadwaita are bundled and found through the binary's rpath (ldd follows it), so what can be
-# missing here is only what the AppImage deliberately takes from the system: glibc, the
+# >>> libcheck: before any setup, make sure the app's shared libraries resolve. On the bundled
+# path (gtk_choice) GTK 4 and libadwaita come with the AppImage and are found through the
+# binary's rpath (ldd follows it), so what can be missing is only what the AppImage
+# deliberately takes from the system: glibc, the
 # graphics stack (OpenGL/EGL, DRM), X11/xcb and Wayland client libraries, fonts (fontconfig,
 # freetype, harfbuzz, fribidi), zlib and expat.
 # LIBCHECK_LDD, LIBCHECK_OS_RELEASE and LIBCHECK_DIALOG=none exist for the tests.
@@ -306,7 +320,8 @@ libcheck_show() {
     return 0
 }
 
-# libcheck_run NAME BINARY: returns 1 (after showing why) when libraries are missing.
+# libcheck_run NAME BINARY [NOTE]: returns 1 (after showing why) when libraries are missing.
+# NOTE replaces the sentence that says what the AppImage brings and what it takes from the system.
 libcheck_run() {
     local missing list hint msg
     missing="$(libcheck_missing "$2")"
@@ -316,7 +331,7 @@ libcheck_run() {
     list="$(paste -sd, - <<<"$missing" | sed 's/,/, /g')"
     hint="$(libcheck_install_hint "${libs[@]}")"
     msg="$1 can't start because these system libraries are missing: $list."
-    msg+=" $1 brings GTK 4 and libadwaita with it, but takes these from the system (graphics, windowing and font libraries every desktop normally has)."
+    msg+=" ${3:-$1 brings GTK 4 and libadwaita with it, but takes these from the system (graphics, windowing and font libraries every desktop normally has).}"
     if [[ -n "$hint" ]]; then
         msg+=" Install them with: $hint, then start $1 again."
     else
@@ -348,7 +363,72 @@ bundle_env() {
 }
 # <<< bundle_env
 
-libcheck_run "Green Light" "$HERE/usr/bin/$APP" || exit 1
+# >>> gtk_choice: which GTK 4 and libadwaita the app runs on. usr/bin/APP is the plain build and
+# loads them from the system, like releases before the bundle; usr/bin/bundled/APP is the same
+# program with an rpath into the AppImage's own copy (bundle_gtk_runtime). The system's copy wins
+# when the plain binary links against it completely: `ldd -r` reports no missing library and no
+# undefined symbol (a libadwaita older than 1.5 or a GTK older than 4.12 lacks symbols the app
+# uses). Without ldd nothing can be checked, so the bundled copy is used. The variable VAR
+# (host or bundled) overrides the check, for support. One line on stderr says which was taken.
+# gtk_choice NAME VAR HOST-BINARY BUNDLED-BINARY sets GTK_CHOICE (host or bundled), GTK_BIN (the
+# binary to run) and GTK_NOTE (libcheck_run's note: empty on the bundled path).
+# Only shell builtins here, so that the check also works when PATH has no ldd at all.
+gtk_choice() {
+    local name="$1" var="$2" value out line why="" rc=0 which hint="" forced=0
+    value="${!var:-}"
+    GTK_CHOICE=""
+    case "$value" in
+        host|bundled) GTK_CHOICE="$value"; forced=1; why="set by $var=$value" ;;
+        "") ;;
+        *) printf '%s: ignoring %s=%s (it takes host or bundled)\n' "$name" "$var" "$value" >&2 ;;
+    esac
+    if [[ -z "$GTK_CHOICE" ]]; then
+        if [[ -n "${LIBCHECK_LDD:-}" ]]; then
+            out="$("$LIBCHECK_LDD" -r "$3" 2>&1)" || rc=$?
+        elif command -v ldd >/dev/null 2>&1; then
+            out="$(ldd -r "$3" 2>&1)" || rc=$?
+        else
+            GTK_CHOICE=bundled
+            why="ldd is not installed, so the system's copy can't be checked"
+        fi
+    fi
+    if [[ -z "$GTK_CHOICE" ]]; then
+        while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+                *"=> not found"*) why="the system has no ${line%% *}" ;;
+                "undefined symbol: "*)
+                    line="${line#undefined symbol: }"
+                    why="the system's libraries lack ${line%%[[:space:]]*}" ;;
+                *"not found"*) why="$line" ;;
+                *) continue ;;
+            esac
+            break
+        done <<<"$out"
+        if [[ -z "$why" && $rc -ne 0 ]]; then
+            why="ldd could not check the system's copy (exit $rc)"
+        fi
+        if [[ -n "$why" ]]; then GTK_CHOICE=bundled; else GTK_CHOICE=host; fi
+    fi
+    if [[ $GTK_CHOICE == host ]]; then
+        GTK_BIN="$3"
+        GTK_NOTE="$var=host makes $name use the system's GTK 4 and libadwaita, which needs these from the system; unset it to use the copy $name brings."
+        # No bundle environment on this path, so the app has nothing to restore for its children.
+        unset APPIMAGE_BUNDLE_ENV
+        which="system's"
+        [[ $forced -eq 1 ]] || hint="$var=bundled uses the bundled copy"
+    else
+        GTK_BIN="$4"
+        GTK_NOTE=""
+        which="bundled"
+        [[ $forced -eq 1 ]] || hint="$var=host forces the system's"
+    fi
+    printf '%s: using the %s GTK 4 and libadwaita%s%s\n' "$name" "$which" "${why:+: $why}" "${hint:+ ($hint)}" >&2
+}
+# <<< gtk_choice
+
+gtk_choice "Green Light" GREEN_LIGHT_GTK "$HERE/usr/bin/$APP" "$HERE/usr/bin/bundled/$APP"
+libcheck_run "Green Light" "$GTK_BIN" "$GTK_NOTE" || exit 1
 
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
 SRC_HELPER="$HERE/usr/lib/$APP/green-light-setup"
@@ -413,9 +493,9 @@ if [[ $needs_install -eq 1 ]]; then
     rm -f "$ERRF"
 fi
 
-bundle_env "$HERE"
+if [[ $GTK_CHOICE == bundled ]]; then bundle_env "$HERE"; fi
 export PATH="$HERE/usr/bin:$PATH"
-exec "$HERE/usr/bin/$APP" "$@"
+exec "$GTK_BIN" "$@"
 APPRUN
 chmod 755 "$APPDIR/AppRun"
 
