@@ -6,12 +6,18 @@ on:
       - 'v*'
   # A test build of a fix branch for the person who reported the issue (AGENTS.md, "Test builds"):
   # the same build, published as a pre-release, never as the latest release.
+  # With dry_run, the release build only: its files stay a workflow artifact, nothing is published.
   workflow_dispatch:
     inputs:
       issue:
-        description: The issue number this test build is for
-        required: true
+        description: The issue number this test build is for (not needed for a dry run)
+        required: false
         type: number
+      dry_run:
+        description: Dry run - build exactly as for a release, keep the files as a workflow artifact, publish nothing
+        required: false
+        type: boolean
+        default: false
 
 # Nothing here can write to the repository except the `publish` job, which only downloads the
 # build job's files and attaches them to the release. The `build` job runs the whole toolchain
@@ -54,6 +60,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # A test build is published for an issue, so it must name one (a dry run publishes nothing).
+      - name: A test build names its issue
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
+        env:
+          ISSUE: ${{ inputs.issue }}
+        run: |
+          if [ -z "$ISSUE" ]; then
+              echo "error: a test build needs the issue input (or set dry_run)" >&2
+              exit 1
+          fi
 
       # The tag names the version that is released: refuse a tag that is not the Cargo
       # version before anything is built.
@@ -111,8 +128,10 @@ jobs:
           if-no-files-found: error
 
   # The only job with write access, and it runs no project code: it attaches what `build` made.
+  # Skipped in a dry run: nothing public is created and nobody is notified.
   publish:
     needs: build
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
