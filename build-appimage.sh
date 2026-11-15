@@ -76,6 +76,11 @@ bundle_gtk_runtime() {
     local work="$appdir/.."
     syslib="$(pkg-config --variable=libdir gtk4)"
     pixver="$(pkg-config --variable=gdk_pixbuf_binary_version gdk-pixbuf-2.0)"
+    # AppRun's bundle_env names this directory.
+    if [[ "$pixver" != 2.10.0 ]]; then
+        echo "==> ERROR: gdk-pixbuf's binary version is $pixver; AppRun's bundle_env expects 2.10.0" >&2
+        return 1
+    fi
     pixdir="$(pkg-config --variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0)"
     loaders="$usr/lib/gdk-pixbuf-2.0/$pixver/loaders"
     giomods="$usr/lib/gio/modules"
@@ -104,12 +109,17 @@ bundle_gtk_runtime() {
     cp "$pixdir/libpixbufloader-svg.so" "$loaders/"
     cp "$syslib/gio/modules/libdconfsettings.so" "$giomods/"
     cp "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so" "$immods/"
-    printf '%s\n' "${modules[@]}" > "$work/bundle-sources"
+    # GLib starts every program GIO launches (GTK's fallback for links when no portal answers)
+    # through gio-launch-desktop: $GIO_LAUNCH_DESKTOP, then its compiled-in path in the build
+    # machine's /usr/lib, then PATH. Other distributions keep it elsewhere or not at all, so a copy
+    # goes into usr/bin, which AppRun puts on PATH.
+    cp "$syslib/glib-2.0/gio-launch-desktop" "$usr/bin/"
+    printf '%s\n' "${modules[@]}" "$syslib/glib-2.0/gio-launch-desktop" > "$work/bundle-sources"
 
     # The libraries: the ldd closure of the binaries and the modules, minus the excludelist.
     local elves=()
     for f in "$@"; do elves+=("$usr/bin/$f"); done
-    elves+=("$loaders"/*.so "$giomods"/*.so "$immods"/*.so)
+    elves+=("$loaders"/*.so "$giomods"/*.so "$immods"/*.so "$usr/bin/gio-launch-desktop")
     for f in "${elves[@]}"; do
         bundle_ldd "$f" > "$work/bundle-closure" || return 1
         while read -r soname path; do
@@ -329,9 +339,13 @@ libcheck_scan() {
             fi
         elif [[ "$line" == *"not found"* ]]; then
             LIBCHECK_OTHER+=("$line")
-        elif [[ "$line" == "undefined symbol: "* ]]; then
+        elif [[ "$line" == "undefined symbol: "*"($1)" ]]; then
+            # Only the binary's own: a system library's unresolved (lazy) symbol is its business.
             line="${line#undefined symbol: }"
             LIBCHECK_SYMBOLS+=("${line%%[[:space:]]*}")
+        elif [[ "$line" == "symbol "*" version "*" not defined in file "*"($1)" ]]; then
+            line="${line#symbol }"
+            LIBCHECK_SYMBOLS+=("${line%% *}")
         fi
     done <<<"$out"
     LIBCHECK_RC=$rc
@@ -483,12 +497,13 @@ libcheck_run() {
 # <<< libcheck
 
 # >>> bundle_env: point the bundled GTK 4 at its own modules, image loaders and schemas
-# (build-appimage.sh, bundle_gtk_runtime). The names go in APPIMAGE_BUNDLE_ENV and each one's
+# (build-appimage.sh, bundle_gtk_runtime), and keep the system's GTK_PATH and GIO_EXTRA_MODULES
+# away from it. The names go in APPIMAGE_BUNDLE_ENV and each one's
 # earlier value in APPIMAGE_ORIG_<NAME> (left unset when it had none), so the app can start other
 # programs with the environment they would have had without the AppImage.
 bundle_env() {
     local var
-    export APPIMAGE_BUNDLE_ENV="GTK_EXE_PREFIX GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR"
+    export APPIMAGE_BUNDLE_ENV="GTK_EXE_PREFIX GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR GTK_PATH GIO_EXTRA_MODULES"
     for var in $APPIMAGE_BUNDLE_ENV; do
         if [[ -n "${!var+set}" ]]; then
             export "APPIMAGE_ORIG_$var=${!var}"
@@ -500,6 +515,9 @@ bundle_env() {
     export GDK_PIXBUF_MODULE_FILE="$1/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
     export GIO_MODULE_DIR="$1/usr/lib/gio/modules"
     export GSETTINGS_SCHEMA_DIR="$1/usr/share/glib-2.0/schemas${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+    # The system's extra GTK and GIO module directories hold modules built for its own (likely
+    # newer) GTK and GLib; they must not load into the bundled copy.
+    unset GTK_PATH GIO_EXTRA_MODULES
 }
 # <<< bundle_env
 
@@ -507,7 +525,7 @@ bundle_env() {
 # loads them from the system, like releases before the bundle; usr/bin/bundled/APP is the same
 # program with an rpath into the AppImage's own copy (bundle_gtk_runtime). The system's copy wins
 # when the plain binary links against it completely: `ldd -r` reports no missing library and no
-# undefined symbol (a libadwaita older than 1.5 or a GTK older than 4.12 lacks symbols the app
+# undefined symbol of the app binary itself (a libadwaita older than 1.5 or a GTK older than 4.12 lacks symbols the app
 # uses). Without ldd nothing can be checked, so the bundled copy is used. The variable VAR
 # (host or bundled) overrides the check, for support. One line on stderr says which was taken.
 # gtk_choice NAME VAR HOST-BINARY BUNDLED-BINARY sets GTK_CHOICE (host or bundled), GTK_BIN (the
@@ -537,9 +555,16 @@ gtk_choice() {
             line="${line#"${line%%[![:space:]]*}"}"
             case "$line" in
                 *"=> not found"*) why="the system has no ${line%% *}" ;;
+                # Only what the app itself needs: a system library's own unresolved (lazy)
+                # symbol says nothing about whether the app runs.
                 "undefined symbol: "*)
+                    [[ "$line" == *"($3)" ]] || continue
                     line="${line#undefined symbol: }"
                     why="the system's libraries lack ${line%%[[:space:]]*}" ;;
+                "symbol "*" version "*" not defined in file "*)
+                    [[ "$line" == *"($3)" ]] || continue
+                    line="${line#symbol }"
+                    why="the system's libraries lack ${line%% *}" ;;
                 *"not found"*) why="$line" ;;
                 *) continue ;;
             esac

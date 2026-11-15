@@ -283,7 +283,9 @@ GTK 4 and libadwaita come from the system when it has them, with a bundled copy 
 The AppDir holds the binary twice: `usr/bin/green-light` as cargo built it (no rpath; the build fails if it
 has one), which loads the system's GTK like releases before the bundle, and `usr/bin/bundled/green-light`,
 patched to the bundled runtime. AppRun's `gtk_choice` picks one at launch: the plain binary when
-`ldd -r` on it prints no `not found` and no `undefined symbol` line (that also catches a libadwaita
+`ldd -r` on it prints no `not found` line and no unresolved symbol of the binary itself (`undefined
+symbol: X (binary)` or `symbol X version Y not defined ... (binary)`; a system library's own lazy
+symbols don't count) (that also catches a libadwaita
 older than 1.5), the bundled one otherwise and when ldd is absent. `GREEN_LIGHT_GTK=host|bundled` overrides the
 check; one stderr line names the copy taken and why. `libcheck_run` then checks the chosen binary
 before any password prompt. The bundle (`bundle_gtk_runtime` in `build-appimage.sh`) is the ldd closure of
@@ -294,7 +296,9 @@ if that changes), the dconf GIO module and the IBus IM module, with compiled sch
 `usr/share/doc/bundled-libraries`: each package's copyright file, the `common-licenses` texts they
 name, and `PACKAGES` (source packages and versions, unmodified Ubuntu 24.04 builds). AppRun's
 `libcheck_run` fails on any `not found` or `undefined symbol` line of `ldd -r`, or a failing ldd, and
-names the glibc version needed and found. Libraries are found through
+names the glibc version needed and found. `gio-launch-desktop` is copied into `usr/bin` (GLib runs every GIO launch
+through it; AppRun puts `usr/bin` on PATH), and `bundle_env` also saves and unsets the system's
+`GTK_PATH` and `GIO_EXTRA_MODULES` (restored for child programs like the others). Libraries are found through
 `$ORIGIN` rpaths set with patchelf, never `LD_LIBRARY_PATH`. On the bundled path only, AppRun's `bundle_env` sets
 `GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`, `GIO_MODULE_DIR` and `GSETTINGS_SCHEMA_DIR` and keeps the
 earlier values in `APPIMAGE_ORIG_*`; every program the app starts must be built with

@@ -347,3 +347,58 @@ fn the_real_ldd_passes_a_complete_binary() {
     let out = Command::new("bash").args(["-c", &script]).env("LIBCHECK_DIALOG", "none").env_remove("LIBCHECK_LDD").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
+
+#[test]
+fn only_the_apps_own_undefined_symbols_count() {
+    // A system library's own lazy unresolved symbol: the system's copy is still fine.
+    let ldd = format!("{HOST_OK}\nundefined symbol: _nv_private_thing\t(/lib/x86_64-linux-gnu/libfoo.so.1)");
+    let c = choose("lib-undefined", Some(&ldd), false, None, "/host/app");
+    assert_eq!(c.choice, "host", "{}", c.err);
+    // ld.so's other format, for the app itself.
+    let ldd =
+        format!("{HOST_OK}\nsymbol adw_dialog_present version LIBADWAITA_1_5 not defined in file libadwaita-1.so.0 with link time reference\t(/host/app)");
+    let c = choose("version-undefined", Some(&ldd), false, None, "/host/app");
+    assert_eq!(c.choice, "bundled", "{}", c.err);
+    assert!(c.err.contains("the system's libraries lack adw_dialog_present"), "{}", c.err);
+    let ldd = format!("{HOST_OK}\nsymbol foo version BAR not defined in file libbar.so.1 with link time reference\t(/lib/libbaz.so.2)");
+    assert_eq!(choose("version-lib", Some(&ldd), false, None, "/host/app").choice, "host");
+}
+
+#[test]
+fn libcheck_counts_only_the_binarys_own_symbols() {
+    let ldd =
+        "undefined symbol: _lazy\t(/lib/libfoo.so.1)\nsymbol foo version BAR not defined in file libbar.so.1 with link time reference\t(/lib/libbaz.so.2)";
+    let (ok, _, err) = run("lib-own", ldd, "ID=debian\n", "libcheck_run 'Test App' /x");
+    assert!(ok, "{err}");
+    let ldd = "symbol adw_x version LIBADWAITA_1_5 not defined in file libadwaita-1.so.0 with link time reference\t(/x)";
+    let (ok, _, err) = run("lib-version", ldd, "ID=debian\n", "libcheck_run 'Test App' /x");
+    assert!(!ok && err.contains("they lack adw_x."), "{err}");
+}
+
+#[test]
+fn bundle_env_keeps_the_hosts_module_paths_away_from_the_bundle() {
+    let script = include_str!("../build-appimage.sh");
+    let start = script.find("# >>> bundle_env").expect("bundle_env block start");
+    let end = script.find("# <<< bundle_env").expect("bundle_env block end");
+    let body = format!(
+        "{}\nbundle_env /app\necho \"${{GTK_PATH-unset}} ${{GIO_EXTRA_MODULES-unset}} $APPIMAGE_ORIG_GTK_PATH $APPIMAGE_ORIG_GIO_EXTRA_MODULES $APPIMAGE_BUNDLE_ENV\"\n",
+        &script[start..end]
+    );
+    let out =
+        Command::new("bash").args(["-c", &body]).env("GTK_PATH", "/usr/lib/gtk-4.0-host").env("GIO_EXTRA_MODULES", "/usr/lib/gio/extra").output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.trim(),
+        "unset unset /usr/lib/gtk-4.0-host /usr/lib/gio/extra GTK_EXE_PREFIX GDK_PIXBUF_MODULE_FILE GIO_MODULE_DIR GSETTINGS_SCHEMA_DIR GTK_PATH GIO_EXTRA_MODULES"
+    );
+}
+
+#[test]
+fn the_build_checks_the_pixbuf_version_and_ships_gio_launch_desktop() {
+    let script = include_str!("../build-appimage.sh");
+    assert!(script.contains("if [[ \"$pixver\" != 2.10.0 ]]; then"));
+    assert!(script.contains("/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"));
+    assert!(script.contains("cp \"$syslib/glib-2.0/gio-launch-desktop\" \"$usr/bin/\""));
+    // Found on PATH, never forced through GIO_LAUNCH_DESKTOP.
+    assert!(!script.contains("export GIO_LAUNCH_DESKTOP"));
+}
