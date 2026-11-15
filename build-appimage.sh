@@ -6,6 +6,69 @@
 set -euo pipefail
 
 APP="green-light"
+
+# >>> libcheck: before any setup, make sure the app's shared libraries resolve.
+# LIBCHECK_LDD, LIBCHECK_OS_RELEASE and LIBCHECK_DIALOG=none exist for the tests.
+libcheck_missing() {
+    local out
+    if [[ -n "${LIBCHECK_LDD:-}" ]]; then
+        out="$("$LIBCHECK_LDD" "$1" 2>/dev/null)"
+    elif command -v ldd >/dev/null 2>&1; then
+        out="$(ldd "$1" 2>/dev/null)"
+    else
+        out="$(LD_TRACE_LOADED_OBJECTS=1 "$1" 2>/dev/null)"
+    fi
+    sed -n 's/^[[:space:]]*\([^[:space:]]*\) => not found.*/\1/p' <<<"$out"
+}
+
+libcheck_install_hint() {
+    local f="${LIBCHECK_OS_RELEASE:-/etc/os-release}" ids id
+    [[ -r "$f" ]] || return 0
+    # shellcheck disable=SC1090
+    ids="$(. "$f" 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}")"
+    for id in $ids; do
+        case "$id" in
+            debian|ubuntu|linuxmint|pop) echo "sudo apt install libgtk-4-1 libadwaita-1-0"; return 0 ;;
+            fedora|rhel|centos|rocky|almalinux) echo "sudo dnf install gtk4 libadwaita"; return 0 ;;
+            arch|cachyos|manjaro|endeavouros) echo "sudo pacman -S gtk4 libadwaita"; return 0 ;;
+            opensuse*|suse|sles) echo "sudo zypper install libgtk-4-1 libadwaita-1-0"; return 0 ;;
+        esac
+    done
+}
+
+libcheck_show() {
+    printf '%s: %s\n' "$1" "$2" >&2
+    [[ "${LIBCHECK_DIALOG:-}" == none ]] && return 0
+    [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --error --title="$1" --text="$2" --width=460 >/dev/null 2>&1
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --error "$2" --title "$1" >/dev/null 2>&1
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "$1" "$2" >/dev/null 2>&1
+    fi
+    return 0
+}
+
+# libcheck_run NAME BINARY: returns 1 (after showing why) when libraries are missing.
+libcheck_run() {
+    local missing list hint msg
+    missing="$(libcheck_missing "$2")"
+    [[ -n "$missing" ]] || return 0
+    list="$(paste -sd, - <<<"$missing" | sed 's/,/, /g')"
+    hint="$(libcheck_install_hint)"
+    msg="$1 can't start because these system libraries are missing: $list."
+    if [[ -n "$hint" ]]; then
+        msg+=" They come with GTK 4 and libadwaita. Install them with: $hint, then start $1 again."
+    else
+        msg+=" They come with GTK 4 (4.12 or newer) and libadwaita (1.5 or newer): install both with your package manager, then start $1 again."
+    fi
+    libcheck_show "$1" "$msg"
+    return 1
+}
+# <<< libcheck
+
+libcheck_run "Green Light" "$HERE/usr/bin/$APP" || exit 1
 # Single source of truth: the version in Cargo.toml
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
@@ -124,27 +187,35 @@ if [[ $needs_install -eq 1 ]]; then
     chmod 755 "$STAGE/green-light-setup"
 
     rc=0
+    ERRF="$(mktemp)"
     if [[ -x "$DST_HELPER" ]] && cmp -s "$SRC_HELPER" "$DST_HELPER" \
         && pkaction --action-id "$SETUP_ACTION" >/dev/null 2>&1; then
-        pkexec "$DST_HELPER" "$STAGE" || rc=$?
+        pkexec "$DST_HELPER" "$STAGE" 2>"$ERRF" || rc=$?
     else
         # $BASH: this script's own interpreter, as the absolute path pkexec needs.
-        pkexec "$BASH" "$STAGE/green-light-setup" "$STAGE" || rc=$?
+        pkexec "$BASH" "$STAGE/green-light-setup" "$STAGE" 2>"$ERRF" || rc=$?
     fi
     rm -rf "$STAGE"
+    cat "$ERRF" >&2
 
     # pkexec: 126 = password prompt dismissed, 127 = not authorized or it could
-    # not run the helper. The helper itself never exits with either.
+    # not run the helper. The helper itself never exits with either. The reason
+    # is handed to the app (GREEN_LIGHT_SETUP_FAILURE), which shows it in a
+    # banner and in the messages of the actions that need the setup.
     if [[ $rc -ne 0 ]]; then
         case $rc in
-            126) echo "Green Light: authorization was cancelled; system components were not updated." >&2 ;;
-            127) echo "Green Light: authorization failed, or pkexec could not run the setup helper; system components were not updated. If no password dialog appeared, no polkit authentication agent is running: start one (hyprpolkitagent on Hyprland, polkit-gnome or lxqt-policykit on sway or i3; policykit-1-gnome on Debian/Ubuntu) and relaunch." >&2 ;;
-            *)   echo "Green Light: installing system components failed (exit $rc)." >&2 ;;
+            126) reason="authorization was cancelled" ;;
+            127) if grep -q -e "No authentication agent found" -e "Error creating textual authentication agent" "$ERRF"; then
+                     reason="no polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed; start one (hyprpolkitagent on Hyprland, polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway or i3)"
+                 else
+                     reason="authorization failed, or pkexec could not run the setup helper"
+                 fi ;;
+            *)   reason="installing system components failed (exit $rc)" ;;
         esac
-        if [[ ! -f "$DST_SCRIPT" ]]; then
-            echo "Green Light: the install feature will not work until setup succeeds — relaunch to retry." >&2
-        fi
+        echo "Green Light: setup did not complete: $reason." >&2
+        export GREEN_LIGHT_SETUP_FAILURE="$reason"
     fi
+    rm -f "$ERRF"
 fi
 
 export PATH="$HERE/usr/bin:$PATH"

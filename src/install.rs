@@ -307,7 +307,7 @@ pub fn recovery_note() -> Option<RecoveryNote> {
 /// `--discard-recovery`).
 pub fn run_privileged_discard_recovery(mut on_line: impl FnMut(&str)) -> Result<()> {
     if !Path::new(PRIVILEGED_SCRIPT).exists() {
-        bail!("Privileged install script not found at {}", PRIVILEGED_SCRIPT);
+        return Err(missing_script_error());
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--discard-recovery".to_string()];
     let run = run_pkexec(&args, None, &mut on_line)?;
@@ -328,7 +328,7 @@ fn discard_result(code: Option<i32>, lines: &[String]) -> Result<()> {
 /// `--recover`, which the boot unit also runs).
 pub fn run_privileged_recover(mut on_line: impl FnMut(&str)) -> Result<Recovered> {
     if !Path::new(PRIVILEGED_SCRIPT).exists() {
-        bail!("Privileged install script not found at {}", PRIVILEGED_SCRIPT);
+        return Err(missing_script_error());
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--recover".to_string()];
     let run = run_pkexec(&args, None, &mut on_line)?;
@@ -350,6 +350,35 @@ const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the p
 
 fn no_agent(lines: &[String]) -> bool {
     lines.iter().any(|l| NO_AGENT_TEXTS.iter().any(|t| l.contains(t)))
+}
+
+/// AppRun's setup (it puts the install script and polkit policy in place at
+/// launch) failed or was cancelled: AppRun hands over why in this variable.
+const SETUP_FAILURE_VAR: &str = "GREEN_LIGHT_SETUP_FAILURE";
+
+fn setup_failure() -> Option<String> {
+    std::env::var(SETUP_FAILURE_VAR).ok().filter(|r| !r.trim().is_empty())
+}
+
+fn setup_problem_text(reason: Option<&str>) -> Option<String> {
+    reason.map(|r| format!("Setup did not complete: {r}. Installing a driver and setting up signing will not work until it does; restart Green Light and authenticate when asked."))
+}
+
+/// For the window's banner: why the launch-time setup did not complete, or None.
+pub fn setup_problem() -> Option<String> {
+    setup_problem_text(setup_failure().as_deref())
+}
+
+fn script_missing_message(reason: Option<&str>) -> String {
+    match reason {
+        Some(r) => format!("Setup didn't complete: {r}; restart Green Light and authenticate when asked to retry."),
+        None => format!("Privileged install script not found at {PRIVILEGED_SCRIPT}"),
+    }
+}
+
+/// The error for an action that needs the install script when it is not there.
+fn missing_script_error() -> anyhow::Error {
+    anyhow::anyhow!(script_missing_message(setup_failure().as_deref()))
 }
 
 /// The first "ERROR:" message of a run, if any: the cause (later ones are
@@ -398,7 +427,7 @@ pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&st
     let script = PRIVILEGED_SCRIPT;
 
     if !Path::new(script).exists() {
-        bail!("Privileged install script not found at {}", script);
+        return Err(missing_script_error());
     }
     check_run_file(&opts.run_file)?;
 
@@ -445,7 +474,7 @@ pub struct SetupOutcome {
 pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
     let fail = |e: anyhow::Error| SetupOutcome { result: Err(e), lines: vec![] };
     if !Path::new(PRIVILEGED_SCRIPT).exists() {
-        return fail(anyhow::anyhow!("Privileged install script not found at {}", PRIVILEGED_SCRIPT));
+        return fail(missing_script_error());
     }
     let args = [PRIVILEGED_SCRIPT.to_string(), "--setup-signing".to_string()];
     let run = match run_pkexec(&args, Some(password), &mut |_| {}) {
@@ -482,6 +511,18 @@ mod tests {
             let msg = install_failure(Some(code), &out);
             assert!(!msg.contains("cancelled") && !msg.contains("Not authorized"), "{code}: {msg}");
         }
+    }
+
+    #[test]
+    fn a_failed_setup_is_the_reason_not_a_missing_script() {
+        let why = "no polkit authentication agent is running";
+        let banner = setup_problem_text(Some(why)).unwrap();
+        assert!(banner.starts_with("Setup did not complete: no polkit") && banner.contains("restart Green Light"), "{banner}");
+        assert_eq!(setup_problem_text(None), None);
+        let msg = script_missing_message(Some(why));
+        assert!(msg.starts_with("Setup didn't complete: no polkit") && msg.contains("restart"), "{msg}");
+        assert!(!msg.contains("not found"), "{msg}");
+        assert!(script_missing_message(None).contains("not found at /usr/lib/green-light/privileged-install.sh"));
     }
 
     #[test]

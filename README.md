@@ -38,7 +38,7 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 
 - x86_64 Linux with systemd and polkit
 - Either an apt-based distro (Ubuntu, Debian, Mint) or a dnf-based distro (Fedora, RHEL, Nobara). The install script detects which one you have and uses the right package manager. Anything else, the GUI runs fine through the AppImage but the install script will refuse to run.
-- GTK 4.12+ and libadwaita 1.5+ installed: the AppImage uses the system's libraries
+- GTK 4.12+ and libadwaita 1.5+ installed: the AppImage uses the system's libraries (without them, Green Light says which are missing and which packages to install, before it asks for a password)
 - Kernel headers and DKMS, which the script installs for you if missing (`linux-headers`/`build-essential` on apt, `kernel-devel`/`kernel-headers` on dnf)
 
 Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver branch. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.

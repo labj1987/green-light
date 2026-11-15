@@ -2,7 +2,7 @@ use crate::branches::{fetch_branches, DriverBranch, UNIX_DRIVERS_PAGE};
 use crate::download::{download_run_file, verify_sha256};
 use crate::install::{
     check_run_file, install_running, recovery_note, recovery_pending, run_privileged_discard_recovery, run_privileged_install, run_privileged_recover,
-    run_privileged_setup_signing, InstallOptions, Recovered, RecoveryNote, StaleRecovery,
+    run_privileged_setup_signing, setup_problem, InstallOptions, Recovered, RecoveryNote, StaleRecovery,
 };
 use crate::preflight::{
     conflict_summary, module_hint, secure_boot_advice, secure_boot_summary, signing_summary, validate_module_choice, validate_mok_password, ModuleChoice,
@@ -435,6 +435,18 @@ pub fn build_ui(app: &Application) {
 
     let content = GtkBox::new(Orientation::Vertical, 0);
     content.append(&header);
+
+    // AppRun's launch-time setup failed or was cancelled: say why (the install
+    // script may not be in place, and the actions that need it would fail).
+    let setup_banner = Banner::new("");
+    match setup_problem() {
+        Some(text) => {
+            setup_banner.set_title(&text);
+            setup_banner.set_revealed(true);
+        }
+        None => setup_banner.set_revealed(false),
+    }
+    content.append(&setup_banner);
 
     // Reboot required banner — shown at top of every page when relevant
     let reboot_banner = Banner::new("A reboot is required to activate the new driver.");
