@@ -288,8 +288,13 @@ older than 1.5), the bundled one otherwise and when ldd is absent. `GREEN_LIGHT_
 check; one stderr line names the copy taken and why. `libcheck_run` then checks the chosen binary
 before any password prompt. The bundle (`bundle_gtk_runtime` in `build-appimage.sh`) is the ldd closure of
 the bundled binary minus the AppImage excludelist (glibc, libstdc++/libgcc_s, GL/EGL/DRM, X11/xcb, Wayland,
-fonts; the script cites the excludelist version) plus the Vulkan loader, the SVG pixbuf loader, the
-dconf GIO module and the IBus IM module, with compiled schemas. Libraries are found through
+fonts; the script cites the excludelist version) and the Vulkan loader, which also come from the
+system; plus the SVG pixbuf loader only (Ubuntu builds PNG and JPEG into gdk-pixbuf; the build fails
+if that changes), the dconf GIO module and the IBus IM module, with compiled schemas. Licences go to
+`usr/share/doc/bundled-libraries`: each package's copyright file, the `common-licenses` texts they
+name, and `PACKAGES` (source packages and versions, unmodified Ubuntu 24.04 builds). AppRun's
+`libcheck_run` fails on any `not found` or `undefined symbol` line of `ldd -r`, or a failing ldd, and
+names the glibc version needed and found. Libraries are found through
 `$ORIGIN` rpaths set with patchelf, never `LD_LIBRARY_PATH`. On the bundled path only, AppRun's `bundle_env` sets
 `GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`, `GIO_MODULE_DIR` and `GSETTINGS_SCHEMA_DIR` and keeps the
 earlier values in `APPIMAGE_ORIG_*`; every program the app starts must be built with

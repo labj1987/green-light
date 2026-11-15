@@ -48,6 +48,38 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
     cmd
 }
 
+/// Opens `uri` in the user's browser through `xdg-open`, with the system's environment (GTK's own
+/// fallback, when no portal answers, would start the browser with the bundle's). False when
+/// xdg-open can't be started, so that GTK can try its own way.
+pub fn open_uri(uri: &str) -> bool {
+    match open_command(uri).spawn() {
+        Ok(mut child) => {
+            // xdg-open returns once the browser is started; reap it off the GTK thread.
+            std::thread::spawn(move || child.wait());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn open_command(uri: &str) -> std::process::Command {
+    let mut cmd = command("xdg-open");
+    cmd.arg(uri);
+    cmd
+}
+
+/// The part of a source file that is not test code: everything before its `#[cfg(test)]` tests
+/// module (`mod tests`, possibly `pub`). Other `#[cfg(test)]` items (a `mod test_http;`, a helper)
+/// don't end it.
+#[cfg(test)]
+fn production_code(text: &str) -> &str {
+    let end = text.match_indices("#[cfg(test)]\n").map(|(i, m)| i + m.len()).find(|&i| {
+        let rest = text[i..].trim_start_matches("pub(crate) ").trim_start_matches("pub ");
+        rest.starts_with("mod tests {")
+    });
+    end.map_or(text, |end| &text[..end - "#[cfg(test)]\n".len()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +121,21 @@ mod tests {
     }
 
     #[test]
+    fn only_the_tests_module_is_left_out_of_the_scan() {
+        let text = "mod a;\n#[cfg(test)]\nmod test_http;\nfn f() { x(); }\n#[cfg(test)]\nmod tests {\n    fn g() {}\n}\n";
+        assert_eq!(production_code(text), "mod a;\n#[cfg(test)]\nmod test_http;\nfn f() { x(); }\n");
+        assert_eq!(production_code("fn f() {}\n"), "fn f() {}\n");
+        assert_eq!(production_code("fn f() {}\n#[cfg(test)]\npub mod tests {\n}\n"), "fn f() {}\n");
+    }
+
+    #[test]
+    fn open_uri_starts_xdg_open_through_command() {
+        let cmd = open_command("https://example.org/x");
+        assert_eq!(cmd.get_program(), "xdg-open");
+        assert_eq!(cmd.get_args().collect::<Vec<_>>(), ["https://example.org/x"]);
+    }
+
+    #[test]
     fn every_program_is_started_through_command() {
         // Outside test code, nothing may build a Command directly: it would inherit the bundle's
         // variables.
@@ -99,7 +146,7 @@ mod tests {
                     scan(&path, bad);
                 } else if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("host_env.rs") {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    let code = production_code(&text);
                     for (n, line) in code.lines().enumerate() {
                         if line.contains("Command::new(") && !line.trim_start().starts_with("//") {
                             bad.push(format!("{}:{}", path.display(), n + 1));

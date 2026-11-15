@@ -18,7 +18,8 @@ under 2.3.0.
   starts on a stock KDE Plasma or Hyprland install (a fresh Fedora KDE, for one), where it used to ask for
   your password and then not start at all. Where the system has them, as on any current GNOME, Green
   Light uses the system's, as before, with your theme and accent colour. If a basic system library is
-  missing (graphics drivers, fonts), Green Light names it before asking for anything. `GREEN_LIGHT_GTK=bundled`
+  missing (graphics drivers, fonts) or the system is too old (glibc older than 2.39), Green Light says
+  so before asking for anything. `GREEN_LIGHT_GTK=bundled`
   or `GREEN_LIGHT_GTK=host` forces one or the other. The AppImage is larger: about 38 MB instead of 4 MB.
 - **A failed first-launch setup now says why.** When the password prompt at launch was cancelled or
   could not appear, the window showed nothing and "Set Up Signing" later claimed the install script was

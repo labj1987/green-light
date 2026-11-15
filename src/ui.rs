@@ -1392,6 +1392,9 @@ pub fn build_ui(app: &Application) {
                     gpu, driver, kernel
                 ))
                 .build();
+            // The website and issue links: opened with the system's environment, not GTK's fallback
+            // (which would start the browser with the AppImage's GTK variables).
+            dialog.connect_activate_link(|_, uri| crate::host_env::open_uri(uri));
             dialog.add_credit_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
             dialog.present(Some(&window));
         });

@@ -93,10 +93,18 @@ bundle_gtk_runtime() {
 
     echo "==> Bundling GTK 4 and libadwaita"
     mkdir -p "$usr/lib" "$loaders" "$giomods" "$immods" "$usr/share/glib-2.0/schemas"
-    cp "$pixdir"/*.so "$loaders/"
+    # Only the SVG loader: Ubuntu builds PNG and JPEG into libgdk_pixbuf itself, and the app shows
+    # no other image formats (the check below fails the build if that ever changes).
+    for f in png jpeg; do
+        if [[ -e "$pixdir/libpixbufloader-$f.so" ]]; then
+            echo "==> ERROR: gdk-pixbuf's $f loader is a module here, not built in; bundle it too" >&2
+            return 1
+        fi
+    done
+    cp "$pixdir/libpixbufloader-svg.so" "$loaders/"
     cp "$syslib/gio/modules/libdconfsettings.so" "$giomods/"
     cp "$syslib/gtk-4.0/4.0.0/immodules/libim-ibus.so" "$immods/"
-    printf '%s\n' "$pixdir"/*.so "${modules[@]:1}" > "$work/bundle-sources"
+    printf '%s\n' "${modules[@]}" > "$work/bundle-sources"
 
     # The libraries: the ldd closure of the binaries and the modules, minus the excludelist.
     local elves=()
@@ -163,7 +171,7 @@ bundle_gtk_runtime() {
     glib-compile-schemas --strict "$usr/share/glib-2.0/schemas"
 
     # The bundled libraries' copyright and licence notices, from their packages.
-    local docs="$usr/share/doc/bundled-libraries"
+    local docs="$usr/share/doc/bundled-libraries" pkgs=()
     mkdir -p "$docs"
     while read -r path; do
         pkg="$(dpkg -S "$path" 2>/dev/null || dpkg -S "$(realpath "$path")" 2>/dev/null \
@@ -174,7 +182,27 @@ bundle_gtk_runtime() {
             return 1
         fi
         cp "/usr/share/doc/$pkg/copyright" "$docs/$pkg.copyright"
+        [[ " ${pkgs[*]} " == *" $pkg "* ]] || pkgs+=("$pkg")
     done < <(sort -u "$work/bundle-sources")
+    # The licence texts those files point to in /usr/share/common-licenses (Debian's directory,
+    # which other distributions don't have).
+    local lic
+    mkdir -p "$docs/common-licenses"
+    while read -r lic; do
+        lic="${lic%.}"
+        if [[ ! -f "$lic" ]]; then
+            echo "==> ERROR: $lic, named by a bundled copyright file, is missing" >&2
+            return 1
+        fi
+        cp -L "$lic" "$docs/common-licenses/"
+    done < <(grep -oh '/usr/share/common-licenses/[A-Za-z0-9][A-Za-z0-9._+-]*' "$docs"/*.copyright | sort -u)
+    {
+        echo "The libraries and modules in usr/lib are unmodified files from these $(. /etc/os-release && echo "$PRETTY_NAME") packages"
+        echo "(source package and version, then the binary package). Each one's copyright file is <package>.copyright"
+        echo "here; the licence texts they name under /usr/share/common-licenses/ are in common-licenses/."
+        echo
+        dpkg-query -W -f '${source:Package} ${source:Version}: ${Package} ${Version}\n' "${pkgs[@]}" | sort -u
+    } > "$docs/PACKAGES"
     rm -f "$work/bundle-sources"
     echo "==> Bundled $(find "$usr/lib" -name '*.so*' | wc -l) libraries and modules ($(du -sh "$usr/lib" | cut -f1))"
 }
@@ -268,42 +296,140 @@ cat > "$APPDIR/AppRun" << 'APPRUN'
 HERE="$(dirname "$(readlink -f "$0")")"
 APP="green-light"
 
-# >>> libcheck: before any setup, make sure the app's shared libraries resolve. On the bundled
-# path (gtk_choice) GTK 4 and libadwaita come with the AppImage and are found through the
-# binary's rpath (ldd follows it), so what can be missing is only what the AppImage
-# deliberately takes from the system: glibc, the
-# graphics stack (OpenGL/EGL, DRM), X11/xcb and Wayland client libraries, fonts (fontconfig,
-# freetype, harfbuzz, fribidi), zlib and expat.
-# LIBCHECK_LDD, LIBCHECK_OS_RELEASE and LIBCHECK_DIALOG=none exist for the tests.
-libcheck_missing() {
-    local out
+# >>> libcheck: before any setup, make sure the app can start. `ldd -r` on the chosen binary
+# (gtk_choice) must report no missing library, no missing symbol version (a glibc older than the
+# build's 2.39, for one) and no undefined symbol. On the bundled path GTK 4 and libadwaita come
+# with the AppImage and are found through the binary's rpath (ldd follows it), so what can be
+# missing is only what the AppImage deliberately takes from the system: glibc, the graphics
+# stack (OpenGL/EGL, DRM, the Vulkan loader), X11/xcb and Wayland client libraries, fonts
+# (fontconfig, freetype, harfbuzz, fribidi), zlib and expat.
+# LIBCHECK_LDD, LIBCHECK_OS_RELEASE, LIBCHECK_GLIBC_HAVE and LIBCHECK_DIALOG=none exist for the tests.
+
+# libcheck_scan BINARY: sorts what `ldd -r BINARY` reports into LIBCHECK_LIBS (libraries not
+# found), LIBCHECK_GLIBC (the newest GLIBC_x.y version that is needed but missing),
+# LIBCHECK_OTHER (other "not found" lines), LIBCHECK_SYMBOLS (undefined symbols) and LIBCHECK_RC
+# (ldd's exit status). Without ldd, the dynamic loader is asked directly, as ldd -r does.
+libcheck_scan() {
+    local out line rc=0 re='version .GLIBC_([0-9]+(\.[0-9]+)*). not found'
+    LIBCHECK_LIBS=(); LIBCHECK_GLIBC=""; LIBCHECK_OTHER=(); LIBCHECK_SYMBOLS=()
     if [[ -n "${LIBCHECK_LDD:-}" ]]; then
-        out="$("$LIBCHECK_LDD" "$1" 2>/dev/null)"
+        out="$("$LIBCHECK_LDD" -r "$1" 2>&1)" || rc=$?
     elif command -v ldd >/dev/null 2>&1; then
-        out="$(ldd "$1" 2>/dev/null)"
+        out="$(ldd -r "$1" 2>&1)" || rc=$?
     else
-        out="$(LD_TRACE_LOADED_OBJECTS=1 "$1" 2>/dev/null)"
+        out="$(LD_TRACE_LOADED_OBJECTS=1 LD_WARN=yes LD_BIND_NOW=yes "$1" 2>&1)" || rc=$?
     fi
-    sed -n 's/^[[:space:]]*\([^[:space:]]*\) => not found.*/\1/p' <<<"$out"
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ "$line" == *"=> not found"* ]]; then
+            LIBCHECK_LIBS+=("${line%% *}")
+        elif [[ "$line" =~ $re ]]; then
+            if [[ -z "$LIBCHECK_GLIBC" ]] || [[ "$(printf '%s\n' "$LIBCHECK_GLIBC" "${BASH_REMATCH[1]}" | sort -V | tail -n1)" != "$LIBCHECK_GLIBC" ]]; then
+                LIBCHECK_GLIBC="${BASH_REMATCH[1]}"
+            fi
+        elif [[ "$line" == *"not found"* ]]; then
+            LIBCHECK_OTHER+=("$line")
+        elif [[ "$line" == "undefined symbol: "* ]]; then
+            line="${line#undefined symbol: }"
+            LIBCHECK_SYMBOLS+=("${line%%[[:space:]]*}")
+        fi
+    done <<<"$out"
+    LIBCHECK_RC=$rc
 }
 
-# libcheck_install_hint LIBRARY...: a command that installs the packages providing LIBRARY...,
-# on distributions whose package manager installs by library name (rpm's provides).
+# libcheck_glibc_version: the system's glibc version, or nothing when it can't be told.
+libcheck_glibc_version() {
+    local v
+    if [[ -n "${LIBCHECK_GLIBC_HAVE:-}" ]]; then
+        echo "$LIBCHECK_GLIBC_HAVE"
+        return 0
+    fi
+    v="$(getconf GNU_LIBC_VERSION 2>/dev/null)"
+    v="${v#glibc }"
+    if [[ -z "$v" ]] && command -v ldd >/dev/null 2>&1; then
+        v="$(ldd --version 2>/dev/null | head -n1)"
+        v="${v##* }"
+    fi
+    [[ "$v" =~ ^[0-9]+(\.[0-9]+)+$ ]] && echo "$v"
+    return 0
+}
+
+# libcheck_package MANAGER LIBRARY: the apt or pacman package that provides LIBRARY, for the
+# libraries the AppImage takes from the system; nothing for any other library.
+libcheck_package() {
+    local so apt pacman
+    while read -r so apt pacman; do
+        [[ "$so" == "$2" ]] || continue
+        if [[ "$1" == apt ]]; then echo "$apt"; else echo "$pacman"; fi
+        return 0
+    done <<'TABLE'
+libvulkan.so.1 libvulkan1 vulkan-icd-loader
+libEGL.so.1 libegl1 libglvnd
+libGL.so.1 libgl1 libglvnd
+libfontconfig.so.1 libfontconfig1 fontconfig
+libfreetype.so.6 libfreetype6 freetype2
+libharfbuzz.so.0 libharfbuzz0b harfbuzz
+libX11.so.6 libx11-6 libx11
+libxcb.so.1 libxcb1 libxcb
+libwayland-client.so.0 libwayland-client0 wayland
+libz.so.1 zlib1g zlib
+libexpat.so.1 libexpat1 expat
+TABLE
+}
+
+# libcheck_install_hint LIBRARY...: how to install the packages that provide LIBRARY..., as one
+# or two sentences, for the system's package manager; nothing for an unknown distribution.
+# dnf and zypper install by library name (rpm's provides); apt and pacman get the package names
+# of the usual host libraries, and the command that finds the package for any other one.
 libcheck_install_hint() {
-    local f="${LIBCHECK_OS_RELEASE:-/etc/os-release}" ids id cmd lib
+    local f="${LIBCHECK_OS_RELEASE:-/etc/os-release}" ids id mgr="" cmd lib pkg out=""
+    local pkgs=() unknown=()
     [[ -r "$f" ]] || return 0
     # shellcheck disable=SC1090
     ids="$(. "$f" 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}")"
     for id in $ids; do
         case "$id" in
-            fedora|rhel|centos|rocky|almalinux) cmd="sudo dnf install" ;;
-            opensuse*|suse|sles) cmd="sudo zypper install" ;;
+            fedora|rhel|centos|rocky|almalinux) mgr=dnf ;;
+            opensuse*|suse|sles) mgr=zypper ;;
+            debian|ubuntu) mgr=apt ;;
+            arch) mgr=pacman ;;
             *) continue ;;
         esac
-        for lib in "$@"; do cmd+=" '$lib()(64bit)'"; done
-        echo "$cmd"
-        return 0
+        break
     done
+    case "$mgr" in
+        dnf|zypper)
+            cmd="sudo $mgr install"
+            for lib in "$@"; do cmd+=" '$lib()(64bit)'"; done
+            echo "Install them with: $cmd."
+            ;;
+        apt|pacman)
+            for lib in "$@"; do
+                pkg="$(libcheck_package "$mgr" "$lib")"
+                if [[ -z "$pkg" ]]; then
+                    unknown+=("$lib")
+                elif [[ " ${pkgs[*]} " != *" $pkg "* ]]; then
+                    pkgs+=("$pkg")
+                fi
+            done
+            if ((${#pkgs[@]})); then
+                if [[ "$mgr" == apt ]]; then cmd="sudo apt install"; else cmd="sudo pacman -S"; fi
+                out="Install them with: $cmd ${pkgs[*]}."
+            fi
+            if ((${#unknown[@]})); then
+                if [[ "$mgr" == apt ]]; then cmd="apt-file search"; else cmd="pacman -F"; fi
+                out+="${out:+ }Find the package that provides $(libcheck_list "${unknown[@]}") with: $cmd <library>."
+            fi
+            echo "$out"
+            ;;
+    esac
+}
+
+# libcheck_list ITEM...: "a, b, c".
+libcheck_list() {
+    local IFS=,
+    local s="$*"
+    echo "${s//,/, }"
 }
 
 libcheck_show() {
@@ -320,22 +446,36 @@ libcheck_show() {
     return 0
 }
 
-# libcheck_run NAME BINARY [NOTE]: returns 1 (after showing why) when libraries are missing.
+# libcheck_run NAME BINARY [NOTE]: returns 1 (after showing why) when BINARY can't start here.
 # NOTE replaces the sentence that says what the AppImage brings and what it takes from the system.
 libcheck_run() {
-    local missing list hint msg
-    missing="$(libcheck_missing "$2")"
-    [[ -n "$missing" ]] || return 0
-    local libs=()
-    mapfile -t libs <<<"$missing"
-    list="$(paste -sd, - <<<"$missing" | sed 's/,/, /g')"
-    hint="$(libcheck_install_hint "${libs[@]}")"
-    msg="$1 can't start because these system libraries are missing: $list."
-    msg+=" ${3:-$1 brings GTK 4 and libadwaita with it, but takes these from the system (graphics, windowing and font libraries every desktop normally has).}"
-    if [[ -n "$hint" ]]; then
-        msg+=" Install them with: $hint, then start $1 again."
+    local msg have hint more=""
+    libcheck_scan "$2"
+    if [[ -n "$LIBCHECK_GLIBC" ]]; then
+        have="$(libcheck_glibc_version)"
+        msg="$1 can't start: it needs glibc $LIBCHECK_GLIBC or newer; this system has ${have:-an older one}."
+        msg+=" This system is too old for this version of $1."
+    elif ((${#LIBCHECK_LIBS[@]})); then
+        msg="$1 can't start because these system libraries are missing: $(libcheck_list "${LIBCHECK_LIBS[@]}")."
+        msg+=" ${3:-$1 brings GTK 4 and libadwaita with it, but takes these from the system (graphics, windowing and font libraries every desktop normally has).}"
+        hint="$(libcheck_install_hint "${LIBCHECK_LIBS[@]}")"
+        if [[ -n "$hint" ]]; then
+            msg+=" $hint Then start $1 again."
+        else
+            msg+=" Install the packages that provide them with your package manager, then start $1 again."
+        fi
+    elif ((${#LIBCHECK_SYMBOLS[@]} + ${#LIBCHECK_OTHER[@]})); then
+        if ((${#LIBCHECK_SYMBOLS[@]} > 3)); then more=" and $((${#LIBCHECK_SYMBOLS[@]} - 3)) more"; fi
+        if ((${#LIBCHECK_SYMBOLS[@]})); then
+            msg="$1 can't start because the system's libraries are too old: they lack $(libcheck_list "${LIBCHECK_SYMBOLS[@]:0:3}")$more."
+        else
+            msg="$1 can't start because the system's libraries are too old: ${LIBCHECK_OTHER[0]}."
+        fi
+        msg+=" ${3:-Update the system, then start $1 again.}"
+    elif ((LIBCHECK_RC != 0)); then
+        msg="$1 can't start: checking its libraries with ldd failed (exit $LIBCHECK_RC)."
     else
-        msg+=" Install the packages that provide them with your package manager, then start $1 again."
+        return 0
     fi
     libcheck_show "$1" "$msg"
     return 1
