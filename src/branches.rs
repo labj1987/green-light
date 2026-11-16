@@ -49,17 +49,6 @@ impl DriverBranch {
             DriverBranch::Legacy => "Legacy",
         }
     }
-
-    /// Adwaita style class giving each branch's badge a distinct tint,
-    /// consistent with the install/version-status badges elsewhere in ui.rs.
-    pub fn css_class(&self) -> &'static str {
-        match self {
-            DriverBranch::NewFeature => "accent",
-            DriverBranch::Production => "success",
-            DriverBranch::OlderProduction => "warning",
-            DriverBranch::Legacy => "dim-label",
-        }
-    }
 }
 
 /// One driver as the lookup service describes it.

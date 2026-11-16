@@ -5,6 +5,30 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.12.0 — 2026-11-15
+
+- **Works while the NVIDIA driver is broken or missing.** Green Light now draws its own window instead
+  of using GTK 4 and libadwaita. It draws with the NVIDIA driver when that works, and otherwise with
+  Mesa's software renderer (lavapipe or llvmpipe, installed on most desktops), so you can still reinstall
+  a driver after an update or a new kernel left the old one unloadable. With no working renderer at all,
+  it says so in a desktop dialog instead of showing nothing.
+- **One look on every desktop, and no GTK needed.** It looks and works the same on GNOME, KDE Plasma,
+  Hyprland, sway, COSMIC and the rest. The AppImage no longer carries its own GTK and libadwaita, so it
+  is much smaller, and `GREEN_LIGHT_GTK` no longer does anything. It follows your desktop's light or dark
+  setting; it no longer takes your GTK theme or accent colour.
+- **Requirements changed:** a graphics driver with Vulkan or OpenGL ES (Mesa's software renderer counts),
+  glibc 2.39 or newer, and the X11 and Wayland client libraries every desktop has. If something is
+  missing, Green Light says what and how to install it before it asks for a password.
+- The file dialog now shows all files, not only `.run` files; picking anything else is refused with a
+  message.
+- The Log tab has a Copy Log button; its text can no longer be selected with the mouse.
+- Typing in the version filter keeps your selected version as long as the list still shows it.
+- Up and Down move through the version list.
+- Dialogs no longer dim the window or close when you click outside them; Enter acts on the button
+  that has the focus.
+- Screen readers: buttons, rows and dialog text are exposed, and notifications are announced (see Known
+  issues in the README).
+
 ## 2.11.0 — 2026-11-15
 
 - **A missing password dialog is now named as the problem.** On a desktop with no polkit authentication

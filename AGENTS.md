@@ -1,6 +1,6 @@
 # Green Light (formerly NVI / NVIDIA Driver Installer)
 
-GTK4 + libadwaita GUI, written in Rust, for browsing and installing
+GUI written in Rust with GPUI Kit (see "UI (GPUI Kit)"), for browsing and installing
 official NVIDIA `.run` drivers from download.nvidia.com. Distributed as
 a single AppImage — **AppImage-only; no `.deb` packaging should ever be
 reintroduced** (it was deliberately removed, along with the DBus service
@@ -21,9 +21,13 @@ them breaks existing installs' policy/settings).
 
 ## Module layout (`src/`)
 
-- `main.rs` — entry point, sets up the shared Tokio runtime and wires up
-  the GTK application.
-- `ui.rs` — the GTK4/libadwaita UI: browse/configure/install/system tabs.
+- `main.rs` — entry point: the single-instance check, the shared Tokio
+  runtime, the toolkit's log output, then the GPUI application.
+- `instance.rs` — one running copy per login: a socket in
+  `XDG_RUNTIME_DIR`; a second launch hands over its activation token and exits.
+- `activation.rs` — raises the window for a second launch on Wayland
+  (`xdg_activation_v1` on GPUI's own connection, with that token).
+- `ui.rs` — the GPUI Kit UI: system/browse/configure/log tabs.
 - `versions.rs` — talks to download.nvidia.com/XFree86/Linux-x86_64/:
   lists available driver versions (an HTTP error or an empty listing is an
   error, not "0 versions"), fetches the SHA256 checksum for a version from
@@ -55,7 +59,7 @@ them breaks existing installs' policy/settings).
   with `InstallOptions` (DKMS, distro-driver block, module flavor), and
   `run_privileged_setup_signing` for `--setup-signing` (password on stdin).
   `check_run_file` applies the script's file rule before the password
-  prompt (off the GTK thread), ACLs included. The script's messages reach
+  prompt (off the UI thread), ACLs included. The script's messages reach
   the Log tab by following `/var/log/green-light.log` from where it ended
   when the run started (the script writes nothing to pipes), and the
   failure message comes from its exit code and first `ERROR:` line, so it
@@ -70,7 +74,8 @@ them breaks existing installs' policy/settings).
   signing setup); `actions_enabled` derives every button's sensitivity from
   that, and Install also waits for the system info (the block switch starts
   from it). A `BusyGuard` holds the operation and ends it when dropped, so a
-  panicking task can't leave the buttons disabled. The install result is
+  panicking task can't leave the buttons disabled (the window redraws from
+  the state; the two-second status poll redraws it when nothing else does). The install result is
   shown only after the last streamed output line. Closing the window during
   an install or signing setup asks first; an install from an earlier run
   (lock held) shows a banner and blocks new actions until it ends; a
@@ -277,46 +282,82 @@ copy of that logic.
   signals and fds, and `systemd-analyze verify` of the unit. Add a case
   there for every behaviour change. CI runs it.
 
+## UI (GPUI Kit)
+
+- The toolkit is `gpui-kit`, pinned to an exact version in Cargo.toml (0.9.x releases weekly and
+  pins GPUI itself as the `gpui-pre` snapshot crates). It draws with wgpu: Vulkan first, OpenGL ES
+  through EGL second; Mesa's software drivers count. That is what lets the app run while the NVIDIA
+  driver is broken or missing (lavapipe or llvmpipe draw the window); keep it that way and re-check
+  it whenever the toolkit is bumped: `VK_ICD_FILENAMES` naming only lavapipe's ICD, and a run with no
+  Vulkan ICD at all and `__EGL_VENDOR_LIBRARY_FILENAMES` naming only Mesa's (llvmpipe through
+  `LIBGL_ALWAYS_SOFTWARE=1`); `GREEN_LIGHT_LOG=info` shows the adapter picked. Its sources are the
+  reference: `~/.cargo/registry/src/*/gpui-component-*`, `gpui-base-*`, `gpui-pre-*`.
+- Shape: one view (`MainView`, the four tabs drawn from `AppState` on every frame) and one small
+  view for dialog content that changes while open (`SigningPrompt`). Dialog builders run on every
+  frame (`Fn`), so one-shot state travels in `Rc<RefCell<Option<..>>>`. `spawn_async` runs a future
+  on Tokio and delivers the result on the UI thread; streamed lines (install output, download
+  progress) come through tokio channels read in a `spawn_in` task.
+- Dialogs: always through `window.open_dialog` with `.overlay(false)` (the toolkit's dimming layer
+  also paints the client-side shadow margin, a dark frame around the window on KDE and GNOME), the
+  content in `named_group(..)`, the buttons in `dialog_buttons()` inside that group (not the
+  toolkit's footer), the default button given the focus at opening, and the text above the buttons
+  capped with `dialog_room(window)` and scrollable: the toolkit cuts off a dialog taller than the
+  window. `show_choice` is the one way to ask a question: buttons, the default one, and the answer
+  that Escape and the close button give (`dismiss`, GTK's old close response). The answer runs with
+  `window.defer` after the dialog closed, so a follow-up dialog is not the one that gets closed.
+- Enter in a dialog: the toolkit sends Enter to the dialog's `on_ok` before the focused button sees
+  it. Every dialog sets `on_ok` and acts as the focused button (`enter_key`); anywhere else (a
+  password field, the close button) it returns false and the dialog stays open.
+- Closing the window: the title bar's close button (`on_close_window`) and the desktop's
+  (`on_window_should_close`) both go through `close_allowed`, which asks first during an install or
+  signing setup.
+- Nothing may show a notification before the window has the toolkit's root view: `push_notification`
+  panics there. `toast` logs to stderr instead; the first loads run from `build_ui` after
+  `open_window`.
+- Screen readers: GPUI reports only elements with an id and a role. Use `label(id, text)` for text
+  (never a bare string child in a dialog), `accessibility_label` on icon buttons, switches and
+  progress bars, and `toast()` for messages (it also feeds the `Announcer` live region; the toolkit's
+  notifications are not announced). The toolkit's dialog cannot be named in 0.9.1; `named_group`
+  plus the initial focus is the stand-in.
+- Fonts: `ui::init` names installed families for the UI and fixed-width fonts before the toolkit
+  starts; without that GPUI warns about ".SystemUIFont" on every Linux system. Nothing may log at
+  warn level on a normal start.
+- The file dialog (portal) has no file-type filter in GPUI: the `.run` check is after the pick
+  (`NOT_A_RUN_FILE`).
+- The version list is a `uniform_list` (only the rows in view are drawn; every row is
+  `VERSION_ROW_HEIGHT` high). Selection is by version string, never by row index.
+- Programs the app starts use plain `std::process::Command`: the AppImage sets no environment for
+  the app, so there is nothing to put back for them.
+- Testing the UI: on a private display (`Xvfb` plus `dbus-run-session`) with a private
+  `XDG_RUNTIME_DIR`, so the single-instance socket of a real session is not touched. Never press
+  Install, Set Up Signing or Restore against a real machine while developing; the dialogs before
+  the password prompt can be reached and cancelled.
+
 ## Build process
 
-GTK 4 and libadwaita come from the system when it has them, with a bundled copy as the fallback.
-The AppDir holds the binary twice: `usr/bin/green-light` as cargo built it (no rpath; the build fails if it
-has one), which loads the system's GTK like releases before the bundle, and `usr/bin/bundled/green-light`,
-patched to the bundled runtime. AppRun's `gtk_choice` picks one at launch: the plain binary when
-`ldd -r` on it prints no `not found` line and no unresolved symbol of the binary itself (`undefined
-symbol: X (binary)` or `symbol X version Y not defined ... (binary)`; a system library's own lazy
-symbols don't count) (that also catches a libadwaita
-older than 1.5), the bundled one otherwise and when ldd is absent. `GREEN_LIGHT_GTK=host|bundled` overrides the
-check; one stderr line names the copy taken and why. `libcheck_run` then checks the chosen binary
-before any password prompt. The bundle (`bundle_gtk_runtime` in `build-appimage.sh`) is the ldd closure of
-the bundled binary minus the AppImage excludelist (glibc, libstdc++/libgcc_s, GL/EGL/DRM, X11/xcb, Wayland,
-fonts; the script cites the excludelist version) and the Vulkan loader, which also come from the
-system; plus the SVG pixbuf loader only (Ubuntu builds PNG and JPEG into gdk-pixbuf; the build fails
-if that changes), the dconf GIO module and the IBus IM module, with compiled schemas. Licences go to
-`usr/share/doc/bundled-libraries`: each package's copyright file, the `common-licenses` texts they
-name, and `PACKAGES` (the Ubuntu 24.04 source packages and versions they come from; the only change is the ELF rpath). AppRun's
-`libcheck_run` fails on any `not found` line of `ldd -r`, and on unresolved symbols of the binary or of
-anything inside the AppImage (a system library's own lazy ones don't count); when ldd fails without
-naming anything, it asks the loader directly. It names the glibc version needed and found. `gio-launch-desktop` is copied into `usr/bin` (GLib runs every GIO launch
-through it; AppRun puts `usr/bin` on PATH), and `bundle_env` also saves and unsets the system's
-`GTK_PATH` and `GIO_EXTRA_MODULES` (restored for child programs like the others). Libraries are found through
-`$ORIGIN` rpaths set with patchelf, never `LD_LIBRARY_PATH`. On the bundled path only, AppRun's `bundle_env` sets
-`GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`, `GIO_MODULE_DIR` and `GSETTINGS_SCHEMA_DIR` and keeps the
-earlier values in `APPIMAGE_ORIG_*`; every program the app starts must be built with
-`host_env::command` (a test fails on a bare `Command::new` outside test code), which puts them back
-(on the host path nothing is set, so it changes nothing).
+The AppImage brings no libraries. The binary goes in as cargo built it and takes glibc, libgcc_s,
+libxcb, libxkbcommon and libxkbcommon-x11 from the system, and loads by name at run time
+libwayland-client (on a Wayland session) and a graphics loader, Vulkan's or EGL's. AppRun's
+`libcheck_run` checks all of that before the launch-time setup's password prompt: `ldd -r` must
+report no missing library, no missing symbol version (glibc older than the build's 2.39) and no
+undefined symbol of the binary (when ldd fails without naming anything, it asks the loader
+directly), and `ldconfig -p` must list the run-time libraries (`libcheck_runtime`; with no usable
+cache nothing is said about them). It names the libraries and the command that installs them
+(`tests/libcheck.rs` runs the block with a fake ldd, ldconfig and os-release). The licence notices of
+every crate in the release build go to `usr/share/licenses/green-light/THIRD-PARTY-LICENSES.txt`
+(`scripts/third_party_licenses.py`, run by the build; CI runs its self-test).
 
 `build-appimage.sh` builds the AppImage — `appimagetool`-direct,
 not `linuxdeploy` (an earlier version of this doc claimed otherwise;
 the script itself never has):
 1. Runs as an ordinary user and writes only inside the checkout, without
    changing tracked files. It installs packages via apt (cargo, rustc,
-   gtk4/adwaita dev headers, `pkg-config`, `zsync`, `wget`, `file`,
-   `desktop-file-utils`) only on a machine with no toolchain (cargo or the
-   GTK4 headers missing), the one case that needs root (through `sudo`
-   unless already root). In CI the workflow installs the headers and the
-   packaging tools; the script then fails early if `wget`, `file` or
-   `desktop-file-validate` is missing.
+   `build-essential`, `pkg-config`, the xcb/xkbcommon/fontconfig dev
+   headers, `zsync`, `wget`, `file`, `desktop-file-utils`) only on a machine
+   with no toolchain (cargo or those headers missing), the one case that
+   needs root (through `sudo` unless already root). In CI the workflow
+   installs the headers and the packaging tools; the script then fails
+   early if `wget`, `file` or `desktop-file-validate` is missing.
 2. `cargo build --release --locked`.
 3. Assembles the AppDir (binary, privileged script, `green-light-setup`
    helper, polkit policy, appdata, desktop file, icon, generated

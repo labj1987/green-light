@@ -83,7 +83,7 @@ pub fn query_system() -> SystemInfo {
 /// Compute capability of each GPU (`nvidia-smi`, driver 510+). Empty when no
 /// driver is running or the field is unsupported.
 fn get_gpu_compute_caps() -> Vec<ComputeCap> {
-    crate::host_env::command("nvidia-smi")
+    std::process::Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
         .ok()
@@ -111,10 +111,10 @@ fn on_path(name: &str) -> bool {
 fn get_distro_packages() -> Vec<String> {
     // dpkg-query exits non-zero when a glob matches nothing but still prints
     // the matches of the others, so only the output is used.
-    if let Ok(out) = crate::host_env::command("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}|${Package}\\n"]).args(DEB_DRIVER_GLOBS).output() {
+    if let Ok(out) = std::process::Command::new("dpkg-query").args(["-W", "-f", "${db:Status-Abbrev}|${Package}\\n"]).args(DEB_DRIVER_GLOBS).output() {
         return parse_dpkg_installed(&String::from_utf8_lossy(&out.stdout));
     }
-    if let Ok(out) = crate::host_env::command("rpm").args(["-qa", "--qf", "%{NAME}\\n"]).args(RPM_DRIVER_GLOBS).output() {
+    if let Ok(out) = std::process::Command::new("rpm").args(["-qa", "--qf", "%{NAME}\\n"]).args(RPM_DRIVER_GLOBS).output() {
         return parse_rpm_names(&String::from_utf8_lossy(&out.stdout));
     }
     vec![]
@@ -134,7 +134,7 @@ fn get_dkms_signing_config() -> crate::preflight::DkmsSigningConfig {
 }
 
 fn command_text(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = crate::host_env::command(cmd).args(args).output().ok()?;
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
     Some(format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
 }
 
@@ -178,7 +178,7 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
     let efi_firmware = std::path::Path::new("/sys/firmware/efi").exists();
     // The certificate's own SHA1 (of its DER form), as the script lists it: a PEM file's bytes would not match.
     let sha1 = ["DER", "PEM"].iter().find_map(|form| {
-        crate::host_env::command("openssl")
+        std::process::Command::new("openssl")
             .args(["x509", "-inform", form, "-in", path, "-noout", "-fingerprint", "-sha1"])
             .output()
             .ok()
@@ -192,7 +192,7 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
 
 /// Who signed the nvidia module on disk for the running kernel.
 fn get_module_signature() -> ModuleSignature {
-    match crate::host_env::command("modinfo").args(["-F", "signer", "nvidia"]).output() {
+    match std::process::Command::new("modinfo").args(["-F", "signer", "nvidia"]).output() {
         Ok(out) => parse_module_signer(out.status.success(), &String::from_utf8_lossy(&out.stdout)),
         Err(_) => ModuleSignature::Missing,
     }
@@ -201,7 +201,7 @@ fn get_module_signature() -> ModuleSignature {
 /// Read the running driver version from nvidia-smi or /proc
 fn get_installed_driver() -> Option<String> {
     // Try nvidia-smi first
-    if let Ok(out) = crate::host_env::command("nvidia-smi").args(["--query-gpu=driver_version", "--format=csv,noheader"]).output() {
+    if let Ok(out) = std::process::Command::new("nvidia-smi").args(["--query-gpu=driver_version", "--format=csv,noheader"]).output() {
         if let Some(v) = parse_smi_driver_version(&String::from_utf8_lossy(&out.stdout)).filter(|_| out.status.success()) {
             return Some(v);
         }
@@ -240,7 +240,7 @@ fn parse_proc_driver_version(content: &str) -> Option<String> {
 
 /// Get the GPU name from nvidia-smi
 fn get_gpu_name() -> Option<String> {
-    let out = crate::host_env::command("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output().ok()?;
+    let out = std::process::Command::new("nvidia-smi").args(["--query-gpu=name", "--format=csv,noheader"]).output().ok()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !s.is_empty() {
@@ -252,7 +252,7 @@ fn get_gpu_name() -> Option<String> {
 
 /// uname -r
 fn get_kernel_version() -> String {
-    crate::host_env::command("uname")
+    std::process::Command::new("uname")
         .arg("-r")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -264,7 +264,7 @@ fn get_kernel_version() -> String {
 ///   new:     "nvidia/595.84/7.0.0-27-generic/x86_64: installed"
 ///   partial: "nvidia/595.84: added"
 fn get_dkms_status() -> Vec<DkmsEntry> {
-    let out = match crate::host_env::command("dkms").arg("status").output() {
+    let out = match std::process::Command::new("dkms").arg("status").output() {
         Ok(o) => o,
         Err(_) => return vec![],
     };
@@ -304,7 +304,7 @@ fn parse_dkms_status(text: &str) -> Vec<DkmsEntry> {
 
 /// Check secure boot via mokutil
 fn get_secure_boot() -> SecureBootStatus {
-    if let Ok(out) = crate::host_env::command("mokutil").arg("--sb-state").output() {
+    if let Ok(out) = std::process::Command::new("mokutil").arg("--sb-state").output() {
         let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
         if s.contains("secureboot enabled") {
             return SecureBootStatus::Enabled;
@@ -328,7 +328,7 @@ fn get_secure_boot() -> SecureBootStatus {
 /// Free disk space on /
 fn get_free_disk() -> Option<u64> {
     // Use statvfs via df -B1 for simplicity
-    let out = crate::host_env::command("df").args(["-B1", "--output=avail", "/"]).output().ok()?;
+    let out = std::process::Command::new("df").args(["-B1", "--output=avail", "/"]).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.lines().nth(1).and_then(|l| l.trim().parse::<u64>().ok())
 }
@@ -336,7 +336,7 @@ fn get_free_disk() -> Option<u64> {
 /// Version of the nvidia kernel module ON DISK — i.e. what will load at
 /// the next boot. This is how a pending repo-style install is detected.
 fn get_disk_module_version() -> Option<String> {
-    let out = crate::host_env::command("modinfo").args(["-F", "version", "nvidia"]).output().ok()?;
+    let out = std::process::Command::new("modinfo").args(["-F", "version", "nvidia"]).output().ok()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !s.is_empty() {

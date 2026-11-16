@@ -58,7 +58,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = crate::host_env::command(cmd).args(args).output().ok()?;
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -177,7 +177,7 @@ impl LogTail {
 /// messages (from before the script starts) come on stderr.
 fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
     let mut tail = LogTail::at_end(INSTALL_LOG);
-    let mut child = crate::host_env::command("pkexec")
+    let mut child = std::process::Command::new("pkexec")
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::null())

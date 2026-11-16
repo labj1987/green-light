@@ -33,10 +33,12 @@ jobs:
           components: clippy, rustfmt
       - name: Toolchain matches rust-toolchain.toml
         run: grep -q '^channel = "1.100.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.100\.0 '
-      - name: Install GTK4 / libadwaita headers
+      # What the UI toolkit (GPUI) links or probes at build time; nothing else comes from the system.
+      - name: Install the UI toolkit's build headers
         run: |
           sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config
+          sudo apt-get install -y -qq build-essential pkg-config \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev
       - name: Build
         env:
           CARGO_BUILD_WARNINGS: deny
@@ -47,6 +49,9 @@ jobs:
         env:
           CARGO_BUILD_WARNINGS: deny
         run: cargo clippy --locked --all-targets -- -D warnings
+      # The AppImage ships the notices of every crate in the build; this is what writes them.
+      - name: Third-party notices can be generated
+        run: python3 scripts/third_party_licenses.py --self-test && python3 scripts/third_party_licenses.py "$RUNNER_TEMP/third-party-licenses.txt"
       - name: Formatting
         run: cargo fmt --all --check
 
