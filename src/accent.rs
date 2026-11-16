@@ -99,6 +99,22 @@ pub fn link_on(accent: Rgb, background: Rgb) -> Rgb {
     (0..=50).map(|step| accent.mix(target, step as f32 / 50.)).find(|&c| reads(c)).unwrap_or(target)
 }
 
+/// Hover and active shades (8% and 16% steps) of `fill`, which carries
+/// `on_fill` text on a window of `background`. They step away from the
+/// window, so they stand out from it as the fill does, when the text still
+/// reads on them; else away from the text, so it keeps reading; and in half
+/// steps when a full step breaks either.
+fn hover_and_active(fill: Rgb, on_fill: Rgb, background: Rgb) -> (Rgb, Rgb) {
+    let outward = if background.luminance() > 0.18 { BLACK } else { WHITE };
+    let away = if on_fill == WHITE { BLACK } else { WHITE };
+    let holds = |c: Rgb| contrast(on_fill, c) >= TEXT_CONTRAST && contrast(c, background) >= UI_CONTRAST;
+    [(outward, 1.), (away, 1.), (outward, 0.5), (away, 0.5)]
+        .into_iter()
+        .map(|(to, scale): (Rgb, f32)| (fill.mix(to, 0.08 * scale), fill.mix(to, 0.16 * scale)))
+        .find(|&(hover, active)| holds(hover) && holds(active))
+        .unwrap_or((fill.mix(away, 0.08), fill.mix(away, 0.16)))
+}
+
 /// The colours the accent sets, for one mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
@@ -122,19 +138,18 @@ pub struct Palette {
 
 impl Palette {
     /// The palette for `accent` on a window of `background` with `foreground`
-    /// text. Hover and active move away from the text colour, so the text on
-    /// them keeps its contrast.
+    /// text.
     pub fn new(accent: Rgb, background: Rgb, foreground: Rgb) -> Palette {
         let line = with_contrast(accent, background, UI_CONTRAST);
         let fill = line;
         let on_fill = text_on(fill);
-        let away = if on_fill == WHITE { BLACK } else { WHITE };
+        let (fill_hover, fill_active) = hover_and_active(fill, on_fill, background);
         let link = link_on(accent, background);
         let further = if background.luminance() > 0.18 { BLACK } else { WHITE };
         Palette {
             fill,
-            fill_hover: fill.mix(away, 0.08),
-            fill_active: fill.mix(away, 0.16),
+            fill_hover,
+            fill_active,
             on_fill,
             line,
             link,
@@ -379,8 +394,8 @@ mod tests {
     }
 
     /// Every accent the desktops offer, plus the extremes.
-    const ACCENTS: [u32; 14] =
-        [0x3584e4, 0x2190a4, 0x3a944a, 0xc88800, 0xed5b00, 0xe62d42, 0xd56199, 0x9141ac, 0x6f8396, 0xf6d32d, 0x3daee9, 0x000000, 0xffffff, 0x777777];
+    const ACCENTS: [u32; 15] =
+        [0x3584e4, 0x2190a4, 0x3a944a, 0xc88800, 0xed5b00, 0xe62d42, 0xd56199, 0x9141ac, 0x6f8396, 0xf6d32d, 0x3daee9, 0xe8cb2d, 0x000000, 0xffffff, 0x777777];
 
     #[test]
     fn every_derived_colour_keeps_its_contrast_in_light_and_dark() {
@@ -390,6 +405,7 @@ mod tests {
                 let p = Palette::new(accent, bg, fg);
                 for fill in [p.fill, p.fill_hover, p.fill_active] {
                     assert!(contrast(p.on_fill, fill) >= TEXT_CONTRAST, "text on {fill:?} for {accent:?}");
+                    assert!(contrast(fill, bg) >= UI_CONTRAST, "{fill:?} against the window for {accent:?}");
                 }
                 assert!(contrast(p.link, bg) >= TEXT_CONTRAST, "link for {accent:?}");
                 assert!(contrast(p.link_hover, bg) >= TEXT_CONTRAST, "hovered link for {accent:?}");
@@ -421,11 +437,16 @@ mod tests {
     }
 
     #[test]
-    fn hover_and_active_step_away_from_the_text() {
-        let purple = Palette::new(hex(0x9141ac), WHITE, BLACK);
-        assert!(purple.fill_hover.luminance() < purple.fill.luminance() && purple.fill_active.luminance() < purple.fill_hover.luminance());
-        let yellow = Palette::new(hex(0xf6d32d), WHITE, BLACK);
-        assert!(yellow.fill_hover.luminance() > yellow.fill.luminance() && yellow.fill_active.luminance() > yellow.fill_hover.luminance());
+    fn hover_and_active_step_away_from_the_window_while_the_text_reads() {
+        for accent in [0x9141ac, 0xf6d32d, 0xe8cb2d] {
+            let on_white = Palette::new(hex(accent), WHITE, BLACK);
+            assert!(on_white.fill_hover.luminance() < on_white.fill.luminance(), "darker on white for {accent:06x}");
+            assert!(on_white.fill_active.luminance() < on_white.fill_hover.luminance());
+        }
+        let dark_bg = Rgb::from_hsla(dark().background);
+        let yellow = Palette::new(hex(0xf6d32d), dark_bg, WHITE);
+        assert!(yellow.fill_hover.luminance() > yellow.fill.luminance(), "lighter on a dark window");
+        assert!(yellow.fill_active.luminance() > yellow.fill_hover.luminance());
     }
 
     #[test]
