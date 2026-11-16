@@ -487,133 +487,16 @@ fn show_error(heading: &str, body: &str, window: &mut Window, cx: &mut App) {
 /// driver (not even Mesa's software ones) there is nothing to draw an error
 /// in. Says so through whatever the desktop offers, then exits: a process
 /// left behind with no window would also keep later launches from starting.
-fn no_window(error: &str) -> ! {
-    let message = no_window_message(error, has_display());
-    show_error_without_window(&message);
-    std::process::exit(1);
-}
-
-fn has_display() -> bool {
-    ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
-}
-
-/// Shows `message` with no window of the app's own: on stderr, and in the
-/// first of the desktop's dialog or notification programs that shows it.
-pub fn show_error_without_window(message: &str) {
+fn no_window(error: &str, activations: Activations) -> ! {
+    // Later launches must not wait for this copy while the message is up:
+    // close the socket, and drop the requests already queued, so the
+    // launches that sent them see the connection close and start afresh.
+    crate::instance::release();
+    drop(activations);
+    let message = no_window_message(error, crate::notice::has_display());
     eprintln!("green-light: {message}");
-    // With no display there is nowhere to show a dialog either.
-    if !has_display() {
-        return;
-    }
-    for (program, args) in error_dialogs(message) {
-        use std::process::Stdio;
-        let run = std::process::Command::new(program).args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output();
-        if run.is_ok_and(|out| helper_showed(program, out.status.code(), &String::from_utf8_lossy(&out.stderr))) {
-            break;
-        }
-    }
-}
-
-/// The programs tried, in order, to show an error when the app has no
-/// window, with their arguments. gdbus sends a notification straight over
-/// D-Bus, for desktops with a notification service but no notify-send (Pop!_OS
-/// COSMIC); xmessage is the last resort. Notifications have no expiry: COSMIC
-/// drops one with the default after a few seconds. kdialog and notification
-/// bodies take markup, so they get the plain text (no &, < or >); xmessage
-/// does not wrap, so its text is wrapped here.
-fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
-    let args = |fixed: &[&str]| fixed.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-    let with = |fixed: &[&str], text: String| {
-        let mut all = args(fixed);
-        all.push(text);
-        all
-    };
-    let plain = plain_text(message);
-    vec![
-        ("zenity", with(&["--error", "--no-markup", "--title=Green Light", "--width=480", "--text"], message.to_string())),
-        ("kdialog", with(&["--title", "Green Light", "--error"], plain.clone())),
-        ("notify-send", with(&["--urgency=critical", "--expire-time=0", "--app-name=Green Light", "Green Light"], plain.clone())),
-        (
-            "gdbus",
-            args(&[
-                "call",
-                "--session",
-                "--dest",
-                "org.freedesktop.Notifications",
-                "--object-path",
-                "/org/freedesktop/Notifications",
-                "--method",
-                "org.freedesktop.Notifications.Notify",
-                "'Green Light'",
-                "uint32 0",
-                "''",
-                "'Green Light'",
-                &gvariant_string(&plain),
-                "@as []",
-                "{'urgency': <byte 2>}",
-                "int32 0",
-            ]),
-        ),
-        ("xmessage", with(&["-center", "-title", "Green Light"], wrap(message, 80))),
-    ]
-}
-
-/// `text` with nothing kdialog (Qt rich text) or a notification server (body
-/// markup) would take as markup: no &, < or >. AppRun's libcheck_plain does the same.
-fn plain_text(text: &str) -> String {
-    text.replace('&', "and").replace('<', "‹").replace('>', "›")
-}
-
-/// `text` with its lines broken at spaces to at most `width` characters
-/// (a longer word stays whole), as `fold -s` does for AppRun's xmessage.
-fn wrap(text: &str, width: usize) -> String {
-    let mut out = Vec::new();
-    for paragraph in text.split('\n') {
-        let mut line = String::new();
-        for word in paragraph.split(' ') {
-            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
-                out.push(std::mem::take(&mut line));
-            } else if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-        out.push(line);
-    }
-    out.join("\n")
-}
-
-/// `text` as a GVariant text-format string, which is how gdbus takes its
-/// arguments.
-fn gvariant_string(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('\'');
-    for c in text.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c => out.push(c),
-        }
-    }
-    out.push('\'');
-    out
-}
-
-/// Whether `program`, having ended with exit `code`, did show the message, so
-/// the next one must not show it again. The dialogs end with 0 when the user
-/// pressed their button and 1 when the user closed them another way; both
-/// mean it was seen. Anything else (a crash, a signal) does not, nor does a
-/// dialog that could not open the display (zenity then also exits 1; `stderr`
-/// says so). notify-send and gdbus show nothing themselves: only 0 says the
-/// desktop took the message.
-fn helper_showed(program: &str, code: Option<i32>, stderr: &str) -> bool {
-    match program {
-        "notify-send" | "gdbus" => code == Some(0),
-        _ => matches!(code, Some(0 | 1)) && !["open display", "connect to display", "connect to X server"].iter().any(|text| stderr.contains(text)),
-    }
+    crate::notice::show_error(&message);
+    std::process::exit(1);
 }
 
 fn no_window_message(error: &str, has_display: bool) -> String {
@@ -718,8 +601,8 @@ pub fn init(cx: &mut App) {
 
 pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // With no display GPUI would run on with no window and no word about it.
-    if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
-        no_window("no display server to connect to");
+    if !crate::notice::has_display() {
+        no_window("no display server to connect to", activations);
     }
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(760.), px(640.)), cx)),
@@ -743,7 +626,7 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     });
     let (window, view) = match opened {
         Ok(opened) => opened,
-        Err(e) => no_window(&format!("{e:#}")),
+        Err(e) => no_window(&format!("{e:#}"), activations),
     };
     // The first loads, now that the window can show what went wrong.
     let _ = window.update(cx, |_, window, cx| {
@@ -757,6 +640,8 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
 
     cx.on_window_closed(|cx, _| {
         if cx.windows().is_empty() {
+            // A launch from now on starts a new copy instead of asking this one.
+            crate::instance::release();
             cx.quit();
         }
     })
@@ -767,10 +652,12 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // that raises the window (see activation.rs). Without a token, or off
     // Wayland, GPUI's own request is what there is; a Wayland compositor then
     // marks the window as wanting attention instead of raising it.
+    // From the first drawn frame on, later launches get "ok" without being
+    // told this copy is still starting: a window that exists but was never
+    // drawn is not up yet.
+    let up = activations.up_signal();
+    let _ = window.update(cx, |_, window, _| window.on_next_frame(move |_, _| up.set()));
     cx.spawn(async move |cx| {
-        // From here on requests are handled: later launches get "ok" without
-        // being told this copy is still starting.
-        activations.ui_up();
         while let Some(request) = activations.recv().await {
             let shown = window.update(cx, |_, window, _| {
                 let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
@@ -2635,47 +2522,6 @@ mod tests {
         assert_eq!(fraction, Some(0.5));
         assert_eq!(text.as_deref(), Some("50.0 / 100.0 MB  (5.0 MB/s)  10s remaining"));
         assert_eq!(progress_text((5, None), 1.0), (None, None), "no size: activity only");
-    }
-
-    #[test]
-    fn an_error_dialog_that_was_seen_is_not_shown_twice() {
-        assert!(helper_showed("zenity", Some(0), ""));
-        assert!(helper_showed("zenity", Some(1), ""), "closed without OK: still seen");
-        assert!(helper_showed("kdialog", Some(1), ""));
-        assert!(!helper_showed("zenity", Some(255), ""), "an error of its own");
-        // zenity that can't reach the display exits 1 too: that is not "seen".
-        assert!(!helper_showed("zenity", Some(1), "(zenity:12): Gtk-WARNING **: cannot open display: :9"));
-        assert!(!helper_showed("zenity", Some(1), "Failed to open display"));
-        assert!(!helper_showed("kdialog", None, ""), "killed by a signal");
-        assert!(helper_showed("notify-send", Some(0), ""));
-        assert!(!helper_showed("notify-send", Some(1), ""), "no notification service");
-        assert!(helper_showed("gdbus", Some(0), ""));
-        assert!(!helper_showed("gdbus", Some(1), ""), "no notification service");
-    }
-
-    #[test]
-    fn without_notify_send_a_notification_goes_over_dbus_then_xmessage() {
-        let dialogs = error_dialogs("it's\nbroken");
-        let programs: Vec<_> = dialogs.iter().map(|(program, _)| *program).collect();
-        // The same order as AppRun's libcheck_show.
-        assert_eq!(programs, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"]);
-        let gdbus = &dialogs[3].1;
-        assert!(gdbus.windows(2).any(|w| w == ["--method", "org.freedesktop.Notifications.Notify"]));
-        assert!(gdbus.contains(&"'it\\'s\\nbroken'".to_string()), "{gdbus:?}");
-        assert_eq!(dialogs[4].1.last().map(String::as_str), Some("it's\nbroken"));
-        // Notifications stay until closed (COSMIC drops others after seconds).
-        assert!(dialogs[2].1.contains(&"--expire-time=0".to_string()));
-        assert!(gdbus.contains(&"int32 0".to_string()));
-        // Markup-taking bodies get plain text; xmessage gets wrapped lines.
-        let dialogs = error_dialogs("a <b> & c");
-        assert_eq!(dialogs[1].1.last().map(String::as_str), Some("a ‹b› and c"));
-        assert_eq!(dialogs[2].1.last().map(String::as_str), Some("a ‹b› and c"));
-        assert!(dialogs[3].1.contains(&"'a ‹b› and c'".to_string()));
-        assert_eq!(dialogs[0].1.last().map(String::as_str), Some("a <b> & c"), "zenity takes it as plain text");
-        assert_eq!(wrap("aaa bbb ccc", 7), "aaa bbb\nccc");
-        assert_eq!(wrap("x\nyy zz", 4), "x\nyy\nzz");
-        assert_eq!(wrap(&"w".repeat(9), 4), "w".repeat(9), "a long word stays whole");
-        assert_eq!(gvariant_string("a\\b"), "'a\\\\b'");
     }
 
     #[test]

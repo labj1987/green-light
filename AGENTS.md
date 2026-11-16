@@ -26,11 +26,22 @@ them breaks existing installs' policy/settings).
 - `instance.rs` — one running copy per login: a socket in
   `XDG_RUNTIME_DIR`; a second launch hands over its activation token
   (`activate <token>\n`), waits up to 2 s for the UI loop's `ok\n`, and exits.
-  While the primary's UI is not up yet (`Activations::ui_up`), its listener
-  answers `starting\n` at once and the second launch waits up to 15 s for
-  `ok\n`. With no answer it names the hung copy's PID (stderr and the no-window
-  dialog path in `ui.rs`). The primary copy keeps `green-light.running`
-  flock'ed for its whole life; AppRun checks that lock to skip the setup.
+  Until the primary's window has drawn its first frame (`UiUp`, set from
+  `on_next_frame` in `ui.rs`), its listener answers `starting\n` at once and
+  the second launch waits up to 15 s for `ok\n`; past that it says the copy is
+  still starting (information, exit 0). With no answer at all it names the
+  hung copy's PID (an error, exit 1). A copy that closes the connection
+  unanswered is going away: the launch asks again every 75 ms for up to 2 s
+  from the first such close. `release()` removes the socket file, then shuts
+  the listener down, and unlocks `green-light.running`; `ui.rs` calls it when
+  the last window closes and before its no-window message (dropping the
+  queued requests, so their launches start afresh). The primary copy keeps
+  `green-light.running` flock'ed until then; AppRun checks that lock to skip
+  the setup.
+- `notice.rs` — messages with no window of the app's own (no renderer, a
+  second launch's "not responding" or "still starting"): zenity, kdialog,
+  notify-send, gdbus, xmessage, in AppRun's `libcheck_show` order. A
+  dialog's stderr goes to an unlinked temporary file read after it exits.
 - `activation.rs` — raises the window for a second launch on Wayland
   (`xdg_activation_v1` on GPUI's own connection, with that token).
 - `ui.rs` — the GPUI Kit UI: system/browse/configure/log tabs.

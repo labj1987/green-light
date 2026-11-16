@@ -44,7 +44,7 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 
 Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver branch. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.
 
-Tested desktops: GNOME on Wayland and X11 (Xvfb) with the NVIDIA driver, lavapipe and llvmpipe. Earlier GTK releases were tested on KDE Plasma, Hyprland and COSMIC; the window is drawn the same way everywhere, so other Wayland and X11 desktops should work too.
+Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC (Wayland), and X11; with the NVIDIA driver and with software rendering only (lavapipe, llvmpipe). The window is drawn the same way everywhere, so other Wayland and X11 desktops should work too.
 
 ## Install
 
