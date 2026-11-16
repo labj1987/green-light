@@ -516,7 +516,7 @@ pub fn show_error_without_window(message: &str) {
 /// The programs tried, in order, to show an error when the app has no
 /// window, with their arguments. gdbus sends a notification straight over
 /// D-Bus, for desktops with a notification service but no notify-send (Pop!_OS
-/// COSMIC); xmessage is the last resort The notification has no expiry: COSMIC drops
+/// COSMIC); xmessage is the last resort. The notification has no expiry: COSMIC drops
 /// one with the default after a few seconds.
 fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
     let args = |fixed: &[&str]| fixed.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
@@ -526,8 +526,8 @@ fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
         all
     };
     vec![
-        ("kdialog", with_message(&["--title", "Green Light", "--error"])),
         ("zenity", with_message(&["--error", "--no-markup", "--title=Green Light", "--width=480", "--text"])),
+        ("kdialog", with_message(&["--title", "Green Light", "--error"])),
         ("notify-send", with_message(&["--urgency=critical", "--app-name=Green Light", "Green Light"])),
         (
             "gdbus",
@@ -2624,7 +2624,8 @@ mod tests {
     fn without_notify_send_a_notification_goes_over_dbus_then_xmessage() {
         let dialogs = error_dialogs("it's\nbroken");
         let programs: Vec<_> = dialogs.iter().map(|(program, _)| *program).collect();
-        assert_eq!(programs, ["kdialog", "zenity", "notify-send", "gdbus", "xmessage"]);
+        // The same order as AppRun's libcheck_show.
+        assert_eq!(programs, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"]);
         let gdbus = &dialogs[3].1;
         assert!(gdbus.windows(2).any(|w| w == ["--method", "org.freedesktop.Notifications.Notify"]));
         assert!(gdbus.contains(&"'it\\'s\\nbroken'".to_string()), "{gdbus:?}");

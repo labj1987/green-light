@@ -172,10 +172,16 @@ fn mark_running(socket: &Path) {
     let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(running_file(socket)) else {
         return;
     };
-    // SAFETY: flock on a file descriptor this function owns.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        // Held for the life of the process: the kernel drops it when the process ends.
-        std::mem::forget(file);
+    // AppRun's check takes the lock for a moment; wait that out (briefly:
+    // without the lock the app still runs, AppRun just doesn't skip its setup).
+    for _ in 0..50 {
+        // SAFETY: flock on a file descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            // Held for the life of the process: the kernel drops it when the process ends.
+            std::mem::forget(file);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -192,28 +198,37 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
 /// Sends the request to the running copy and waits for its answer: "ok"
 /// within `waits.answer`, or "starting" within that and then "ok" within
 /// `waits.start`.
-fn hand_over(mut stream: UnixStream, token: Option<&str>, waits: Waits) -> Claim {
+/// `Ok(claim)`, or `Err(Closed)` when the running copy closed the connection
+/// without answering: it was exiting, so the claim is worth another try.
+fn hand_over(mut stream: UnixStream, token: Option<&str>, waits: Waits) -> Result<Claim, Closed> {
     let pid = peer_pid(&stream);
     let asked = Instant::now();
     let _ = stream.set_write_timeout(Some(waits.answer));
     if writeln!(stream, "activate {}", token.unwrap_or("")).is_err() {
-        return Claim::NotResponding(pid);
+        return Err(Closed);
     }
     let mut reader = BufReader::new(&stream).take(64);
     let mut line = Vec::new();
     let _ = stream.set_read_timeout(Some(waits.answer));
-    if reader.read_until(b'\n', &mut line).is_ok() && line == STARTING {
+    let mut read = reader.read_until(b'\n', &mut line);
+    if read.is_ok() && line == STARTING {
         line.clear();
         let left = waits.start.saturating_sub(asked.elapsed()).max(Duration::from_millis(1));
         let _ = stream.set_read_timeout(Some(left));
-        let _ = reader.read_until(b'\n', &mut line);
+        read = reader.read_until(b'\n', &mut line);
     }
-    if line == ACK {
-        Claim::HandedOver
-    } else {
-        Claim::NotResponding(pid)
+    match read {
+        _ if line == ACK => Ok(Claim::HandedOver),
+        // End of file with nothing, or a reset (it closed before reading the
+        // request): the copy went away. A timeout is another error.
+        Ok(0) => Err(Closed),
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe) => Err(Closed),
+        _ => Ok(Claim::NotResponding(pid)),
     }
 }
+
+/// The running copy closed the connection without an answer.
+struct Closed;
 
 /// Whether a failed connect means "nobody is listening" (a socket file left
 /// by a copy that is gone, or no file at all), as opposed to a running copy
@@ -223,12 +238,24 @@ fn nobody_listening(error: &std::io::Error) -> bool {
 }
 
 fn claim_at(path: &Path, token: Option<String>, waits: Waits) -> Claim {
+    // A copy that exits while it is being asked closes the connection: try
+    // again once (this launch then usually becomes the primary), and if that
+    // copy too goes away unanswered, leave quietly rather than call it hung.
+    for _ in 0..2 {
+        if let Ok(claim) = try_claim(path, token.as_deref(), waits) {
+            return claim;
+        }
+    }
+    Claim::HandedOver
+}
+
+fn try_claim(path: &Path, token: Option<&str>, waits: Waits) -> Result<Claim, Closed> {
     let lock = lock(path);
     match UnixStream::connect(path) {
         Ok(stream) => {
             // The wait for the answer needs no lock: other launches may look meanwhile.
             drop(lock);
-            return hand_over(stream, token.as_deref(), waits);
+            return hand_over(stream, token, waits);
         }
         Err(e) if nobody_listening(&e) => {
             let _ = std::fs::remove_file(path);
@@ -264,7 +291,7 @@ fn claim_at(path: &Path, token: Option<String>, waits: Waits) -> Claim {
             std::mem::forget(tx);
         }
     }
-    Claim::Primary(activations)
+    Ok(Claim::Primary(activations))
 }
 
 /// The token a second launch sent with its request, if any. A launch that
@@ -415,6 +442,49 @@ mod tests {
         let waited = started.elapsed();
         assert!(waited >= Duration::from_millis(900) && waited < Duration::from_secs(3), "{waited:?}");
         drop(request);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_exits_while_asked_is_not_called_hung() {
+        let dir = scratch("exiting");
+        let path = dir.join("test.sock");
+        // A copy that takes the request and then goes away without answering, its socket with it.
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let exiting = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let _ = std::fs::remove_file(&path);
+                drop(listener);
+                drop(stream);
+            })
+        };
+        // The second launch tries again and, nobody being there now, becomes the primary.
+        let claim = claim_at(&path, None, waits(2000, 5000));
+        exiting.join().unwrap();
+        assert!(matches!(claim, Claim::Primary(_)), "not \"not responding\"");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_running_lock_waits_out_a_brief_check() {
+        let dir = scratch("probe");
+        let path = dir.join("test.sock");
+        // AppRun's check holds the lock for a moment while the primary starts.
+        let probe = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(running_file(&path)).unwrap();
+        // SAFETY: flock on a descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(probe);
+        });
+        let _first = primary(&path);
+        release.join().unwrap();
+        let file = std::fs::File::open(running_file(&path)).unwrap();
+        // SAFETY: as above.
+        let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        assert!(!free, "the primary took the lock once the check let go");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
