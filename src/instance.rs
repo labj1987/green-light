@@ -7,9 +7,11 @@
 //! so there is never a second window that could start a download or an
 //! install next to the first one's. The wire format is one line each way:
 //! `activate <token>\n` from the second launch, `ok\n` back once the running
-//! copy's UI has handled it. A running copy that does not answer (its UI is
-//! stuck) is named, with its PID, instead of the second launch exiting with
-//! nothing to show for it.
+//! copy's UI has handled it. A copy that is still starting (its socket is up
+//! before its window: a cold start on a software renderer takes seconds)
+//! first answers `starting\n` at once, and `ok\n` once its UI is up. A
+//! running copy that does not answer (its UI is stuck) is named, with its
+//! PID, instead of the second launch exiting with nothing to show for it.
 //!
 //! The primary copy also holds a lock on `green-light.running` next to the
 //! socket for as long as it runs: AppRun checks it to skip its launch-time
@@ -23,7 +25,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
 /// A later launch's request to show the running window, with the activation
@@ -45,7 +49,32 @@ impl Activation {
 }
 
 /// Requests from later launches to show the running window.
-pub type Activations = UnboundedReceiver<Activation>;
+pub struct Activations {
+    requests: UnboundedReceiver<Activation>,
+    ui_up: Arc<AtomicBool>,
+}
+
+impl Activations {
+    fn new(requests: UnboundedReceiver<Activation>, ui_up: Arc<AtomicBool>) -> Self {
+        Activations { requests, ui_up }
+    }
+
+    /// Says the UI is up and handles requests: until then, a later launch is
+    /// told this copy is still starting, and waits longer for its answer.
+    pub fn ui_up(&self) {
+        self.ui_up.store(true, Ordering::Release);
+    }
+
+    /// The next request.
+    pub async fn recv(&mut self) -> Option<Activation> {
+        self.requests.recv().await
+    }
+
+    #[cfg(test)]
+    fn blocking_recv(&mut self) -> Option<Activation> {
+        self.requests.blocking_recv()
+    }
+}
 
 /// What `claim` found.
 pub enum Claim {
@@ -60,8 +89,19 @@ pub enum Claim {
 /// The running copy's answer once it has handled a request.
 const ACK: &[u8] = b"ok\n";
 
-/// How long a second launch waits for that answer.
-const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+/// Its answer, at once, while its UI is not up yet.
+const STARTING: &[u8] = b"starting\n";
+
+/// How long a second launch waits for an answer.
+#[derive(Clone, Copy)]
+struct Waits {
+    /// For any answer at all.
+    answer: Duration,
+    /// For "ok" from a copy that said it is starting, counted from the request.
+    start: Duration,
+}
+
+const WAITS: Waits = Waits { answer: Duration::from_secs(2), start: Duration::from_secs(15) };
 
 /// What a second launch says when the running copy did not answer.
 pub fn not_responding_message(pid: Option<u32>) -> String {
@@ -98,13 +138,13 @@ fn valid_token(token: &str) -> bool {
 /// show its window).
 pub fn claim() -> Claim {
     match runtime_dir() {
-        Some(dir) => claim_at(&dir.join("green-light.sock"), launch_token(), ACK_TIMEOUT),
+        Some(dir) => claim_at(&dir.join("green-light.sock"), launch_token(), WAITS),
         None => {
             eprintln!("green-light: XDG_RUNTIME_DIR is not set, so a second launch can't find this one");
             let (tx, rx) = unbounded_channel();
             // Kept open for the life of the process: the receiver never ends.
             std::mem::forget(tx);
-            Claim::Primary(rx)
+            Claim::Primary(Activations::new(rx, Arc::default()))
         }
     }
 }
@@ -149,19 +189,29 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     (got == 0 && cred.pid > 0).then(|| cred.pid.unsigned_abs())
 }
 
-/// Sends the request to the running copy and waits up to `timeout` for its
-/// answer.
-fn hand_over(mut stream: UnixStream, token: Option<&str>, timeout: Duration) -> Claim {
+/// Sends the request to the running copy and waits for its answer: "ok"
+/// within `waits.answer`, or "starting" within that and then "ok" within
+/// `waits.start`.
+fn hand_over(mut stream: UnixStream, token: Option<&str>, waits: Waits) -> Claim {
     let pid = peer_pid(&stream);
-    let _ = stream.set_write_timeout(Some(timeout));
+    let asked = Instant::now();
+    let _ = stream.set_write_timeout(Some(waits.answer));
     if writeln!(stream, "activate {}", token.unwrap_or("")).is_err() {
         return Claim::NotResponding(pid);
     }
-    let _ = stream.set_read_timeout(Some(timeout));
+    let mut reader = BufReader::new(&stream).take(64);
     let mut line = Vec::new();
-    match BufReader::new(&stream).take(64).read_until(b'\n', &mut line) {
-        Ok(_) if line == ACK => Claim::HandedOver,
-        _ => Claim::NotResponding(pid),
+    let _ = stream.set_read_timeout(Some(waits.answer));
+    if reader.read_until(b'\n', &mut line).is_ok() && line == STARTING {
+        line.clear();
+        let left = waits.start.saturating_sub(asked.elapsed()).max(Duration::from_millis(1));
+        let _ = stream.set_read_timeout(Some(left));
+        let _ = reader.read_until(b'\n', &mut line);
+    }
+    if line == ACK {
+        Claim::HandedOver
+    } else {
+        Claim::NotResponding(pid)
     }
 }
 
@@ -172,13 +222,13 @@ fn nobody_listening(error: &std::io::Error) -> bool {
     matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound)
 }
 
-fn claim_at(path: &Path, token: Option<String>, timeout: Duration) -> Claim {
+fn claim_at(path: &Path, token: Option<String>, waits: Waits) -> Claim {
     let lock = lock(path);
     match UnixStream::connect(path) {
         Ok(stream) => {
             // The wait for the answer needs no lock: other launches may look meanwhile.
             drop(lock);
-            return hand_over(stream, token.as_deref(), timeout);
+            return hand_over(stream, token.as_deref(), waits);
         }
         Err(e) if nobody_listening(&e) => {
             let _ = std::fs::remove_file(path);
@@ -190,12 +240,17 @@ fn claim_at(path: &Path, token: Option<String>, timeout: Duration) -> Claim {
         }
     }
     let (tx, rx) = unbounded_channel();
+    let ui_up = Arc::new(AtomicBool::new(false));
+    let activations = Activations::new(rx, ui_up.clone());
     match UnixListener::bind(path) {
         Ok(listener) => {
             mark_running(path);
             std::thread::spawn(move || {
-                for connection in listener.incoming().flatten() {
+                for mut connection in listener.incoming().flatten() {
                     let token = read_request(&connection);
+                    if !ui_up.load(Ordering::Acquire) {
+                        let _ = connection.write_all(STARTING);
+                    }
                     if tx.send(Activation { token, reply: Some(connection) }).is_err() {
                         break;
                     }
@@ -209,7 +264,7 @@ fn claim_at(path: &Path, token: Option<String>, timeout: Duration) -> Claim {
             std::mem::forget(tx);
         }
     }
-    Claim::Primary(rx)
+    Claim::Primary(activations)
 }
 
 /// The token a second launch sent with its request, if any. A launch that
@@ -228,12 +283,17 @@ fn parse_request(line: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_at, nobody_listening, not_responding_message, parse_request, running_file, valid_token, Activations, Claim, MAX_TOKEN};
+    use super::{claim_at, nobody_listening, not_responding_message, parse_request, running_file, valid_token, Activations, Claim, Waits, MAX_TOKEN};
     use std::os::fd::AsRawFd;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
-    const WAIT: Duration = Duration::from_secs(2);
+    const WAIT: Waits = Waits { answer: Duration::from_secs(2), start: Duration::from_secs(15) };
+
+    /// Short waits: `answer` for any answer, `start` for "ok" after "starting".
+    fn waits(answer: u64, start: u64) -> Waits {
+        Waits { answer: Duration::from_millis(answer), start: Duration::from_millis(start) }
+    }
 
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("green-light-{name}-{}", std::process::id()));
@@ -242,9 +302,13 @@ mod tests {
         dir
     }
 
+    /// The primary copy, with its UI up.
     fn primary(path: &Path) -> Activations {
         match claim_at(path, None, WAIT) {
-            Claim::Primary(rx) => rx,
+            Claim::Primary(rx) => {
+                rx.ui_up();
+                rx
+            }
             _ => panic!("expected to be the primary copy"),
         }
     }
@@ -283,7 +347,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
         let started = Instant::now();
-        let claim = claim_at(&path, Some("tok".into()), Duration::from_millis(300));
+        let claim = claim_at(&path, Some("tok".into()), waits(300, 5000));
         let waited = started.elapsed();
         match claim {
             Claim::NotResponding(pid) => assert_eq!(pid, Some(std::process::id()), "the listener's PID (this process)"),
@@ -300,8 +364,57 @@ mod tests {
             stream.write_all(b"busy\n").unwrap();
             stream
         });
-        assert!(matches!(claim_at(&path, None, Duration::from_millis(300)), Claim::NotResponding(_)));
+        assert!(matches!(claim_at(&path, None, waits(300, 5000)), Claim::NotResponding(_)));
         drop(wrong.join());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_still_starting_gets_longer_to_answer() {
+        let dir = scratch("starting");
+        let path = dir.join("test.sock");
+        // The primary's UI is not up yet: the listener says "starting" at once.
+        let Claim::Primary(mut first) = claim_at(&path, None, WAIT) else { panic!("primary") };
+        let launch = {
+            let path = path.clone();
+            // Any answer within 300 ms, "ok" within 5 s.
+            std::thread::spawn(move || claim_at(&path, None, waits(300, 5000)))
+        };
+        let request = first.blocking_recv().unwrap();
+        // The UI comes up well after the 300 ms a silent copy gets, then answers.
+        std::thread::sleep(Duration::from_millis(800));
+        first.ui_up();
+        request.done();
+        assert!(matches!(launch.join().unwrap(), Claim::HandedOver), "a slow start is not \"not responding\"");
+        // Once the UI is up, nothing says "starting": a stuck UI gets only the short wait.
+        let started = Instant::now();
+        let launch = {
+            let path = path.clone();
+            std::thread::spawn(move || claim_at(&path, None, waits(300, 5000)))
+        };
+        let request = first.blocking_recv().unwrap();
+        assert!(matches!(launch.join().unwrap(), Claim::NotResponding(Some(_))));
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        drop(request);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_copy_that_stays_starting_is_reported_after_the_long_wait() {
+        let dir = scratch("stuck-start");
+        let path = dir.join("test.sock");
+        let Claim::Primary(mut first) = claim_at(&path, None, WAIT) else { panic!("primary") };
+        let started = Instant::now();
+        let launch = {
+            let path = path.clone();
+            std::thread::spawn(move || claim_at(&path, None, waits(200, 900)))
+        };
+        let request = first.blocking_recv().unwrap();
+        // Never answered: the UI never comes up.
+        assert!(matches!(launch.join().unwrap(), Claim::NotResponding(Some(_))));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(900) && waited < Duration::from_secs(3), "{waited:?}");
+        drop(request);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -363,7 +476,7 @@ mod tests {
                 let path = path.clone();
                 // Nobody answers here, so the others report the primary as not responding,
                 // quickly: what matters is that only one became the primary.
-                std::thread::spawn(move || claim_at(&path, None, Duration::from_millis(100)))
+                std::thread::spawn(move || claim_at(&path, None, waits(100, 100)))
             })
             .collect();
         // All kept until counted: a dropped primary would stop listening.

@@ -737,6 +737,9 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // Wayland, GPUI's own request is what there is; a Wayland compositor then
     // marks the window as wanting attention instead of raising it.
     cx.spawn(async move |cx| {
+        // From here on requests are handled: later launches get "ok" without
+        // being told this copy is still starting.
+        activations.ui_up();
         while let Some(request) = activations.recv().await {
             let shown = window.update(cx, |_, window, _| {
                 let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));

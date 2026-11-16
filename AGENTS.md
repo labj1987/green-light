@@ -25,8 +25,10 @@ them breaks existing installs' policy/settings).
   runtime, the toolkit's log output, then the GPUI application.
 - `instance.rs` — one running copy per login: a socket in
   `XDG_RUNTIME_DIR`; a second launch hands over its activation token
-  (`activate <token>\n`), waits up to 2 s for the UI loop's `ok\n`, and exits;
-  with no answer it names the hung copy's PID (stderr and the no-window
+  (`activate <token>\n`), waits up to 2 s for the UI loop's `ok\n`, and exits.
+  While the primary's UI is not up yet (`Activations::ui_up`), its listener
+  answers `starting\n` at once and the second launch waits up to 15 s for
+  `ok\n`. With no answer it names the hung copy's PID (stderr and the no-window
   dialog path in `ui.rs`). The primary copy keeps `green-light.running`
   flock'ed for its whole life; AppRun checks that lock to skip the setup.
 - `activation.rs` — raises the window for a second launch on Wayland
