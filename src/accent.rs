@@ -276,6 +276,24 @@ fn set(accent: Option<Rgb>, cx: &mut App) {
 /// The portal's bus name.
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
 
+/// The accent in a `SettingChanged` value: `Some(None)` for "no accent",
+/// `None` when the value has another shape. The portal documents `(ddd)`;
+/// COSMIC's sends an array of three doubles in the signal (its `ReadOne`
+/// answers `(ddd)`).
+fn accent_in(value: &ashpd::zbus::zvariant::Value<'_>) -> Option<Option<Rgb>> {
+    use ashpd::zbus::zvariant::Value;
+    let channels: Vec<f64> = match value {
+        Value::Value(inner) => return accent_in(inner),
+        Value::Structure(fields) => fields.fields().iter().map(|c| f64::try_from(c).ok()).collect::<Option<_>>()?,
+        Value::Array(items) => items.iter().map(|c| f64::try_from(c).ok()).collect::<Option<_>>()?,
+        _ => return None,
+    };
+    match channels[..] {
+        [r, g, b] => Some(Rgb::from_portal(r, g, b)),
+        _ => None,
+    }
+}
+
 /// Reads the accent from the portal and follows its changes, reading it again
 /// whenever the portal (re)starts: at login it may come up after the window,
 /// and it can be restarted. Without a portal or an accent the theme is left as
@@ -302,7 +320,9 @@ async fn watch(cx: &mut gpui_kit::AsyncApp) -> Option<()> {
         // Listen first, so a change between the read and the subscription is not lost.
         let settings = Settings::with_connection(connection.clone()).await.ok();
         let mut changes = match &settings {
-            Some(settings) => settings.receive_accent_color_changed().await.ok(),
+            // Every setting, not the typed accent stream: that one drops a value
+            // that is not `(ddd)`, and COSMIC's is not.
+            Some(settings) => settings.receive_setting_changed().await.ok(),
             None => None,
         };
         if let Some(settings) = &settings {
@@ -314,8 +334,19 @@ async fn watch(cx: &mut gpui_kit::AsyncApp) -> Option<()> {
             let restart = owners.next();
             let owner_change = match changes.as_mut() {
                 Some(stream) => match select(stream.next(), restart).await {
-                    Either::Left((Some(c), _)) => {
-                        cx.update(|cx| set(Rgb::from_portal(c.red(), c.green(), c.blue()), cx));
+                    Either::Left((Some(setting), _)) => {
+                        if setting.namespace() != "org.freedesktop.appearance" || setting.key() != "accent-color" {
+                            continue;
+                        }
+                        let accent = match accent_in(setting.value()) {
+                            Some(accent) => accent,
+                            // A shape not known here: ask for the value instead.
+                            None => match &settings {
+                                Some(settings) => settings.accent_color().await.ok().and_then(|c| Rgb::from_portal(c.red(), c.green(), c.blue())),
+                                None => None,
+                            },
+                        };
+                        cx.update(|cx| set(accent, cx));
                         continue;
                     }
                     Either::Left((None, _)) => {
@@ -530,6 +561,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_accent_is_read_from_a_tuple_or_an_array() {
+        use ashpd::zbus::zvariant::Value;
+        let purple = (0.569, 0.255, 0.675);
+        let tuple = Value::from(purple);
+        assert_eq!(accent_in(&tuple), Some(Rgb::from_portal(0.569, 0.255, 0.675)), "(ddd), as the portal documents it");
+        let array = Value::from(vec![0.569, 0.255, 0.675]);
+        assert_eq!(accent_in(&array), Some(Rgb::from_portal(0.569, 0.255, 0.675)), "ad, as COSMIC sends it");
+        assert_eq!(accent_in(&Value::Value(Box::new(array.try_clone().unwrap()))), accent_in(&array), "wrapped in a variant");
+        assert_eq!(accent_in(&Value::from((-1., -1., -1.))), Some(None), "no accent set");
+        assert_eq!(accent_in(&Value::from(vec![0.5, 0.5])), None, "two channels are not a colour");
+        assert_eq!(accent_in(&Value::from("purple")), None);
     }
 
     #[test]
