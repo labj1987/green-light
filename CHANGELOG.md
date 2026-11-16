@@ -13,6 +13,8 @@ under 2.3.0.
   it at once. Text on accent-coloured buttons stays readable: it is white or near-black, whichever
   stands out. On desktops without an accent colour (Hyprland, sway, GNOME before 47) the colours
   stay as they were.
+- Unselected radio buttons and checkboxes are easier to see in dark mode (and light): their outline now
+  stands out from the window, for example the module type choice on the Configure page.
 
 ## 2.12.1 — 2026-11-16
 

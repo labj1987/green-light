@@ -340,9 +340,13 @@ async fn watch(cx: &mut gpui_kit::AsyncApp) -> Option<()> {
                         }
                         let accent = match accent_in(setting.value()) {
                             Some(accent) => accent,
-                            // A shape not known here: ask for the value instead.
+                            // A shape not known here: ask for the value instead. A failed
+                            // read keeps the accent that works; only a read of "unset" clears it.
                             None => match &settings {
-                                Some(settings) => settings.accent_color().await.ok().and_then(|c| Rgb::from_portal(c.red(), c.green(), c.blue())),
+                                Some(settings) => match settings.accent_color().await {
+                                    Ok(c) => Rgb::from_portal(c.red(), c.green(), c.blue()),
+                                    Err(_) => continue,
+                                },
                                 None => None,
                             },
                         };
@@ -575,6 +579,28 @@ mod tests {
         assert_eq!(accent_in(&Value::from((-1., -1., -1.))), Some(None), "no accent set");
         assert_eq!(accent_in(&Value::from(vec![0.5, 0.5])), None, "two channels are not a colour");
         assert_eq!(accent_in(&Value::from("purple")), None);
+        assert_eq!(accent_in(&Value::from(vec![f64::NAN, 0.5, 0.5])), Some(None), "NaN is no accent");
+        assert_eq!(accent_in(&Value::from((0.5, f64::INFINITY, 0.5))), Some(None), "infinity is no accent");
+        assert_eq!(accent_in(&Value::from((0.5, "green", 0.5))), None, "a struct of mixed types is not a colour");
+        assert_eq!(accent_in(&Value::from(vec![0.1, 0.2, 0.3, 0.4])), None, "four channels are not a colour");
+    }
+
+    #[test]
+    fn hover_and_active_stay_visible_and_readable_on_greys_and_ramps() {
+        let mut accents = vec![];
+        for v in (0..=255u32).step_by(15) {
+            accents.extend([v * 0x010101, v << 16, v << 8, v, v << 8 | v, v << 16 | v, v << 16 | v << 8]);
+        }
+        for base in [light(), dark()] {
+            let (bg, fg) = (Rgb::from_hsla(base.background), Rgb::from_hsla(base.foreground));
+            for &accent in &accents {
+                let p = Palette::new(hex(accent), bg, fg);
+                for (name, shade) in [("hover", p.fill_hover), ("active", p.fill_active)] {
+                    assert!(contrast(shade, bg) >= UI_CONTRAST, "{name} of {accent:06x} against the window: {}", contrast(shade, bg));
+                    assert!(contrast(p.on_fill, shade) >= TEXT_CONTRAST, "text on {name} of {accent:06x}: {}", contrast(p.on_fill, shade));
+                }
+            }
+        }
     }
 
     #[test]

@@ -599,6 +599,28 @@ pub fn init(cx: &mut App) {
     }
 }
 
+/// Light or dark, as the desktop prefers, with radio buttons that can be seen
+/// and the desktop's accent colour.
+fn follow_appearance(window: &mut Window, cx: &mut App) {
+    Theme::sync_system_appearance(Some(window), cx);
+    let theme = Theme::global_mut(cx);
+    theme.input = input_border(theme.is_dark());
+    crate::accent::apply(cx);
+}
+
+/// The colour of an unselected radio button's ring (and of checkbox and text
+/// field borders: the theme's `input` colour). The toolkit's own is barely
+/// different from the background (#2f2f2f on #0a0a0a in dark, #e5e5e5 on
+/// white in light), so an unselected choice, such as the module type on the
+/// Configure page, looked like no choice at all. These keep at least 3:1
+/// contrast, what a control's outline needs to be seen.
+fn input_border(dark: bool) -> Hsla {
+    gpui_kit::rgb(if dark { INPUT_BORDER_DARK } else { INPUT_BORDER_LIGHT }).into()
+}
+
+const INPUT_BORDER_DARK: u32 = 0x737373;
+const INPUT_BORDER_LIGHT: u32 = 0x8a8a8a;
+
 pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // With no display GPUI would run on with no window and no word about it.
     if !crate::notice::has_display() {
@@ -617,14 +639,8 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title("Green Light");
         // Follow the desktop's light/dark preference and accent colour, now and when they change.
-        Theme::sync_system_appearance(Some(window), cx);
-        crate::accent::apply(cx);
-        window
-            .observe_window_appearance(|window, cx| {
-                Theme::sync_system_appearance(Some(window), cx);
-                crate::accent::apply(cx);
-            })
-            .detach();
+        follow_appearance(window, cx);
+        window.observe_window_appearance(follow_appearance).detach();
         cx.new(|cx| MainView::new(window, cx))
     });
     let (window, view) = match opened {
@@ -2547,6 +2563,17 @@ mod tests {
         };
         let (la, lb) = (luminance(a), luminance(b));
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn unselected_radio_buttons_stand_out_from_the_background() {
+        use gpui_kit::component::ThemeColor;
+        for (dark, base) in [(false, ThemeColor::light()), (true, ThemeColor::dark())] {
+            let ratio = contrast(input_border(dark), base.background);
+            assert!(ratio >= 3.0, "dark={dark}: ring against the window {ratio:.2}");
+        }
+        // What the toolkit had: far below that.
+        assert!(contrast(gpui_kit::rgb(0x2f2f2f).into(), ThemeColor::dark().background) < 1.6);
     }
 
     #[test]
