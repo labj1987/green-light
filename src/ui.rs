@@ -506,8 +506,9 @@ pub fn show_error_without_window(message: &str) {
         return;
     }
     for (program, args) in error_dialogs(message) {
-        let status = std::process::Command::new(program).args(&args).stdin(std::process::Stdio::null()).status();
-        if status.is_ok_and(|status| helper_showed(program, status.code())) {
+        use std::process::Stdio;
+        let run = std::process::Command::new(program).args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output();
+        if run.is_ok_and(|out| helper_showed(program, out.status.code(), &String::from_utf8_lossy(&out.stderr))) {
             break;
         }
     }
@@ -516,19 +517,22 @@ pub fn show_error_without_window(message: &str) {
 /// The programs tried, in order, to show an error when the app has no
 /// window, with their arguments. gdbus sends a notification straight over
 /// D-Bus, for desktops with a notification service but no notify-send (Pop!_OS
-/// COSMIC); xmessage is the last resort. The notification has no expiry: COSMIC drops
-/// one with the default after a few seconds.
+/// COSMIC); xmessage is the last resort. Notifications have no expiry: COSMIC
+/// drops one with the default after a few seconds. kdialog and notification
+/// bodies take markup, so they get the plain text (no &, < or >); xmessage
+/// does not wrap, so its text is wrapped here.
 fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
     let args = |fixed: &[&str]| fixed.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
-    let with_message = |fixed: &[&str]| {
+    let with = |fixed: &[&str], text: String| {
         let mut all = args(fixed);
-        all.push(message.to_string());
+        all.push(text);
         all
     };
+    let plain = plain_text(message);
     vec![
-        ("zenity", with_message(&["--error", "--no-markup", "--title=Green Light", "--width=480", "--text"])),
-        ("kdialog", with_message(&["--title", "Green Light", "--error"])),
-        ("notify-send", with_message(&["--urgency=critical", "--app-name=Green Light", "Green Light"])),
+        ("zenity", with(&["--error", "--no-markup", "--title=Green Light", "--width=480", "--text"], message.to_string())),
+        ("kdialog", with(&["--title", "Green Light", "--error"], plain.clone())),
+        ("notify-send", with(&["--urgency=critical", "--expire-time=0", "--app-name=Green Light", "Green Light"], plain.clone())),
         (
             "gdbus",
             args(&[
@@ -544,14 +548,39 @@ fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
                 "uint32 0",
                 "''",
                 "'Green Light'",
-                &gvariant_string(message),
+                &gvariant_string(&plain),
                 "@as []",
                 "{'urgency': <byte 2>}",
                 "int32 0",
             ]),
         ),
-        ("xmessage", with_message(&["-center", "-title", "Green Light"])),
+        ("xmessage", with(&["-center", "-title", "Green Light"], wrap(message, 80))),
     ]
+}
+
+/// `text` with nothing kdialog (Qt rich text) or a notification server (body
+/// markup) would take as markup: no &, < or >. AppRun's libcheck_plain does the same.
+fn plain_text(text: &str) -> String {
+    text.replace('&', "and").replace('<', "‹").replace('>', "›")
+}
+
+/// `text` with its lines broken at spaces to at most `width` characters
+/// (a longer word stays whole), as `fold -s` does for AppRun's xmessage.
+fn wrap(text: &str, width: usize) -> String {
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split(' ') {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+            } else if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        out.push(line);
+    }
+    out.join("\n")
 }
 
 /// `text` as a GVariant text-format string, which is how gdbus takes its
@@ -576,13 +605,14 @@ fn gvariant_string(text: &str) -> String {
 /// Whether `program`, having ended with exit `code`, did show the message, so
 /// the next one must not show it again. The dialogs end with 0 when the user
 /// pressed their button and 1 when the user closed them another way; both
-/// mean it was seen. Anything else (no display, a crash, a signal) does not.
-/// notify-send and gdbus show nothing themselves: only 0 says the desktop
-/// took the message.
-fn helper_showed(program: &str, code: Option<i32>) -> bool {
+/// mean it was seen. Anything else (a crash, a signal) does not, nor does a
+/// dialog that could not open the display (zenity then also exits 1; `stderr`
+/// says so). notify-send and gdbus show nothing themselves: only 0 says the
+/// desktop took the message.
+fn helper_showed(program: &str, code: Option<i32>, stderr: &str) -> bool {
     match program {
         "notify-send" | "gdbus" => code == Some(0),
-        _ => matches!(code, Some(0 | 1)),
+        _ => matches!(code, Some(0 | 1)) && !["open display", "connect to display", "connect to X server"].iter().any(|text| stderr.contains(text)),
     }
 }
 
@@ -2609,15 +2639,18 @@ mod tests {
 
     #[test]
     fn an_error_dialog_that_was_seen_is_not_shown_twice() {
-        assert!(helper_showed("zenity", Some(0)));
-        assert!(helper_showed("zenity", Some(1)), "closed without OK: still seen");
-        assert!(helper_showed("kdialog", Some(1)));
-        assert!(!helper_showed("zenity", Some(255)), "could not open a display");
-        assert!(!helper_showed("kdialog", None), "killed by a signal");
-        assert!(helper_showed("notify-send", Some(0)));
-        assert!(!helper_showed("notify-send", Some(1)), "no notification service");
-        assert!(helper_showed("gdbus", Some(0)));
-        assert!(!helper_showed("gdbus", Some(1)), "no notification service");
+        assert!(helper_showed("zenity", Some(0), ""));
+        assert!(helper_showed("zenity", Some(1), ""), "closed without OK: still seen");
+        assert!(helper_showed("kdialog", Some(1), ""));
+        assert!(!helper_showed("zenity", Some(255), ""), "an error of its own");
+        // zenity that can't reach the display exits 1 too: that is not "seen".
+        assert!(!helper_showed("zenity", Some(1), "(zenity:12): Gtk-WARNING **: cannot open display: :9"));
+        assert!(!helper_showed("zenity", Some(1), "Failed to open display"));
+        assert!(!helper_showed("kdialog", None, ""), "killed by a signal");
+        assert!(helper_showed("notify-send", Some(0), ""));
+        assert!(!helper_showed("notify-send", Some(1), ""), "no notification service");
+        assert!(helper_showed("gdbus", Some(0), ""));
+        assert!(!helper_showed("gdbus", Some(1), ""), "no notification service");
     }
 
     #[test]
@@ -2630,6 +2663,18 @@ mod tests {
         assert!(gdbus.windows(2).any(|w| w == ["--method", "org.freedesktop.Notifications.Notify"]));
         assert!(gdbus.contains(&"'it\\'s\\nbroken'".to_string()), "{gdbus:?}");
         assert_eq!(dialogs[4].1.last().map(String::as_str), Some("it's\nbroken"));
+        // Notifications stay until closed (COSMIC drops others after seconds).
+        assert!(dialogs[2].1.contains(&"--expire-time=0".to_string()));
+        assert!(gdbus.contains(&"int32 0".to_string()));
+        // Markup-taking bodies get plain text; xmessage gets wrapped lines.
+        let dialogs = error_dialogs("a <b> & c");
+        assert_eq!(dialogs[1].1.last().map(String::as_str), Some("a ‹b› and c"));
+        assert_eq!(dialogs[2].1.last().map(String::as_str), Some("a ‹b› and c"));
+        assert!(dialogs[3].1.contains(&"'a ‹b› and c'".to_string()));
+        assert_eq!(dialogs[0].1.last().map(String::as_str), Some("a <b> & c"), "zenity takes it as plain text");
+        assert_eq!(wrap("aaa bbb ccc", 7), "aaa bbb\nccc");
+        assert_eq!(wrap("x\nyy zz", 4), "x\nyy\nzz");
+        assert_eq!(wrap(&"w".repeat(9), 4), "w".repeat(9), "a long word stays whole");
         assert_eq!(gvariant_string("a\\b"), "'a\\\\b'");
     }
 

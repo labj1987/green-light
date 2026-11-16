@@ -368,7 +368,14 @@ fn without_zenity_kdialog_or_notify_send_the_message_goes_over_dbus() {
     fake(&dir, "gdbus", &log, 0);
     fake(&dir, "xmessage", &log, 0);
     let script = format!("{}\nlibcheck_show 'Green Light' \"It's <missing>\"\n", block());
-    let out = Command::new("/bin/bash").args(["-c", &script]).env("PATH", &dir).env("DISPLAY", ":0").env_remove("LIBCHECK_DIALOG").output().unwrap();
+    let out = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("PATH", &dir)
+        .env("DISPLAY", ":9999")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("LIBCHECK_DIALOG")
+        .output()
+        .unwrap();
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success());
@@ -391,13 +398,84 @@ fn when_no_notification_is_taken_xmessage_shows_the_message() {
     fake(&dir, "gdbus", &log, 1);
     fake(&dir, "xmessage", &log, 0);
     let script = format!("{}\nlibcheck_show 'Green Light' 'Broken.'\n", block());
-    let out = Command::new("/bin/bash").args(["-c", &script]).env("PATH", &dir).env("DISPLAY", ":0").env_remove("LIBCHECK_DIALOG").output().unwrap();
+    let out = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("PATH", &dir)
+        .env("DISPLAY", ":9999")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("LIBCHECK_DIALOG")
+        .output()
+        .unwrap();
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success());
     let order: Vec<&str> = calls.lines().filter(|l| l.starts_with("== ")).collect();
     assert_eq!(order, ["== notify-send", "== gdbus", "== xmessage"], "{calls}");
+    assert!(calls.contains("== notify-send\n-u\ncritical\n-t\n0\n"), "stays until closed: {calls}");
     assert!(calls.ends_with("== xmessage\n-center\n-title\nGreen Light\nBroken.\n"), "{calls}");
+}
+
+#[test]
+fn xmessage_gets_folded_lines() {
+    let dir = scratch("show-fold");
+    let log = dir.join("log");
+    fake(&dir, "xmessage", &log, 0);
+    // Only fold from the system: PATH must never reach a real dialog program.
+    let fold = ["/usr/bin/fold", "/bin/fold"].into_iter().find(|p| Path::new(p).exists()).expect("fold");
+    std::os::unix::fs::symlink(fold, dir.join("fold")).unwrap();
+    let long = "word ".repeat(30);
+    let script = format!("{}\nlibcheck_show 'Green Light' '{}'\n", block(), long.trim_end());
+    let out = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("PATH", &dir)
+        .env("DISPLAY", ":9999")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("LIBCHECK_DIALOG")
+        .output()
+        .unwrap();
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success());
+    let text = calls.split("Green Light\n").nth(1).unwrap_or_default();
+    assert!(text.lines().count() >= 2 && text.lines().all(|l| l.chars().count() <= 80), "{calls}");
+}
+
+#[test]
+fn a_zenity_that_cannot_open_the_display_does_not_count_as_shown() {
+    // zenity exits 1 both when its dialog is closed and when it can't reach the display.
+    let dir = scratch("show-zenity-nodisplay");
+    let log = dir.join("log");
+    script_file(
+        &dir.join("zenity"),
+        &format!("#!/bin/sh\necho '== zenity' >> '{}'\necho '(zenity:1): Gtk-WARNING **: cannot open display: :0' >&2\nexit 1\n", log.display()),
+    );
+    fake(&dir, "gdbus", &log, 0);
+    let script = format!("{}\nlibcheck_show 'Green Light' 'Broken.'\n", block());
+    let out = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("PATH", &dir)
+        .env("DISPLAY", ":9999")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("LIBCHECK_DIALOG")
+        .output()
+        .unwrap();
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    // A zenity closed by the user (1, no complaint) is seen.
+    script_file(&dir.join("zenity"), &format!("#!/bin/sh\necho '== zenity' >> '{}'\nexit 1\n", log.display()));
+    std::fs::write(&log, "").unwrap();
+    let _ = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("PATH", &dir)
+        .env("DISPLAY", ":9999")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("LIBCHECK_DIALOG")
+        .output()
+        .unwrap();
+    let closed = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success());
+    assert!(calls.starts_with("== zenity\n== gdbus\n"), "the next one shows it: {calls}");
+    assert_eq!(closed, "== zenity\n");
 }
 
 #[test]
@@ -484,11 +562,16 @@ fn a_running_copy_is_found_by_its_lock() {
     std::fs::write(&file, b"").unwrap();
     assert_eq!(run_setup(&dir, &check, &[]).1, "free\n");
     // Locked by a running copy.
-    let held = format!("flock '{}' sleep 5 >/dev/null 2>&1 & sleep 0.3; {check}; kill %1", file.display());
+    let held = format!("flock -o '{}' sleep 5 >/dev/null 2>&1 & sleep 0.3; {check}; kill %1", file.display());
     let (ok, out, err) = run_setup(&dir, &held, &[]);
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(ok, "{err}");
     assert_eq!(out, "running\n");
+    // Another launch's probe (a shared lock) at the same moment is not a running copy.
+    let probing = format!("flock -o -s '{}' sleep 5 >/dev/null 2>&1 & sleep 0.3; {check}; kill %1", file.display());
+    let (ok, out, err) = run_setup(&dir, &probing, &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ok, "{err}");
+    assert_eq!(out, "free\n");
 }
 
 #[test]

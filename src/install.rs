@@ -285,6 +285,7 @@ fn recover_result(code: Option<i32>, lines: &[String]) -> Result<Recovered> {
         Some(3) => Ok(Recovered::Restored),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
         Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
+        Some(127) if refused(lines) => bail!("{REFUSED_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         Some(4) => bail!(
             "The previous driver could not be fully restored{detail}. Don't reboot until a \
@@ -338,6 +339,7 @@ fn discard_result(code: Option<i32>, lines: &[String]) -> Result<()> {
         Some(0) => Ok(()),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
         Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
+        Some(127) if refused(lines) => bail!("{REFUSED_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         code => bail!("Discarding the recovery data failed (exit code {code:?}){}", first_error(lines).map(|e| format!(": {e}")).unwrap_or_default()),
     }
@@ -366,6 +368,14 @@ const NO_AGENT_TEXTS: [&str; 2] = [
 ];
 
 const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed. Start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use hyprpolkitagent; on sway or i3 use polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit.";
+
+/// pkexec's "Not authorized" (127): what polkit-kde-agent's Cancel gives, as
+/// well as a refusal; COSMIC's and GNOME's agents give 126 for Cancel.
+fn refused(lines: &[String]) -> bool {
+    lines.iter().any(|l| l.contains("Not authorized"))
+}
+
+const REFUSED_MESSAGE: &str = "Authentication was cancelled or refused; nothing was changed.";
 
 fn no_agent(lines: &[String]) -> bool {
     lines.iter().any(|l| NO_AGENT_TEXTS.iter().any(|t| l.contains(t)))
@@ -414,6 +424,7 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
     match code {
         Some(126) => "Authentication was cancelled; nothing was changed.".to_string(),
         Some(127) if no_agent(lines) => NO_AGENT_MESSAGE.to_string(),
+        Some(127) if refused(lines) => REFUSED_MESSAGE.to_string(),
         Some(127) => "Not authorized, or pkexec could not start the install script; nothing was changed.".to_string(),
         Some(1) => format!("The install stopped before changing anything{detail}"),
         Some(2) => format!("The install script refused to start{detail}"),
@@ -504,6 +515,7 @@ pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
         Some(0) => Ok(()),
         Some(126) => Err(anyhow::anyhow!("Authentication was cancelled.")),
         Some(127) if no_agent(&run.lines) => Err(anyhow::anyhow!(NO_AGENT_MESSAGE)),
+        Some(127) if refused(&run.lines) => Err(anyhow::anyhow!(REFUSED_MESSAGE)),
         Some(127) => Err(anyhow::anyhow!("Not authorized, or pkexec could not start the script.")),
         code => Err(anyhow::anyhow!(
             "Signing setup failed{}",
@@ -570,8 +582,18 @@ mod tests {
             assert!(msg.contains("No polkit authentication agent") && msg.contains("hyprpolkitagent"), "{msg}");
             assert!(!msg.contains("Not authorized"), "{msg}");
         }
-        // Other 127s keep the generic message, and the text only counts with 127.
-        assert!(install_failure(Some(127), &lines(&["Error executing command as another user: Not authorized"])).contains("Not authorized"));
+        // polkit-kde-agent's Cancel (127 "Not authorized") reads as a cancel, everywhere.
+        let kde = lines(&["Error executing command as another user: Not authorized", "", "This incident has been reported."]);
+        for msg in [
+            install_failure(Some(127), &kde),
+            recover_result(Some(127), &kde).unwrap_err().to_string(),
+            discard_result(Some(127), &kde).unwrap_err().to_string(),
+        ] {
+            assert_eq!(msg, "Authentication was cancelled or refused; nothing was changed.");
+        }
+        // Other 127s keep the generic message, and the texts only count with 127.
+        assert!(install_failure(Some(127), &[]).contains("Not authorized"));
+        assert!(!install_failure(Some(1), &kde).contains("cancelled"));
         assert!(!install_failure(Some(1), &err).contains("polkit authentication agent"));
     }
 
