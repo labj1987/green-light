@@ -249,26 +249,33 @@ libgcc_s.so.1 libgcc-s1 gcc-libs
 TABLE
 }
 
-# libcheck_install_hint LIBRARY...: how to install the packages that provide LIBRARY..., as one
-# or two sentences, for the system's package manager; nothing for an unknown distribution.
-# dnf and zypper install by library name (rpm's provides); apt and pacman get the package names
-# of the usual host libraries, and the command that finds the package for any other one.
-libcheck_install_hint() {
-    local f="${LIBCHECK_OS_RELEASE:-/etc/os-release}" ids id mgr="" cmd lib pkg out=""
-    local pkgs=() unknown=()
+# libcheck_manager: the system's package manager (apt, dnf, zypper or pacman), from os-release;
+# nothing for an unknown distribution.
+libcheck_manager() {
+    local f="${LIBCHECK_OS_RELEASE:-/etc/os-release}" ids id
     [[ -r "$f" ]] || return 0
     # shellcheck disable=SC1090
     ids="$(. "$f" 2>/dev/null; echo "${ID:-} ${ID_LIKE:-}")"
     for id in $ids; do
         case "$id" in
-            fedora|rhel|centos|rocky|almalinux) mgr=dnf ;;
-            opensuse*|suse|sles) mgr=zypper ;;
-            debian|ubuntu) mgr=apt ;;
-            arch) mgr=pacman ;;
+            fedora|rhel|centos|rocky|almalinux) echo dnf ;;
+            opensuse*|suse|sles) echo zypper ;;
+            debian|ubuntu) echo apt ;;
+            arch) echo pacman ;;
             *) continue ;;
         esac
-        break
+        return 0
     done
+}
+
+# libcheck_install_hint LIBRARY...: how to install the packages that provide LIBRARY..., as one
+# or two sentences, for the system's package manager; nothing for an unknown distribution.
+# dnf and zypper install by library name (rpm's provides); apt and pacman get the package names
+# of the usual host libraries, and the command that finds the package for any other one.
+libcheck_install_hint() {
+    local mgr cmd lib pkg out=""
+    local pkgs=() unknown=()
+    mgr="$(libcheck_manager)"
     case "$mgr" in
         dnf|zypper)
             cmd="sudo $mgr install"
@@ -315,16 +322,43 @@ libcheck_plain() {
     echo "${t//>/›}"
 }
 
+# libcheck_gvariant TEXT: TEXT as a GVariant text-format string, for gdbus.
+libcheck_gvariant() {
+    local t="${1//\\/\\\\}"
+    t="${t//\'/\\\'}"
+    t="${t//$'\n'/\\n}"
+    printf "'%s'" "$t"
+}
+
+# libcheck_show TITLE TEXT: TEXT on stderr and, in a desktop session, in the first of these that
+# shows it: zenity, kdialog (both end with 0 or 1 once seen), a notification through notify-send or
+# straight over D-Bus with gdbus (0: the desktop took it; Pop!_OS COSMIC has gdbus but no
+# notify-send), and xmessage.
 libcheck_show() {
+    local rc plain
     printf '%s: %s\n' "$1" "$2" >&2
     [[ "${LIBCHECK_DIALOG:-}" == none ]] && return 0
     [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] || return 0
+    plain="$(libcheck_plain "$2")"
     if command -v zenity >/dev/null 2>&1; then
-        zenity --error --no-markup --title="$1" --text="$2" --width=460 >/dev/null 2>&1
-    elif command -v kdialog >/dev/null 2>&1; then
-        kdialog --error "$(libcheck_plain "$2")" --title "$1" >/dev/null 2>&1
-    elif command -v notify-send >/dev/null 2>&1; then
-        notify-send -u critical "$1" "$(libcheck_plain "$2")" >/dev/null 2>&1
+        rc=0; zenity --error --no-markup --title="$1" --text="$2" --width=460 >/dev/null 2>&1 || rc=$?
+        ((rc <= 1)) && return 0
+    fi
+    if command -v kdialog >/dev/null 2>&1; then
+        rc=0; kdialog --error "$plain" --title "$1" >/dev/null 2>&1 || rc=$?
+        ((rc <= 1)) && return 0
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -u critical "$1" "$plain" >/dev/null 2>&1 && return 0
+    fi
+    if command -v gdbus >/dev/null 2>&1; then
+        gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+            --method org.freedesktop.Notifications.Notify "$(libcheck_gvariant "$1")" 'uint32 0' "''" \
+            "$(libcheck_gvariant "$1")" "$(libcheck_gvariant "$plain")" '@as []' "{'urgency': <byte 2>}" 'int32 -1' \
+            >/dev/null 2>&1 && return 0
+    fi
+    if command -v xmessage >/dev/null 2>&1; then
+        xmessage -center -title "$1" "$2" >/dev/null 2>&1
     fi
     return 0
 }
@@ -370,6 +404,72 @@ libcheck_run() {
 
 libcheck_run "Green Light" "$HERE/usr/bin/$APP" || exit 1
 
+# >>> setup: the launch-time setup's helpers (tests/libcheck.rs runs them with the libcheck block).
+
+# setup_running FILE: whether another copy of the app runs for this login. The copy that owns the
+# single-instance socket holds a lock on FILE for as long as it runs (src/instance.rs).
+setup_running() {
+    [[ -e "$1" ]] && command -v flock >/dev/null 2>&1 || return 1
+    ! flock -n "$1" true 2>/dev/null
+}
+
+# setup_pkexec ARG...: pkexec ARG..., in a session of its own (no controlling terminal) and with
+# stdin from /dev/null. A desktop started from a text console (Hyprland from tty1) leaves its
+# apps that console as controlling terminal; with no polkit agent running, pkexec would then ask
+# for the password there, on a console nobody sees, and wait for ever. Without a terminal it
+# fails at once instead ("Error creating textual authentication agent"), and a running agent
+# shows its dialog as before (polkit goes by the login session, not the terminal).
+setup_pkexec() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid -w pkexec "$@" </dev/null
+    else
+        pkexec "$@" </dev/null
+    fi
+}
+
+# setup_reason RC ERRFILE: why the setup did not complete, from pkexec's exit status RC and what
+# it printed (in ERRFILE). 126 is a dismissed prompt (COSMIC's agent, GNOME's); polkit-kde-agent
+# reports its Cancel as "Not authorized", 127. The helper itself never exits with either.
+setup_reason() {
+    case $1 in
+        126) echo "authorization was cancelled or refused" ;;
+        127) if grep -q -e "No authentication agent found" -e "Error creating textual authentication agent" "$2"; then
+                 echo "no polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed; start one (hyprpolkitagent on Hyprland, polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway or i3)"
+             elif grep -q "Not authorized" "$2"; then
+                 echo "authorization was cancelled or refused"
+             else
+                 echo "authorization was cancelled or refused, or pkexec could not run the setup helper"
+             fi ;;
+        *)   echo "installing system components failed (exit $1)" ;;
+    esac
+}
+
+# setup_no_pkexec: why the setup can't run on a system without pkexec, with the command that
+# installs it on this distribution.
+setup_no_pkexec() {
+    local how
+    case "$(libcheck_manager)" in
+        apt) how="sudo apt install pkexec" ;;
+        dnf) how="sudo dnf install polkit" ;;
+        zypper) how="sudo zypper install polkit" ;;
+        pacman) how="sudo pacman -S polkit" ;;
+    esac
+    if [[ -n "$how" ]]; then
+        echo "polkit's pkexec is not installed, so nothing was changed; install it with: $how (and a polkit authentication agent, if your desktop has none)"
+    else
+        echo "polkit's pkexec is not installed, so nothing was changed; install polkit (and a polkit authentication agent, if your desktop has none) with your package manager"
+    fi
+}
+# <<< setup
+
+export PATH="$HERE/usr/bin:$PATH"
+
+# A copy already running: hand over to it straight away (the binary asks it to raise its window
+# and exits), without the setup and its password prompt.
+if [[ -n "${XDG_RUNTIME_DIR:-}" ]] && setup_running "$XDG_RUNTIME_DIR/$APP.running"; then
+    exec "$HERE/usr/bin/$APP" "$@"
+fi
+
 SRC_SCRIPT="$HERE/usr/lib/$APP/privileged-install.sh"
 SRC_HELPER="$HERE/usr/lib/$APP/green-light-setup"
 SRC_POLICY="$HERE/usr/share/polkit-1/actions/io.github.labj1987.GreenLight.policy"
@@ -394,46 +494,40 @@ if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1 \
 fi
 
 if [[ $needs_install -eq 1 ]]; then
-    STAGE="$(mktemp -d)"
-    cp "$SRC_SCRIPT" "$STAGE/privileged-install.sh"
-    cp "$SRC_POLICY" "$STAGE/policy"
-    cp "$SRC_UNIT" "$STAGE/recover-service"
-    cp "$SRC_HELPER" "$STAGE/green-light-setup"
-    chmod 755 "$STAGE/green-light-setup"
-
-    rc=0
-    ERRF="$(mktemp)"
-    if [[ -x "$DST_HELPER" ]] && cmp -s "$SRC_HELPER" "$DST_HELPER" \
-        && pkaction --action-id "$SETUP_ACTION" >/dev/null 2>&1; then
-        pkexec "$DST_HELPER" "$STAGE" 2>"$ERRF" || rc=$?
+    reason=""
+    if ! command -v pkexec >/dev/null 2>&1; then
+        reason="$(setup_no_pkexec)"
     else
-        # $BASH: this script's own interpreter, as the absolute path pkexec needs.
-        pkexec "$BASH" "$STAGE/green-light-setup" "$STAGE" 2>"$ERRF" || rc=$?
-    fi
-    rm -rf "$STAGE"
-    cat "$ERRF" >&2
+        STAGE="$(mktemp -d)"
+        cp "$SRC_SCRIPT" "$STAGE/privileged-install.sh"
+        cp "$SRC_POLICY" "$STAGE/policy"
+        cp "$SRC_UNIT" "$STAGE/recover-service"
+        cp "$SRC_HELPER" "$STAGE/green-light-setup"
+        chmod 755 "$STAGE/green-light-setup"
 
-    # pkexec: 126 = password prompt dismissed, 127 = not authorized or it could
-    # not run the helper. The helper itself never exits with either. The reason
-    # is handed to the app (GREEN_LIGHT_SETUP_FAILURE), which shows it in a
-    # banner and in the messages of the actions that need the setup.
-    if [[ $rc -ne 0 ]]; then
-        case $rc in
-            126) reason="authorization was cancelled" ;;
-            127) if grep -q -e "No authentication agent found" -e "Error creating textual authentication agent" "$ERRF"; then
-                     reason="no polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed; start one (hyprpolkitagent on Hyprland, polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit on sway or i3)"
-                 else
-                     reason="authorization failed, or pkexec could not run the setup helper"
-                 fi ;;
-            *)   reason="installing system components failed (exit $rc)" ;;
-        esac
+        rc=0
+        ERRF="$(mktemp)"
+        if [[ -x "$DST_HELPER" ]] && cmp -s "$SRC_HELPER" "$DST_HELPER" \
+            && pkaction --action-id "$SETUP_ACTION" >/dev/null 2>&1; then
+            setup_pkexec "$DST_HELPER" "$STAGE" 2>"$ERRF" || rc=$?
+        else
+            # $BASH: this script's own interpreter, as the absolute path pkexec needs.
+            setup_pkexec "$BASH" "$STAGE/green-light-setup" "$STAGE" 2>"$ERRF" || rc=$?
+        fi
+        rm -rf "$STAGE"
+        cat "$ERRF" >&2
+        [[ $rc -eq 0 ]] || reason="$(setup_reason "$rc" "$ERRF")"
+        rm -f "$ERRF"
+    fi
+
+    # The reason is handed to the app (GREEN_LIGHT_SETUP_FAILURE), which shows it in a banner and
+    # in the messages of the actions that need the setup.
+    if [[ -n "$reason" ]]; then
         echo "Green Light: setup did not complete: $reason." >&2
         export GREEN_LIGHT_SETUP_FAILURE="$reason"
     fi
-    rm -f "$ERRF"
 fi
 
-export PATH="$HERE/usr/bin:$PATH"
 exec "$HERE/usr/bin/$APP" "$@"
 APPRUN
 chmod 755 "$APPDIR/AppRun"

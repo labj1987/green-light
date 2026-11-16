@@ -169,6 +169,25 @@ impl LogTail {
     }
 }
 
+/// `command`, to be run in a session of its own, with no controlling
+/// terminal. An app started on a desktop that was started from a text console
+/// (Hyprland from tty1) has that console as its terminal; with no polkit
+/// agent running, pkexec would ask for the password there, on a console
+/// nobody sees, and wait for ever. Without one it fails at once with its
+/// "no agent" message. A running agent works as before: polkit goes by the
+/// login session, not the terminal.
+fn without_terminal(mut command: std::process::Command) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setsid is async-signal-safe, and the closure touches nothing else.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command
+}
+
 /// Run `pkexec <args>` and pass the script's messages to `on_line` as they
 /// come. Without a terminal the script writes nothing to its stdout or
 /// stderr (a pipe to this app, which may be closed mid-install), only to its
@@ -177,7 +196,7 @@ impl LogTail {
 /// messages (from before the script starts) come on stderr.
 fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
     let mut tail = LogTail::at_end(INSTALL_LOG);
-    let mut child = std::process::Command::new("pkexec")
+    let mut child = without_terminal(std::process::Command::new("pkexec"))
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::null())
@@ -500,6 +519,17 @@ mod tests {
 
     fn lines(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pkexec_runs_without_a_controlling_terminal() {
+        // In a session of its own: its session ID is its own PID, and it has no terminal.
+        let out = super::without_terminal(std::process::Command::new("sh")).args(["-c", "echo $$; cut -d' ' -f6,7 /proc/$$/stat"]).output().unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut lines = text.lines();
+        let pid = lines.next().unwrap();
+        let fields: Vec<&str> = lines.next().unwrap().split(' ').collect();
+        assert_eq!(fields, [pid, "0"], "session = own PID, tty_nr = 0");
     }
 
     #[test]

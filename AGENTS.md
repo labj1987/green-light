@@ -24,7 +24,11 @@ them breaks existing installs' policy/settings).
 - `main.rs` — entry point: the single-instance check, the shared Tokio
   runtime, the toolkit's log output, then the GPUI application.
 - `instance.rs` — one running copy per login: a socket in
-  `XDG_RUNTIME_DIR`; a second launch hands over its activation token and exits.
+  `XDG_RUNTIME_DIR`; a second launch hands over its activation token
+  (`activate <token>\n`), waits up to 2 s for the UI loop's `ok\n`, and exits;
+  with no answer it names the hung copy's PID (stderr and the no-window
+  dialog path in `ui.rs`). The primary copy keeps `green-light.running`
+  flock'ed for its whole life; AppRun checks that lock to skip the setup.
 - `activation.rs` — raises the window for a second launch on Wayland
   (`xdg_activation_v1` on GPUI's own connection, with that token).
 - `ui.rs` — the GPUI Kit UI: system/browse/configure/log tabs.
@@ -290,7 +294,8 @@ copy of that logic.
   driver is broken or missing (lavapipe or llvmpipe draw the window); keep it that way and re-check
   it whenever the toolkit is bumped: `VK_ICD_FILENAMES` naming only lavapipe's ICD, and a run with no
   Vulkan ICD at all and `__EGL_VENDOR_LIBRARY_FILENAMES` naming only Mesa's (llvmpipe through
-  `LIBGL_ALWAYS_SOFTWARE=1`); `GREEN_LIGHT_LOG=info` shows the adapter picked. Its sources are the
+  `LIBGL_ALWAYS_SOFTWARE=1`); `GREEN_LIGHT_LOG=info` shows the adapter picked
+  (noisy dependencies such as zbus are capped at warn, `QUIET_CRATES` in `main.rs`). Its sources are the
   reference: `~/.cargo/registry/src/*/gpui-component-*`, `gpui-base-*`, `gpui-pre-*`.
 - Shape: one view (`MainView`, the four tabs drawn from `AppState` on every frame) and one small
   view for dialog content that changes while open (`SigningPrompt`). Dialog builders run on every
@@ -370,7 +375,18 @@ the script itself never has):
    enabled). AppRun
    stages the setup files in a `mktemp -d` dir and,
    on first run, runs the staged helper as `pkexec "$BASH" <helper>` so a
-   noexec `/tmp` doesn't matter.
+   noexec `/tmp` doesn't matter. Every pkexec (AppRun's `setup_pkexec`, the
+   app's `run_pkexec`) runs under `setsid` with no controlling terminal: a
+   desktop started from a TTY (Hyprland from tty1) would otherwise get pkexec's
+   text agent on that hidden console, waiting for ever. AppRun skips the setup
+   and execs the binary straight away when a copy is already running
+   (`setup_running`), says so when pkexec is missing (`setup_no_pkexec`, with
+   the distribution's install command), and words pkexec's 126/127 in
+   `setup_reason` (polkit-kde-agent's Cancel is 127 "Not authorized"). The
+   helpers sit between `# >>> setup` and `# <<< setup`, which
+   `tests/libcheck.rs` runs. `libcheck_show` (and the app's no-window
+   message) tries zenity, kdialog, notify-send, a notification over `gdbus`
+   (Pop!_OS COSMIC has no notify-send), then xmessage.
 4. Downloads `appimagetool` (pinned 1.9.1) and the type2 runtime it
    puts in front of the squashfs (pinned 20251108, passed with
    `--runtime-file`), both SHA256-verified and cached in `.cache/`, and

@@ -28,6 +28,18 @@ under 2.3.0.
   that has the focus.
 - Screen readers: buttons, rows and dialog text are exposed, and notifications are announced (see Known
   issues in the README).
+- **Starting it again while it is open** brings up the open window without asking for the password
+  again, also after a cancelled prompt. If the open copy has stopped responding, the new start says so,
+  with the PID to close, instead of doing nothing.
+- **Hyprland started from a text console** no longer hangs at the first-launch password prompt when no
+  polkit agent runs: the prompt no longer goes to that hidden console, and Green Light says that no agent
+  is running. Without pkexec at all, it says that and names the package to install.
+- Cancelling the password prompt on KDE Plasma now reads "authorization was cancelled or refused", as on
+  other desktops, instead of "authorization failed".
+- The "can't start" messages (a missing library) now also appear on Pop!_OS COSMIC, as a notification.
+- Dark theme: the Production and New Feature badges in Browse are readable, and the icon in About is
+  shown at full size.
+- `GREEN_LIGHT_LOG=info` no longer prints the D-Bus library's handshake details.
 
 ## 2.11.0 — 2026-11-15
 

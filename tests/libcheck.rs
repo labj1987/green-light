@@ -150,7 +150,7 @@ fn the_apprun_checks_the_libraries_and_then_starts_the_one_binary() {
     assert!(check < exec);
     // The check comes before the launch-time setup's password prompt: an app that can't start
     // must not ask for one first.
-    let setup = apprun.find("pkexec ").expect("the launch-time setup");
+    let setup = apprun.find("setup_pkexec \"$DST_HELPER\"").expect("the launch-time setup");
     assert!(check < setup && setup < exec);
     // The setup says why it did not complete when no polkit agent is running.
     assert!(apprun.contains("no polkit authentication agent is running"));
@@ -326,4 +326,175 @@ fn libcheck_counts_only_the_binarys_own_symbols() {
     let ldd = "symbol xkb_x version V_1.0.0 not defined in file libxkbcommon.so.0 with link time reference\t(/x)";
     let (ok, _, err) = run("lib-version", ldd, "ID=debian\n", "libcheck_run 'Test App' /x");
     assert!(!ok && err.contains("they lack xkb_x."), "{err}");
+}
+
+/// The AppRun's whole text.
+fn apprun() -> &'static str {
+    let script = include_str!("../build-appimage.sh");
+    let apprun = &script[script.find("<< 'APPRUN'").expect("AppRun heredoc")..];
+    &apprun[..apprun.find("\nAPPRUN\n").expect("AppRun heredoc end")]
+}
+
+/// The libcheck block followed by the AppRun's setup helpers (they use libcheck's).
+fn setup_block() -> String {
+    let apprun = apprun();
+    let start = apprun.find("# >>> setup").expect("setup block start");
+    let end = apprun.find("# <<< setup").expect("setup block end");
+    format!("{}\n{}", block(), &apprun[start..end])
+}
+
+/// Runs `call` after the libcheck and setup blocks with `bin` first on PATH and `env` set.
+fn run_setup(bin: &Path, call: &str, env: &[(&str, &str)]) -> (bool, String, String) {
+    let script = format!("{}\n{call}\n", setup_block());
+    let mut command = Command::new("/bin/bash");
+    command.args(["-c", &script]).env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    let out = command.output().unwrap();
+    (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// A fake program that appends its name and arguments, one per line, to `log` and exits with `code`.
+fn fake(bin: &Path, name: &str, log: &Path, code: i32) {
+    script_file(&bin.join(name), &format!("#!/bin/sh\n{{ echo \"== {name}\"; for a in \"$@\"; do echo \"$a\"; done; }} >> '{}'\nexit {code}\n", log.display()));
+}
+
+#[test]
+fn without_zenity_kdialog_or_notify_send_the_message_goes_over_dbus() {
+    // Pop!_OS COSMIC: no zenity, kdialog or notify-send, but gdbus and a notification service.
+    let dir = scratch("show-gdbus");
+    let log = dir.join("log");
+    fake(&dir, "gdbus", &log, 0);
+    fake(&dir, "xmessage", &log, 0);
+    let script = format!("{}\nlibcheck_show 'Green Light' \"It's <missing>\"\n", block());
+    let out = Command::new("/bin/bash").args(["-c", &script]).env("PATH", &dir).env("DISPLAY", ":0").env_remove("LIBCHECK_DIALOG").output().unwrap();
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success());
+    assert!(calls.starts_with("== gdbus\ncall\n--session\n--dest\norg.freedesktop.Notifications\n"), "{calls}");
+    assert!(calls.contains("\norg.freedesktop.Notifications.Notify\n'Green Light'\nuint32 0\n''\n'Green Light'\n'It\\'s ‹missing›'\n@as []\n"), "{calls}");
+    assert!(!calls.contains("xmessage"), "shown once: {calls}");
+}
+
+#[test]
+fn when_no_notification_is_taken_xmessage_shows_the_message() {
+    let dir = scratch("show-xmessage");
+    let log = dir.join("log");
+    fake(&dir, "notify-send", &log, 1);
+    fake(&dir, "gdbus", &log, 1);
+    fake(&dir, "xmessage", &log, 0);
+    let script = format!("{}\nlibcheck_show 'Green Light' 'Broken.'\n", block());
+    let out = Command::new("/bin/bash").args(["-c", &script]).env("PATH", &dir).env("DISPLAY", ":0").env_remove("LIBCHECK_DIALOG").output().unwrap();
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success());
+    let order: Vec<&str> = calls.lines().filter(|l| l.starts_with("== ")).collect();
+    assert_eq!(order, ["== notify-send", "== gdbus", "== xmessage"], "{calls}");
+    assert!(calls.ends_with("== xmessage\n-center\n-title\nGreen Light\nBroken.\n"), "{calls}");
+}
+
+#[test]
+fn the_setup_prompt_runs_without_a_controlling_terminal() {
+    // A fake pkexec that reports its PID, session, terminal and stdin.
+    let dir = scratch("setsid");
+    let report = dir.join("report");
+    script_file(
+        &dir.join("pkexec"),
+        &format!(
+            "#!/bin/bash\nread -r -a stat < /proc/$$/stat\necho \"$$ ${{stat[5]}} ${{stat[6]}} $(readlink /proc/$$/fd/0) $*\" > '{}'\nexit 126\n",
+            report.display()
+        ),
+    );
+    let (ok, out, err) = run_setup(&dir, "rc=0; setup_pkexec /helper /stage || rc=$?; echo \"rc=$rc\"", &[]);
+    let line = std::fs::read_to_string(&report).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ok, "{err}");
+    assert_eq!(out, "rc=126\n", "pkexec's exit status comes back");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields.len(), 6, "{line}");
+    assert_eq!(fields[1], fields[0], "a session of its own (session ID = its PID): {line}");
+    assert_eq!(fields[2], "0", "no controlling terminal: {line}");
+    assert_eq!(fields[3], "/dev/null", "{line}");
+    assert_eq!(&fields[4..], ["/helper", "/stage"]);
+}
+
+#[test]
+fn the_setup_failure_reads_right_for_every_desktop() {
+    let dir = scratch("reason");
+    let errf = dir.join("err");
+    let reason = |rc: i32, err: &str| {
+        std::fs::write(&errf, err).unwrap();
+        let (ok, out, _) = run_setup(&dir, &format!("setup_reason {rc} '{}'", errf.display()), &[]);
+        assert!(ok);
+        out.trim_end().to_string()
+    };
+    // COSMIC's and GNOME's agents: 126 for a dismissed prompt.
+    assert_eq!(reason(126, "Error executing command as another user: Request dismissed\n"), "authorization was cancelled or refused");
+    // polkit-kde-agent's Cancel: 127 "Not authorized".
+    assert_eq!(
+        reason(127, "Error executing command as another user: Not authorized\n\nThis incident has been reported.\n"),
+        "authorization was cancelled or refused"
+    );
+    assert!(reason(
+        127,
+        "Error creating textual authentication agent: Error opening current controlling terminal for the process (`/dev/tty'): No such device or address\n"
+    )
+    .starts_with("no polkit authentication agent is running"));
+    assert!(reason(127, "No authentication agent found.\n").starts_with("no polkit authentication agent is running"));
+    assert_eq!(reason(127, "pkexec: something else\n"), "authorization was cancelled or refused, or pkexec could not run the setup helper");
+    assert_eq!(reason(3, ""), "installing system components failed (exit 3)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_missing_pkexec_is_named_with_the_install_command() {
+    let dir = scratch("nopkexec");
+    let release = dir.join("os-release");
+    for (os, want) in [
+        ("ID=fedora\n", "install it with: sudo dnf install polkit "),
+        ("ID=ubuntu\nID_LIKE=debian\n", "install it with: sudo apt install pkexec "),
+        ("ID=cachyos\nID_LIKE=arch\n", "install it with: sudo pacman -S polkit "),
+        ("ID=opensuse-tumbleweed\nID_LIKE=\"opensuse suse\"\n", "install it with: sudo zypper install polkit "),
+        ("ID=somethingelse\n", "install polkit (and a polkit authentication agent, if your desktop has none) with your package manager"),
+    ] {
+        std::fs::write(&release, os).unwrap();
+        let (ok, out, _) = run_setup(&dir, "setup_no_pkexec", &[("LIBCHECK_OS_RELEASE", release.to_str().unwrap())]);
+        assert!(ok);
+        assert!(out.starts_with("polkit's pkexec is not installed, so nothing was changed; ") && out.contains(want), "{os}: {out}");
+        assert!(!out.contains("authorization"), "{out}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_running_copy_is_found_by_its_lock() {
+    let dir = scratch("running");
+    let file = dir.join("green-light.running");
+    let check = format!("if setup_running '{}'; then echo running; else echo free; fi", file.display());
+    // No file: nothing runs.
+    assert_eq!(run_setup(&dir, &check, &[]).1, "free\n");
+    // The file, unlocked: left by a copy that is gone.
+    std::fs::write(&file, b"").unwrap();
+    assert_eq!(run_setup(&dir, &check, &[]).1, "free\n");
+    // Locked by a running copy.
+    let held = format!("flock '{}' sleep 5 >/dev/null 2>&1 & sleep 0.3; {check}; kill %1", file.display());
+    let (ok, out, err) = run_setup(&dir, &held, &[]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(ok, "{err}");
+    assert_eq!(out, "running\n");
+}
+
+#[test]
+fn a_second_launch_hands_over_before_the_setup_and_pkexec_is_checked_first() {
+    let apprun = apprun();
+    let check = apprun.find("\nlibcheck_run \"Green Light\"").unwrap();
+    let handover = apprun.find("setup_running \"$XDG_RUNTIME_DIR/$APP.running\"; then\n    exec \"$HERE/usr/bin/$APP\" \"$@\"").expect("hand-over");
+    let setup = apprun.find("needs_install=0").unwrap();
+    assert!(check < handover && handover < setup, "the hand-over skips the setup and its prompt");
+    let main = &apprun[setup..];
+    let missing = main.find("if ! command -v pkexec").expect("pkexec is looked for");
+    assert!(missing < main.find("setup_pkexec ").unwrap());
+    // Every pkexec of the setup goes through setup_pkexec (no terminal).
+    assert!(!main.contains("\n        pkexec ") && !main.contains(" pkexec \""), "{main}");
 }

@@ -26,11 +26,11 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    accesskit, div, img, px, size, uniform_list, Anchor, AnyElement, App, AppContext as _, AssetSource, Bounds, ClipboardItem, Context, Div, Element,
-    ElementId, Entity, FocusHandle, Focusable as _, FontWeight, GlobalElementId, Image, ImageFormat, InspectorElementId, InteractiveElement as _, IntoElement,
-    KeyDownEvent, LayoutId, MouseButton, ParentElement as _, PathPromptOptions, Pixels, Position, Render, Role, ScrollHandle, ScrollStrategy, SharedString,
-    Stateful, StatefulInteractiveElement as _, Style, Styled as _, Subscription, Task, Text, UniformListScrollHandle, Window, WindowBounds, WindowDecorations,
-    WindowOptions,
+    accesskit, div, hsla, img, px, size, uniform_list, Anchor, AnyElement, App, AppContext as _, AssetSource, Bounds, ClipboardItem, Context, Div, Element,
+    ElementId, Entity, FocusHandle, Focusable as _, FontWeight, GlobalElementId, Hsla, Image, ImageFormat, InspectorElementId, InteractiveElement as _,
+    IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement as _, PathPromptOptions, Pixels, Position, Render, Role, ScrollHandle, ScrollStrategy,
+    SharedString, Stateful, StatefulInteractiveElement as _, Style, Styled as _, Subscription, Task, Text, UniformListScrollHandle, Window, WindowBounds,
+    WindowDecorations, WindowOptions,
 };
 
 use std::cell::{Cell, RefCell};
@@ -488,37 +488,99 @@ fn show_error(heading: &str, body: &str, window: &mut Window, cx: &mut App) {
 /// in. Says so through whatever the desktop offers, then exits: a process
 /// left behind with no window would also keep later launches from starting.
 fn no_window(error: &str) -> ! {
-    let has_display = ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
-    let message = no_window_message(error, has_display);
-    eprintln!("green-light: {message}");
-    // With no display there is nowhere to show a dialog either.
-    if has_display {
-        for (program, args) in ERROR_DIALOGS {
-            let status = std::process::Command::new(program).args(*args).arg(&message).status();
-            if status.is_ok_and(|status| helper_showed(program, status.code())) {
-                break;
-            }
-        }
-    }
+    let message = no_window_message(error, has_display());
+    show_error_without_window(&message);
     std::process::exit(1);
 }
 
-/// The programs tried, in order, to show an error when the app has no window.
-const ERROR_DIALOGS: &[(&str, &[&str])] = &[
-    ("kdialog", &["--title", "Green Light", "--error"]),
-    ("zenity", &["--error", "--no-markup", "--title=Green Light", "--width=480", "--text"]),
-    ("notify-send", &["--urgency=critical", "--app-name=Green Light", "Green Light"]),
-    ("xmessage", &["-center"]),
-];
+fn has_display() -> bool {
+    ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Shows `message` with no window of the app's own: on stderr, and in the
+/// first of the desktop's dialog or notification programs that shows it.
+pub fn show_error_without_window(message: &str) {
+    eprintln!("green-light: {message}");
+    // With no display there is nowhere to show a dialog either.
+    if !has_display() {
+        return;
+    }
+    for (program, args) in error_dialogs(message) {
+        let status = std::process::Command::new(program).args(&args).stdin(std::process::Stdio::null()).status();
+        if status.is_ok_and(|status| helper_showed(program, status.code())) {
+            break;
+        }
+    }
+}
+
+/// The programs tried, in order, to show an error when the app has no
+/// window, with their arguments. gdbus sends a notification straight over
+/// D-Bus, for desktops with a notification service but no notify-send (Pop!_OS
+/// COSMIC); xmessage is the last resort.
+fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
+    let args = |fixed: &[&str]| fixed.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let with_message = |fixed: &[&str]| {
+        let mut all = args(fixed);
+        all.push(message.to_string());
+        all
+    };
+    vec![
+        ("kdialog", with_message(&["--title", "Green Light", "--error"])),
+        ("zenity", with_message(&["--error", "--no-markup", "--title=Green Light", "--width=480", "--text"])),
+        ("notify-send", with_message(&["--urgency=critical", "--app-name=Green Light", "Green Light"])),
+        (
+            "gdbus",
+            args(&[
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.Notifications",
+                "--object-path",
+                "/org/freedesktop/Notifications",
+                "--method",
+                "org.freedesktop.Notifications.Notify",
+                "'Green Light'",
+                "uint32 0",
+                "''",
+                "'Green Light'",
+                &gvariant_string(message),
+                "@as []",
+                "{'urgency': <byte 2>}",
+                "int32 -1",
+            ]),
+        ),
+        ("xmessage", with_message(&["-center", "-title", "Green Light"])),
+    ]
+}
+
+/// `text` as a GVariant text-format string, which is how gdbus takes its
+/// arguments.
+fn gvariant_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
 
 /// Whether `program`, having ended with exit `code`, did show the message, so
 /// the next one must not show it again. The dialogs end with 0 when the user
 /// pressed their button and 1 when the user closed them another way; both
 /// mean it was seen. Anything else (no display, a crash, a signal) does not.
-/// notify-send shows nothing itself: only 0 says the desktop took the message.
+/// notify-send and gdbus show nothing themselves: only 0 says the desktop
+/// took the message.
 fn helper_showed(program: &str, code: Option<i32>) -> bool {
     match program {
-        "notify-send" => code == Some(0),
+        "notify-send" | "gdbus" => code == Some(0),
         _ => matches!(code, Some(0 | 1)),
     }
 }
@@ -675,13 +737,18 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
     // Wayland, GPUI's own request is what there is; a Wayland compositor then
     // marks the window as wanting attention instead of raising it.
     cx.spawn(async move |cx| {
-        while let Some(token) = activations.recv().await {
-            let _ = window.update(cx, |_, window, _| {
-                let raised = token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
+        while let Some(request) = activations.recv().await {
+            let shown = window.update(cx, |_, window, _| {
+                let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
                 if !raised {
                     window.activate_window();
                 }
             });
+            // The launch that asked waits for this; without it, it reports
+            // this copy as not responding.
+            if shown.is_ok() {
+                request.done();
+            }
         }
     })
     .detach();
@@ -2143,7 +2210,9 @@ impl MainView {
                             .overflow_y_scroll()
                             .gap_1()
                             .items_center()
-                            .child(img(icon.clone()).w(px(64.)).h(px(64.)))
+                            // Fixed size: in the scrolling column it would otherwise shrink
+                            // when the dialog is short (to 16 px on a small screen).
+                            .child(img(icon.clone()).size(px(64.)).flex_none())
                             .child(div().text_xl().font_weight(FontWeight::BOLD).child(label("name", "Green Light")))
                             .child(div().text_color(muted).child(label("version", env!("CARGO_PKG_VERSION"))))
                             .child(div().text_center().child(label("summary", "A GUI for installing NVIDIA drivers from official .run files.")))
@@ -2290,7 +2359,7 @@ fn version_row(ver: &DriverVersion, index: usize, installed: Option<&str>, selec
                 )
                 .child(div().text_sm().text_color(theme.muted_foreground).truncate().child(label(id("file"), subtitle))),
         )
-        .when_some(ver.branch, |r, branch| r.child(branch_tag(branch).child(label(id("branch"), branch.label()))))
+        .when_some(ver.branch, |r, branch| r.child(branch_tag(branch, theme.is_dark()).child(label(id("branch"), branch.label()))))
 }
 
 /// The rows of the Browse list all have this height (the list draws only
@@ -2299,15 +2368,29 @@ const VERSION_ROW_HEIGHT: f32 = 52.;
 
 /// Branch badge (Production/New Feature/Older Production/Legacy), from
 /// NVIDIA's own data; omitted rather than guessed without it.
-fn branch_tag(branch: DriverBranch) -> Tag {
-    match branch {
-        DriverBranch::NewFeature => Tag::info(),
-        DriverBranch::Production => Tag::success(),
-        DriverBranch::OlderProduction => Tag::warning(),
-        DriverBranch::Legacy => Tag::secondary(),
+fn branch_tag(branch: DriverBranch, dark: bool) -> Tag {
+    let (background, text) = branch_colors(branch, dark);
+    Tag::custom(background, text, text.opacity(0.4)).small().rounded_full()
+}
+
+/// A branch badge's background and text colours: a tint of the branch's
+/// colour with text of the same hue that reads on it, in the light and the
+/// dark theme alike (at least 4.5:1, see the tests). The toolkit's own
+/// success and info tags put light text on a light green or cyan in its dark
+/// theme.
+fn branch_colors(branch: DriverBranch, dark: bool) -> (Hsla, Hsla) {
+    let (hue, saturation) = match branch {
+        DriverBranch::Production => (142., 0.65),
+        DriverBranch::NewFeature => (199., 0.75),
+        DriverBranch::OlderProduction => (38., 0.85),
+        DriverBranch::Legacy => (220., 0.12),
+    };
+    let hue = hue / 360.;
+    if dark {
+        (hsla(hue, saturation * 0.6, 0.17, 1.), hsla(hue, saturation, 0.80, 1.))
+    } else {
+        (hsla(hue, saturation, 0.92, 1.), hsla(hue, saturation, 0.24, 1.))
     }
-    .small()
-    .rounded_full()
 }
 
 /// The download's progress bar value and text for (downloaded, total) bytes
@@ -2529,6 +2612,20 @@ mod tests {
         assert!(!helper_showed("kdialog", None), "killed by a signal");
         assert!(helper_showed("notify-send", Some(0)));
         assert!(!helper_showed("notify-send", Some(1)), "no notification service");
+        assert!(helper_showed("gdbus", Some(0)));
+        assert!(!helper_showed("gdbus", Some(1)), "no notification service");
+    }
+
+    #[test]
+    fn without_notify_send_a_notification_goes_over_dbus_then_xmessage() {
+        let dialogs = error_dialogs("it's\nbroken");
+        let programs: Vec<_> = dialogs.iter().map(|(program, _)| *program).collect();
+        assert_eq!(programs, ["kdialog", "zenity", "notify-send", "gdbus", "xmessage"]);
+        let gdbus = &dialogs[3].1;
+        assert!(gdbus.windows(2).any(|w| w == ["--method", "org.freedesktop.Notifications.Notify"]));
+        assert!(gdbus.contains(&"'it\\'s\\nbroken'".to_string()), "{gdbus:?}");
+        assert_eq!(dialogs[4].1.last().map(String::as_str), Some("it's\nbroken"));
+        assert_eq!(gvariant_string("a\\b"), "'a\\\\b'");
     }
 
     #[test]
@@ -2537,6 +2634,28 @@ mod tests {
         assert!(gpu.contains("graphics driver") && gpu.contains("software renderer") && gpu.ends_with("Details: x"));
         let headless = no_window_message("x", false);
         assert!(headless.contains("no display") && !headless.contains("graphics driver"));
+    }
+
+    /// WCAG contrast ratio of two opaque colours.
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let luminance = |c: Hsla| {
+            let c = gpui_kit::Rgba::from(c);
+            let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+            0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+        };
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn branch_badges_are_readable_in_both_themes() {
+        for branch in [DriverBranch::Production, DriverBranch::NewFeature, DriverBranch::OlderProduction, DriverBranch::Legacy] {
+            for dark in [false, true] {
+                let (background, text) = branch_colors(branch, dark);
+                let ratio = contrast(background, text);
+                assert!(ratio >= 4.5, "{} badge, dark={dark}: contrast {ratio:.2}", branch.label());
+            }
+        }
     }
 
     #[test]
