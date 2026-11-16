@@ -360,6 +360,18 @@ fn fake(bin: &Path, name: &str, log: &Path, code: i32) {
     script_file(&bin.join(name), &format!("#!/bin/sh\n{{ echo \"== {name}\"; for a in \"$@\"; do echo \"$a\"; done; }} >> '{}'\nexit {code}\n", log.display()));
 }
 
+/// Links the system's mktemp and rm into `bin`, for libcheck_dialog's temporary file holding a
+/// dialog's stderr: the show tests run with only `bin` on PATH.
+fn dialog_tools(bin: &Path) {
+    for tool in ["mktemp", "rm"] {
+        let real = ["/usr/bin", "/bin"].into_iter().map(|dir| Path::new(dir).join(tool)).find(|path| path.exists()).expect(tool);
+        let link = bin.join(tool);
+        if !link.exists() {
+            std::os::unix::fs::symlink(real, link).unwrap();
+        }
+    }
+}
+
 #[test]
 fn without_zenity_kdialog_or_notify_send_the_message_goes_over_dbus() {
     // Pop!_OS COSMIC: no zenity, kdialog or notify-send, but gdbus and a notification service.
@@ -367,6 +379,7 @@ fn without_zenity_kdialog_or_notify_send_the_message_goes_over_dbus() {
     let log = dir.join("log");
     fake(&dir, "gdbus", &log, 0);
     fake(&dir, "xmessage", &log, 0);
+    dialog_tools(&dir);
     let script = format!("{}\nlibcheck_show 'Green Light' \"It's <missing>\"\n", block());
     let out = Command::new("/bin/bash")
         .args(["-c", &script])
@@ -397,6 +410,7 @@ fn when_no_notification_is_taken_xmessage_shows_the_message() {
     fake(&dir, "notify-send", &log, 1);
     fake(&dir, "gdbus", &log, 1);
     fake(&dir, "xmessage", &log, 0);
+    dialog_tools(&dir);
     let script = format!("{}\nlibcheck_show 'Green Light' 'Broken.'\n", block());
     let out = Command::new("/bin/bash")
         .args(["-c", &script])
@@ -450,6 +464,7 @@ fn a_zenity_that_cannot_open_the_display_does_not_count_as_shown() {
         &format!("#!/bin/sh\necho '== zenity' >> '{}'\necho '(zenity:1): Gtk-WARNING **: cannot open display: :0' >&2\nexit 1\n", log.display()),
     );
     fake(&dir, "gdbus", &log, 0);
+    dialog_tools(&dir);
     let script = format!("{}\nlibcheck_show 'Green Light' 'Broken.'\n", block());
     let out = Command::new("/bin/bash")
         .args(["-c", &script])
@@ -476,6 +491,44 @@ fn a_zenity_that_cannot_open_the_display_does_not_count_as_shown() {
     assert!(out.status.success());
     assert!(calls.starts_with("== zenity\n== gdbus\n"), "the next one shows it: {calls}");
     assert_eq!(closed, "== zenity\n");
+}
+
+#[test]
+fn a_dialog_that_leaves_a_process_holding_its_stderr_is_not_waited_for() {
+    // Reading a dialog's stderr through a pipe to its end would wait for the 5 s that process
+    // sleeps; and its complaint must still be read once the dialog has ended.
+    let dir = scratch("show-zenity-child");
+    let log = dir.join("log");
+    script_file(
+        &dir.join("zenity"),
+        &format!("#!/bin/sh\necho '== zenity' >> '{}'\necho 'cannot open display: :9999' >&2\nsleep 5 &\nexit 1\n", log.display()),
+    );
+    fake(&dir, "gdbus", &log, 0);
+    dialog_tools(&dir);
+    std::os::unix::fs::symlink(["/usr/bin/sleep", "/bin/sleep"].into_iter().find(|p| Path::new(p).exists()).expect("sleep"), dir.join("sleep")).unwrap();
+    let tmp = dir.join("tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    let script = format!("{}\nlibcheck_show 'Green Light' 'Broken.'\n", block());
+    let started = std::time::Instant::now();
+    let out = Command::new("/bin/bash")
+        .args(["-c", &script])
+        .env("PATH", &dir)
+        .env("TMPDIR", &tmp)
+        .env("DISPLAY", ":9999")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("LIBCHECK_DIALOG")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    let waited = started.elapsed();
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let left = std::fs::read_dir(&tmp).unwrap().count();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.success());
+    assert!(waited < std::time::Duration::from_secs(3), "{waited:?}");
+    assert!(calls.starts_with("== zenity\n== gdbus\n"), "the complaint was read: {calls}");
+    assert_eq!(left, 0, "the temporary file is removed");
 }
 
 #[test]

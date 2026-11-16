@@ -42,9 +42,9 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 - **It works while the NVIDIA driver is broken or missing.** The window is drawn with whatever works: the NVIDIA driver's Vulkan, or Mesa's software renderers (lavapipe for Vulkan, llvmpipe for OpenGL ES), which most desktops install by default (`mesa-vulkan-drivers` / `libegl-mesa0` on Debian and Ubuntu, `mesa-vulkan-drivers` / `mesa-libEGL` on Fedora, `vulkan-swrast` / `mesa` on Arch). So you can still reinstall a driver after a failed update or a kernel change left the old one unloadable. With no working renderer at all, Green Light says so in a desktop dialog instead of showing nothing
 - Kernel headers and DKMS, which the script installs for you if missing (`linux-headers`/`build-essential` on apt, `kernel-devel`/`kernel-headers` on dnf)
 
-Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver branch. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.
+Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, with drivers 615.78.08 and 620.70.06. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.
 
-Tested desktops: GNOME on Wayland and X11 (Xvfb) with the NVIDIA driver, lavapipe and llvmpipe. Earlier GTK releases were tested on KDE Plasma, Hyprland and COSMIC; the window is drawn the same way everywhere, so other Wayland and X11 desktops should work too.
+Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC (Wayland), and X11; with the NVIDIA driver and with software rendering only (lavapipe, llvmpipe). The window is drawn the same way everywhere, so other Wayland and X11 desktops should work too.
 
 ## Install
 
@@ -119,7 +119,7 @@ sudo ./privileged-install.sh --setup-signing
 - **The Log tab's text can't be selected with the mouse.** Copy Log copies all of it.
 - **The font is one your system already has** (Ubuntu, Adwaita Sans, Cantarell, Noto Sans or DejaVu Sans, whichever is found first), not necessarily the one your desktop is set to, and the window follows your desktop's light or dark setting but not its accent colour.
 - **Screen readers.** Buttons, rows and the text in dialogs are exposed, and notifications are announced. A dialog itself has no name: its title names the group that holds its content, where the keyboard focus goes when it opens. The window's minimise, maximise and close buttons and the two links in About are not exposed (close the window with your desktop's shortcut, such as Alt+F4). These are limits of the UI toolkit, GPUI Kit.
-- **Starting Green Light a second time** shows the window that is already open, without asking for a password again. On Wayland it comes to the front when the second start came from your launcher, dock or menu (GNOME shows a "Green Light is ready" notice instead, as it does for other apps); started from a terminal, the desktop only marks the window as wanting attention. If the open copy has stopped responding, the second start says so, with the PID to close.
+- **Starting Green Light a second time** shows the window that is already open, without asking for a password again. On Wayland it comes to the front when the second start came from your launcher, dock or menu (GNOME shows a "Green Light is ready" notice instead, as it does for other apps); started from a terminal, the desktop only marks the window as wanting attention. If the open copy is still starting, the second start says so, and its window appears when it is ready. If the open copy has stopped responding, the second start says so, with the PID to close.
 
 ## Logs and troubleshooting
 

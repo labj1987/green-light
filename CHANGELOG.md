@@ -5,6 +5,21 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.12.1 — 2026-11-16
+
+- **A second start no longer reports a copy that is still starting as stuck.** If Green Light is
+  still opening its window (a cold start with software rendering can take a while), a second start
+  now says so as information, and the window appears when it is ready. A copy that really does not
+  respond is still named, with its process number to close it by.
+- **Starting again right after closing works at once.** A start just as the previous window closes,
+  or after Green Light could not open its window, now opens a new window instead of waiting for the
+  old copy and calling it not responding.
+- A message shown without a window no longer waits for helper programs the dialog left running,
+  and a dialog that could not open is no longer taken as shown, so the message still comes as a
+  notification.
+- `GREEN_LIGHT_LOG` no longer shows two harmless warnings: the D-Bus library's "Failed to populate
+  properties cache", and the toolkit's "set_focus called more than once" with a screen reader.
+
 ## 2.12.0 — 2026-11-16
 
 - **Works while the NVIDIA driver is broken or missing.** Green Light now draws its own window instead

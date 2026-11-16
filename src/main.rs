@@ -3,6 +3,7 @@ mod branches;
 mod download;
 mod install;
 mod instance;
+mod notice;
 mod preflight;
 mod system;
 #[cfg(test)]
@@ -48,10 +49,20 @@ impl log::Log for StderrLog {
 const QUIET_CRATES: &[&str] =
     &["zbus", "zbus_names", "zvariant", "ashpd", "async_io", "polling", "calloop", "mio", "hyper", "hyper_util", "h2", "reqwest", "rustls", "tracing"];
 
+/// Modules whose warnings are harmless and say nothing the user can act on:
+/// only their errors are shown. zbus's proxy warns "Failed to populate
+/// properties cache" when a D-Bus service has no properties to give, and
+/// GPUI's accessibility tree that focus was set twice in one frame, which
+/// happens with a screen reader running.
+const ERRORS_ONLY: &[&str] = &["zbus::proxy", "gpui::window::a11y"];
+
 /// The most detailed level shown for messages from `target` (a module path).
 fn level_cap(target: &str) -> log::LevelFilter {
+    let within = |module: &&str| target.strip_prefix(*module).is_some_and(|rest| rest.is_empty() || rest.starts_with("::"));
     let krate = target.split("::").next().unwrap_or(target);
-    if QUIET_CRATES.contains(&krate) {
+    if ERRORS_ONLY.iter().any(within) {
+        log::LevelFilter::Error
+    } else if QUIET_CRATES.contains(&krate) {
         log::LevelFilter::Warn
     } else {
         log::LevelFilter::Trace
@@ -64,8 +75,18 @@ fn main() {
     let activations = match instance::claim() {
         instance::Claim::Primary(activations) => activations,
         instance::Claim::HandedOver => return,
+        // Still starting: it has the request and shows its window when it
+        // is up, so this is news, not an error.
+        instance::Claim::Starting(pid) => {
+            let message = instance::starting_message(pid);
+            eprintln!("green-light: {message}");
+            notice::show_info(&message);
+            return;
+        }
         instance::Claim::NotResponding(pid) => {
-            ui::show_error_without_window(&instance::not_responding_message(pid));
+            let message = instance::not_responding_message(pid);
+            eprintln!("green-light: {message}");
+            notice::show_error(&message);
             std::process::exit(1);
         }
     };
@@ -95,5 +116,17 @@ mod tests {
         assert_eq!(level_cap("gpui::platform"), LevelFilter::Trace, "the toolkit's renderer choice still shows");
         assert_eq!(level_cap("green_light::ui"), LevelFilter::Trace);
         assert_eq!(level_cap("zbusy"), LevelFilter::Trace, "whole crate names only");
+    }
+
+    #[test]
+    fn harmless_warnings_are_hidden_but_errors_show() {
+        // "Failed to populate properties cache" and a screen reader's double focus.
+        for target in ["zbus::proxy", "zbus::proxy::builder", "gpui::window::a11y"] {
+            assert!(Level::Warn > level_cap(target), "{target}");
+            assert!(Level::Error <= level_cap(target), "{target}");
+        }
+        assert_eq!(level_cap("zbus::proxyish"), LevelFilter::Warn, "whole module names only");
+        assert_eq!(level_cap("gpui::window"), LevelFilter::Trace, "the rest of the window's messages still show");
+        assert_eq!(level_cap("gpui::window::a11yx"), LevelFilter::Trace);
     }
 }
