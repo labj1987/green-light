@@ -7,3 +7,6 @@
 *.AppImage
 *.AppImage.zsync
 release-notes.md
+
+# Python bytecode
+__pycache__/

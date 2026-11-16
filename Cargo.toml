@@ -1,9 +1,9 @@
 [package]
 name = "green-light"
-version = "2.11.0"
+version = "2.12.0"
 edition = "2021"
 rust-version = "1.100"
-description = "Green Light — GTK4 GUI for installing NVIDIA drivers on Linux"
+description = "Green Light — a GUI for installing NVIDIA drivers on Linux"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"
 
@@ -12,10 +12,8 @@ name = "green-light"
 path = "src/main.rs"
 
 [dependencies]
-gtk4 = { version = "0.11", features = ["v4_12"] }
-libadwaita = { version = "0.9", features = ["v1_4", "v1_5"] }
-glib = "0.22"
-gio = "0.22"
+# The UI toolkit: GPUI Kit (GPUI + gpui-base + gpui-component + default icons).
+gpui-kit = "=0.9.1"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["stream"] }
 sha2 = "0.11"
@@ -25,6 +23,16 @@ scraper = "0.29"
 regex = "1"
 anyhow = "1"
 serde_json = "1"
+# The user's Downloads folder (XDG_DOWNLOAD_DIR from ~/.config/user-dirs.dirs).
+dirs = "6"
+libc = "0.2"
+log = "0.4"
+# Raising the window for a second launch (activation.rs): the request goes out on GPUI's own
+# Wayland connection, so these are the versions and the system-library backend GPUI uses.
+raw-window-handle = "0.6"
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 
 [profile.release]
 opt-level = 3

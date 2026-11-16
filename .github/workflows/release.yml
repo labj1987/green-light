@@ -98,14 +98,14 @@ jobs:
       - name: Toolchain matches rust-toolchain.toml
         run: grep -q '^channel = "1.100.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.100\.0 '
 
-      # The GTK headers the build needs and the packaging tools build-appimage.sh uses. This is
+      # The headers the UI toolkit needs at build time and the packaging tools build-appimage.sh uses. This is
       # the only privileged step: the AppImage build below runs as the runner user.
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq || true
-          sudo apt-get install -y -qq libgtk-4-dev libadwaita-1-dev pkg-config \
-            zsync wget file desktop-file-utils \
-            patchelf librsvg2-common dconf-gsettings-backend ibus-gtk4 libgdk-pixbuf2.0-bin gsettings-desktop-schemas
+          sudo apt-get install -y -qq build-essential pkg-config \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libfontconfig1-dev \
+            zsync wget file desktop-file-utils
 
       - name: Build AppImage
         run: bash build-appimage.sh

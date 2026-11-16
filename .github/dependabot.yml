@@ -18,9 +18,9 @@ updates:
     # Matches .cargo/config.toml (global-min-publish-age).
     cooldown:
       default-days: 3
-    # Indirect crates are included: a gtk-rs release has to move its -sys crates with it
-    # (gio 0.22.10 does not build against gio-sys 0.22.8), and a direct-only update leaves them
-    # behind. Patch and minor updates are grouped separately because Dependabot counts a 0.x
+    # Indirect crates are included: the UI toolkit is one direct dependency (gpui-kit, pinned
+    # to an exact version) over several hundred indirect ones, and a direct-only update would
+    # leave all of those behind. Patch and minor updates are grouped separately because Dependabot counts a 0.x
     # bump such as sha2 0.10 -> 0.11 as "minor" although it breaks the API: a breaking bump can
     # only fail the minor group, never the patch one. Major updates each get their own pull request.
     allow:

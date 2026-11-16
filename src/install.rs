@@ -58,7 +58,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 }
 
 fn command_stdout(cmd: &str, args: &[&str]) -> Option<String> {
-    let out = crate::host_env::command(cmd).args(args).output().ok()?;
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -169,6 +169,25 @@ impl LogTail {
     }
 }
 
+/// `command`, to be run in a session of its own, with no controlling
+/// terminal. An app started on a desktop that was started from a text console
+/// (Hyprland from tty1) has that console as its terminal; with no polkit
+/// agent running, pkexec would ask for the password there, on a console
+/// nobody sees, and wait for ever. Without one it fails at once with its
+/// "no agent" message. A running agent works as before: polkit goes by the
+/// login session, not the terminal.
+fn without_terminal(mut command: std::process::Command) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: setsid is async-signal-safe, and the closure touches nothing else.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command
+}
+
 /// Run `pkexec <args>` and pass the script's messages to `on_line` as they
 /// come. Without a terminal the script writes nothing to its stdout or
 /// stderr (a pipe to this app, which may be closed mid-install), only to its
@@ -177,7 +196,7 @@ impl LogTail {
 /// messages (from before the script starts) come on stderr.
 fn run_pkexec(args: &[String], stdin: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<ScriptRun> {
     let mut tail = LogTail::at_end(INSTALL_LOG);
-    let mut child = crate::host_env::command("pkexec")
+    let mut child = without_terminal(std::process::Command::new("pkexec"))
         .args(args)
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::null())
@@ -266,6 +285,7 @@ fn recover_result(code: Option<i32>, lines: &[String]) -> Result<Recovered> {
         Some(3) => Ok(Recovered::Restored),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
         Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
+        Some(127) if refused(lines) => bail!("{REFUSED_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         Some(4) => bail!(
             "The previous driver could not be fully restored{detail}. Don't reboot until a \
@@ -319,6 +339,7 @@ fn discard_result(code: Option<i32>, lines: &[String]) -> Result<()> {
         Some(0) => Ok(()),
         Some(126) => bail!("Authentication was cancelled; nothing was changed."),
         Some(127) if no_agent(lines) => bail!("{NO_AGENT_MESSAGE}"),
+        Some(127) if refused(lines) => bail!("{REFUSED_MESSAGE}"),
         Some(127) => bail!("Not authorized, or pkexec could not start the script; nothing was changed."),
         code => bail!("Discarding the recovery data failed (exit code {code:?}){}", first_error(lines).map(|e| format!(": {e}")).unwrap_or_default()),
     }
@@ -347,6 +368,14 @@ const NO_AGENT_TEXTS: [&str; 2] = [
 ];
 
 const NO_AGENT_MESSAGE: &str = "No polkit authentication agent is running (the program that shows the admin password dialog), so nothing was changed. Start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use hyprpolkitagent; on sway or i3 use polkit-gnome (policykit-1-gnome on Debian/Ubuntu) or lxqt-policykit.";
+
+/// pkexec's "Not authorized" (127): what polkit-kde-agent's Cancel gives, as
+/// well as a refusal; COSMIC's and GNOME's agents give 126 for Cancel.
+fn refused(lines: &[String]) -> bool {
+    lines.iter().any(|l| l.contains("Not authorized"))
+}
+
+const REFUSED_MESSAGE: &str = "Authentication was cancelled or refused; nothing was changed.";
 
 fn no_agent(lines: &[String]) -> bool {
     lines.iter().any(|l| NO_AGENT_TEXTS.iter().any(|t| l.contains(t)))
@@ -395,6 +424,7 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
     match code {
         Some(126) => "Authentication was cancelled; nothing was changed.".to_string(),
         Some(127) if no_agent(lines) => NO_AGENT_MESSAGE.to_string(),
+        Some(127) if refused(lines) => REFUSED_MESSAGE.to_string(),
         Some(127) => "Not authorized, or pkexec could not start the install script; nothing was changed.".to_string(),
         Some(1) => format!("The install stopped before changing anything{detail}"),
         Some(2) => format!("The install script refused to start{detail}"),
@@ -485,6 +515,7 @@ pub fn run_privileged_setup_signing(password: &str) -> SetupOutcome {
         Some(0) => Ok(()),
         Some(126) => Err(anyhow::anyhow!("Authentication was cancelled.")),
         Some(127) if no_agent(&run.lines) => Err(anyhow::anyhow!(NO_AGENT_MESSAGE)),
+        Some(127) if refused(&run.lines) => Err(anyhow::anyhow!(REFUSED_MESSAGE)),
         Some(127) => Err(anyhow::anyhow!("Not authorized, or pkexec could not start the script.")),
         code => Err(anyhow::anyhow!(
             "Signing setup failed{}",
@@ -500,6 +531,17 @@ mod tests {
 
     fn lines(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pkexec_runs_without_a_controlling_terminal() {
+        // In a session of its own: its session ID is its own PID, and it has no terminal.
+        let out = super::without_terminal(std::process::Command::new("sh")).args(["-c", "echo $$; cut -d' ' -f6,7 /proc/$$/stat"]).output().unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut lines = text.lines();
+        let pid = lines.next().unwrap();
+        let fields: Vec<&str> = lines.next().unwrap().split(' ').collect();
+        assert_eq!(fields, [pid, "0"], "session = own PID, tty_nr = 0");
     }
 
     #[test]
@@ -540,8 +582,18 @@ mod tests {
             assert!(msg.contains("No polkit authentication agent") && msg.contains("hyprpolkitagent"), "{msg}");
             assert!(!msg.contains("Not authorized"), "{msg}");
         }
-        // Other 127s keep the generic message, and the text only counts with 127.
-        assert!(install_failure(Some(127), &lines(&["Error executing command as another user: Not authorized"])).contains("Not authorized"));
+        // polkit-kde-agent's Cancel (127 "Not authorized") reads as a cancel, everywhere.
+        let kde = lines(&["Error executing command as another user: Not authorized", "", "This incident has been reported."]);
+        for msg in [
+            install_failure(Some(127), &kde),
+            recover_result(Some(127), &kde).unwrap_err().to_string(),
+            discard_result(Some(127), &kde).unwrap_err().to_string(),
+        ] {
+            assert_eq!(msg, "Authentication was cancelled or refused; nothing was changed.");
+        }
+        // Other 127s keep the generic message, and the texts only count with 127.
+        assert!(install_failure(Some(127), &[]).contains("Not authorized"));
+        assert!(!install_failure(Some(1), &kde).contains("cancelled"));
         assert!(!install_failure(Some(1), &err).contains("polkit authentication agent"));
     }
 

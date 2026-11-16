@@ -4,6 +4,7 @@ use crate::install::{
     check_run_file, install_running, recovery_note, recovery_pending, run_privileged_discard_recovery, run_privileged_install, run_privileged_recover,
     run_privileged_setup_signing, setup_problem, InstallOptions, Recovered, RecoveryNote, StaleRecovery,
 };
+use crate::instance::Activations;
 use crate::preflight::{
     conflict_summary, module_hint, secure_boot_advice, secure_boot_summary, signing_summary, validate_module_choice, validate_mok_password, ModuleChoice,
     MOK_PASSWORD_HINT,
@@ -11,18 +12,57 @@ use crate::preflight::{
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
 use crate::versions::{fetch_checksum, fetch_versions, is_sha256_hex, version_from_filename, DriverVersion};
 
-use gtk4::prelude::*;
-use gtk4::{
-    Align, Box as GtkBox, Button, FileDialog, Label, ListBox, Orientation, ProgressBar, ScrolledWindow, SelectionMode, Spinner, Stack, Switch, TextView,
-    WrapMode,
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::link::Link;
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::progress::Progress;
+use gpui_kit::component::radio::{Radio, RadioGroup};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::tag::Tag;
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Disableable as _, Icon, Root, Sizable as _, Theme, ThemeMode, ThemeRegistry, TitleBar, WindowExt as _,
 };
-use libadwaita::prelude::*;
-use libadwaita::{AboutDialog, ActionRow, Application, ApplicationWindow, Banner, ComboRow, HeaderBar, PreferencesGroup, Toast, ToastOverlay};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::{
+    accesskit, div, hsla, img, px, size, uniform_list, Anchor, AnyElement, App, AppContext as _, AssetSource, Bounds, ClipboardItem, Context, Div, Element,
+    ElementId, Entity, FocusHandle, Focusable as _, FontWeight, GlobalElementId, Hsla, Image, ImageFormat, InspectorElementId, InteractiveElement as _,
+    IntoElement, KeyDownEvent, LayoutId, MouseButton, ParentElement as _, PathPromptOptions, Pixels, Position, Render, Role, ScrollHandle, ScrollStrategy,
+    SharedString, Stateful, StatefulInteractiveElement as _, Style, Styled as _, Subscription, Task, Text, UniformListScrollHandle, Window, WindowBounds,
+    WindowDecorations, WindowOptions,
+};
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
+
+const WEBSITE: &str = "https://github.com/labj1987/green-light";
+const ISSUES: &str = "https://github.com/labj1987/green-light/issues";
+
+// GPUI Kit's component icons plus the one this app adds.
+gpui_kit::assets::icon_assets!(ExtraIcons, [RefreshCw]);
+
+pub struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(bytes) = ExtraIcons.load(path)? {
+            return Ok(Some(bytes));
+        }
+        gpui_kit::assets::Assets.load(path)
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(ExtraIcons.list(path)?);
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  App state
@@ -102,48 +142,58 @@ fn actions_enabled(s: &AppState) -> ActionsEnabled {
     }
 }
 
+type SharedState = Rc<RefCell<AppState>>;
+
 /// Holds the one running operation. Dropping it ends the operation, so a
 /// task that panics (and whose callback therefore never runs) can't leave
 /// every button disabled; `release` ends it early. It only ever ends its own
-/// operation, never one started after it.
+/// operation, never one started after it. The window redraws from the state,
+/// so ending it needs no more than the state change (the status poll redraws
+/// within two seconds when nothing else does).
 struct BusyGuard {
-    state: Rc<RefCell<AppState>>,
-    refresh: Rc<dyn Fn()>,
+    state: SharedState,
     token: u64,
+}
+
+thread_local! {
+    /// Releases that found the state borrowed; done by the next status poll.
+    static DEFERRED_RELEASES: RefCell<Vec<(SharedState, u64)>> = RefCell::default();
 }
 
 impl BusyGuard {
     /// Start `kind`, unless something is already running.
-    fn start(state: &Rc<RefCell<AppState>>, refresh: &Rc<dyn Fn()>, kind: Busy) -> Option<Rc<Self>> {
-        let token = {
-            let mut s = state.borrow_mut();
-            if s.busy.is_some() || s.external_install {
-                return None;
-            }
-            s.busy_token += 1;
-            s.busy = Some(kind);
-            s.busy_token
-        };
-        refresh();
-        Some(Rc::new(Self { state: state.clone(), refresh: refresh.clone(), token }))
+    fn start(state: &SharedState, kind: Busy) -> Option<Rc<Self>> {
+        let mut s = state.borrow_mut();
+        if s.busy.is_some() || s.external_install {
+            return None;
+        }
+        s.busy_token += 1;
+        s.busy = Some(kind);
+        Some(Rc::new(Self { state: state.clone(), token: s.busy_token }))
     }
 
     fn release(&self) {
-        let Ok(mut s) = self.state.try_borrow_mut() else {
-            // Called while the state is borrowed: finish on the next idle.
-            let (state, refresh, token) = (self.state.clone(), self.refresh.clone(), self.token);
-            glib::idle_add_local_once(move || {
-                BusyGuard { state, refresh, token }.release();
-            });
-            return;
-        };
-        if s.busy.is_none() || s.busy_token != self.token {
-            return;
-        }
-        s.busy = None;
-        s.download_cancel = None;
-        drop(s);
-        (self.refresh)();
+        end_busy(&self.state, self.token);
+    }
+}
+
+fn end_busy(state: &SharedState, token: u64) {
+    let Ok(mut s) = state.try_borrow_mut() else {
+        // Called while the state is borrowed: finish on the next poll.
+        DEFERRED_RELEASES.with(|d| d.borrow_mut().push((state.clone(), token)));
+        return;
+    };
+    if s.busy.is_none() || s.busy_token != token {
+        return;
+    }
+    s.busy = None;
+    s.download_cancel = None;
+}
+
+fn run_deferred_releases() {
+    let pending = DEFERRED_RELEASES.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for (state, token) in pending {
+        end_busy(&state, token);
     }
 }
 
@@ -154,26 +204,433 @@ impl Drop for BusyGuard {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Async bridge: run future on Tokio, deliver result to GTK main thread
+//  Async bridge: run a future on the shared Tokio runtime, deliver the result
+//  back on the UI thread, in the window it was started from.
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn spawn_async<F, T, CB>(future: F, callback: CB)
+fn spawn_async<F, T, CB>(window: &Window, cx: &App, future: F, callback: CB)
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
-    CB: FnOnce(T) + 'static,
+    CB: FnOnce(T, &mut Window, &mut App) + 'static,
 {
-    // The heavy future runs on the Tokio runtime; only the oneshot await
-    // (runtime-independent) runs on the glib main context. No polling.
     let (tx, rx) = tokio::sync::oneshot::channel::<T>();
     crate::runtime().spawn(async move {
         let _ = tx.send(future.await);
     });
-    glib::MainContext::default().spawn_local(async move {
-        if let Ok(val) = rx.await {
-            callback(val);
-        }
+    window
+        .spawn(cx, async move |cx| {
+            if let Ok(val) = rx.await {
+                let _ = cx.update(|window, cx| callback(val, window, cx));
+            }
+        })
+        .detach();
+}
+
+/// A message this long stays until it is closed; shorter ones go away on
+/// their own.
+const LONG_TOAST: usize = 120;
+
+/// A short message at the bottom of the window. Notifications show their
+/// text as plain text, so error text needs no escaping. Nothing is shown
+/// before the window has the toolkit's root view (pushing one earlier panics
+/// in the toolkit).
+fn toast(window: &mut Window, cx: &mut App, text: &str) {
+    if window.root::<Root>().flatten().is_none() {
+        eprintln!("green-light: not shown (the window is not up yet): {text}");
+        return;
+    }
+    window.push_notification(Notification::new().message(text.to_string()).placement(Anchor::BottomCenter).autohide(text.chars().count() <= LONG_TOAST), cx);
+    announce(text);
+    window.refresh();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Screen readers. GPUI reports an element to assistive technology only when
+//  it has an id and a role, so the text, dialog names and announcements below
+//  are spelled out; a bare string child is drawn but never read.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Text a screen reader can read (a label node holding the text).
+fn label(id: impl Into<ElementId>, text: impl Into<SharedString>) -> Text {
+    Text::new(id.into(), text.into())
+}
+
+/// GPUI Kit 0.9.1 gives a dialog no accessible name and has no way to set
+/// one, so everything in a dialog, its buttons included, sits in a group
+/// named after the title: a screen reader says the name when the keyboard
+/// focus moves into the group, which is when the dialog opens.
+fn named_group(id: impl Into<ElementId>, name: impl Into<SharedString>) -> Stateful<Div> {
+    v_flex().id(id.into()).role(Role::Group).aria_label(name).gap_3()
+}
+
+// Every dialog is opened with `.overlay(false)`: the toolkit's dimming layer
+// (0.9.1) also covers the invisible margin a client-decorated window keeps
+// around itself for its shadow, which shows as a dark frame around the
+// window on KDE and GNOME. Without it a dialog is as modal as with it (it
+// takes the input and the focus); gone are the dimming, click-outside-to-close
+// and dragging the window by its title bar or the dimmed area, for which the
+// dialog's own title stands in (`dialog_title`).
+
+/// The height a dialog's text may take before it scrolls. The toolkit cuts
+/// off a dialog that is taller than the window instead of scrolling it
+/// (0.9.1), which would take the buttons out of reach, so the part above
+/// the buttons gets what the window leaves after the dialog's margin, title
+/// and button row.
+fn dialog_room(window: &Window) -> Pixels {
+    (window.viewport_size().height - px(DIALOG_CHROME)).max(px(60.))
+}
+
+/// What a dialog needs of the window's height besides its text.
+const DIALOG_CHROME: f32 = 220.;
+
+/// A dialog's title, which is also the handle to move the window by: while a
+/// dialog is open the toolkit keeps the pointer off everything under it, the
+/// window's own title bar included.
+fn dialog_title(title: impl Into<SharedString>) -> impl IntoElement {
+    div().w_full().on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move()).child(label("title", title))
+}
+
+/// The button row at the bottom of a dialog.
+fn dialog_buttons() -> Div {
+    h_flex().justify_end().gap_2().pt_1()
+}
+
+/// What Enter does in a dialog. The toolkit hands Enter to the dialog (its
+/// "confirm") before the focused button sees it, so the dialog looks at
+/// where the focus is and acts as that button would: Enter on a button
+/// presses it, and Enter anywhere else (a field, the close button) decides
+/// nothing and leaves the dialog open.
+fn enter_key(focused: &[bool]) -> Option<usize> {
+    focused.iter().position(|&f| f)
+}
+
+thread_local! {
+    /// The newest notification, for `Announcer`.
+    static ANNOUNCEMENT: RefCell<SharedString> = RefCell::default();
+}
+
+/// Has the screen reader read `text` out (through the main window's `Announcer`).
+fn announce(text: &str) {
+    ANNOUNCEMENT.with(|current| {
+        let mut current = current.borrow_mut();
+        // The announcement is the change of the node's name, so the same
+        // message twice in a row needs a name that differs: an invisible
+        // zero-width space is added or dropped.
+        *current = if current.as_ref() == text { format!("{text}\u{200b}").into() } else { text.to_string().into() };
     });
+}
+
+/// A live region: an invisible node whose accessible name is the newest
+/// notification, marked "polite" so a screen reader reads each change out
+/// once it has finished speaking. GPUI Kit's own notifications are not
+/// announced (longbridge/gpui-kit issue 3659: no live regions).
+struct Announcer(SharedString);
+
+impl IntoElement for Announcer {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for Announcer {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some("announcer".into())
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn a11y_role(&self) -> Option<Role> {
+        Some(Role::Status)
+    }
+
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        node.set_live(accesskit::Live::Polite);
+        if !self.0.is_empty() {
+            node.set_label(self.0.to_string());
+        }
+    }
+
+    fn request_layout(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, window: &mut Window, cx: &mut App) -> (LayoutId, ()) {
+        // Out of the flow and with no size: it takes no room in the window.
+        let style = Style { position: Position::Absolute, ..Style::default() };
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), _: &mut Window, _: &mut App) {}
+
+    fn paint(&mut self, _: Option<&GlobalElementId>, _: Option<&InspectorElementId>, _: Bounds<Pixels>, _: &mut (), _: &mut (), _: &mut Window, _: &mut App) {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Dialogs
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How a dialog button looks.
+#[derive(Clone, Copy, PartialEq)]
+enum Look {
+    Plain,
+    /// The suggested action.
+    Primary,
+    /// An action that throws something away.
+    Danger,
+}
+
+/// A question with a row of buttons. The answer is the index of the button
+/// pressed; closing the dialog any other way (Escape, its close button) is
+/// the answer `dismiss`. `default` is the button that has the keyboard focus
+/// when it opens, so Enter and Space act on it.
+struct Choice {
+    id: &'static str,
+    title: SharedString,
+    body: SharedString,
+    buttons: Vec<(&'static str, &'static str, Look)>,
+    default: usize,
+    dismiss: usize,
+}
+
+type Answer = Box<dyn FnOnce(usize, &mut Window, &mut App)>;
+
+/// Shows `choice`; `on_answer` runs once, after the dialog is out of the way
+/// (so it may open the next one).
+fn show_choice(choice: Choice, on_answer: impl FnOnce(usize, &mut Window, &mut App) + 'static, window: &mut Window, cx: &mut App) {
+    let Choice { id, title, body, buttons, default, dismiss } = choice;
+    let slot: Rc<RefCell<Option<Answer>>> = Rc::new(RefCell::new(Some(Box::new(on_answer))));
+    let focus: Rc<Vec<FocusHandle>> = Rc::new(buttons.iter().map(|_| cx.focus_handle()).collect());
+    let first = Cell::new(true);
+    window.open_dialog(cx, move |dialog, window, cx| {
+        if first.replace(false) {
+            focus[default].focus(window, cx);
+        }
+        let answer = {
+            let slot = slot.clone();
+            move |index: usize, window: &mut Window, cx: &mut App| {
+                if let Some(callback) = slot.borrow_mut().take() {
+                    window.defer(cx, move |window, cx| callback(index, window, cx));
+                }
+            }
+        };
+        let enter = answer.clone();
+        let dismissed = answer.clone();
+        let enter_focus = focus.clone();
+        let row = buttons.iter().enumerate().fold(dialog_buttons(), |row, (index, &(button_id, text, look))| {
+            let answer = answer.clone();
+            row.child(
+                Button::new(button_id)
+                    .label(text)
+                    .track_focus(&focus[index])
+                    .map(|b| match look {
+                        Look::Plain => b,
+                        Look::Primary => b.primary(),
+                        Look::Danger => b.danger(),
+                    })
+                    .on_click(move |_, window, cx| {
+                        window.close_dialog(cx);
+                        answer(index, window, cx);
+                    }),
+            )
+        });
+        dialog
+            .title(dialog_title(title.clone()))
+            .overlay(false)
+            .w(px(440.))
+            // Enter: what the focused button says (see `enter_key`).
+            .on_ok(move |_, window, cx| {
+                let focused: Vec<bool> = enter_focus.iter().map(|f| f.is_focused(window)).collect();
+                match enter_key(&focused) {
+                    Some(index) => {
+                        enter(index, window, cx);
+                        true
+                    }
+                    None => false,
+                }
+            })
+            // Escape and the close button.
+            .on_close(move |_, window, cx| dismissed(dismiss, window, cx))
+            .child(
+                named_group(id, title.clone())
+                    .child(div().id("body").max_h(dialog_room(window)).overflow_y_scroll().child(label("text", body.clone())))
+                    .child(row),
+            )
+    });
+}
+
+/// A message the user has to see, in a dialog over the window.
+fn show_error(heading: &str, body: &str, window: &mut Window, cx: &mut App) {
+    show_choice(
+        Choice {
+            id: "error",
+            title: heading.to_string().into(),
+            body: body.to_string().into(),
+            buttons: vec![("error-close", "Close", Look::Plain)],
+            default: 0,
+            dismiss: 0,
+        },
+        |_, _, _| {},
+        window,
+        cx,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  No window at all
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The window is drawn with the GPU, so with no usable Vulkan or OpenGL ES
+/// driver (not even Mesa's software ones) there is nothing to draw an error
+/// in. Says so through whatever the desktop offers, then exits: a process
+/// left behind with no window would also keep later launches from starting.
+fn no_window(error: &str) -> ! {
+    let message = no_window_message(error, has_display());
+    show_error_without_window(&message);
+    std::process::exit(1);
+}
+
+fn has_display() -> bool {
+    ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
+/// Shows `message` with no window of the app's own: on stderr, and in the
+/// first of the desktop's dialog or notification programs that shows it.
+pub fn show_error_without_window(message: &str) {
+    eprintln!("green-light: {message}");
+    // With no display there is nowhere to show a dialog either.
+    if !has_display() {
+        return;
+    }
+    for (program, args) in error_dialogs(message) {
+        use std::process::Stdio;
+        let run = std::process::Command::new(program).args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output();
+        if run.is_ok_and(|out| helper_showed(program, out.status.code(), &String::from_utf8_lossy(&out.stderr))) {
+            break;
+        }
+    }
+}
+
+/// The programs tried, in order, to show an error when the app has no
+/// window, with their arguments. gdbus sends a notification straight over
+/// D-Bus, for desktops with a notification service but no notify-send (Pop!_OS
+/// COSMIC); xmessage is the last resort. Notifications have no expiry: COSMIC
+/// drops one with the default after a few seconds. kdialog and notification
+/// bodies take markup, so they get the plain text (no &, < or >); xmessage
+/// does not wrap, so its text is wrapped here.
+fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
+    let args = |fixed: &[&str]| fixed.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+    let with = |fixed: &[&str], text: String| {
+        let mut all = args(fixed);
+        all.push(text);
+        all
+    };
+    let plain = plain_text(message);
+    vec![
+        ("zenity", with(&["--error", "--no-markup", "--title=Green Light", "--width=480", "--text"], message.to_string())),
+        ("kdialog", with(&["--title", "Green Light", "--error"], plain.clone())),
+        ("notify-send", with(&["--urgency=critical", "--expire-time=0", "--app-name=Green Light", "Green Light"], plain.clone())),
+        (
+            "gdbus",
+            args(&[
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.Notifications",
+                "--object-path",
+                "/org/freedesktop/Notifications",
+                "--method",
+                "org.freedesktop.Notifications.Notify",
+                "'Green Light'",
+                "uint32 0",
+                "''",
+                "'Green Light'",
+                &gvariant_string(&plain),
+                "@as []",
+                "{'urgency': <byte 2>}",
+                "int32 0",
+            ]),
+        ),
+        ("xmessage", with(&["-center", "-title", "Green Light"], wrap(message, 80))),
+    ]
+}
+
+/// `text` with nothing kdialog (Qt rich text) or a notification server (body
+/// markup) would take as markup: no &, < or >. AppRun's libcheck_plain does the same.
+fn plain_text(text: &str) -> String {
+    text.replace('&', "and").replace('<', "‹").replace('>', "›")
+}
+
+/// `text` with its lines broken at spaces to at most `width` characters
+/// (a longer word stays whole), as `fold -s` does for AppRun's xmessage.
+fn wrap(text: &str, width: usize) -> String {
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split(' ') {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+            } else if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        out.push(line);
+    }
+    out.join("\n")
+}
+
+/// `text` as a GVariant text-format string, which is how gdbus takes its
+/// arguments.
+fn gvariant_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Whether `program`, having ended with exit `code`, did show the message, so
+/// the next one must not show it again. The dialogs end with 0 when the user
+/// pressed their button and 1 when the user closed them another way; both
+/// mean it was seen. Anything else (a crash, a signal) does not, nor does a
+/// dialog that could not open the display (zenity then also exits 1; `stderr`
+/// says so). notify-send and gdbus show nothing themselves: only 0 says the
+/// desktop took the message.
+fn helper_showed(program: &str, code: Option<i32>, stderr: &str) -> bool {
+    match program {
+        "notify-send" | "gdbus" => code == Some(0),
+        _ => matches!(code, Some(0 | 1)) && !["open display", "connect to display", "connect to X server"].iter().any(|text| stderr.contains(text)),
+    }
+}
+
+fn no_window_message(error: &str, has_display: bool) -> String {
+    if has_display {
+        format!(
+            "Green Light could not open its window: no working graphics driver was found \
+             (Vulkan or OpenGL ES). Green Light can draw with Mesa's software renderer when the \
+             NVIDIA driver is broken or missing: install it (mesa-vulkan-drivers on Debian, \
+             Ubuntu and Fedora; vulkan-swrast on Arch), then start Green Light again.\n\nDetails: {error}"
+        )
+    } else {
+        format!(
+            "Green Light could not open its window: there is no display to open it on \
+             (neither WAYLAND_DISPLAY nor DISPLAY is set). Start it from your desktop session.\
+             \n\nDetails: {error}"
+        )
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,1646 +660,1885 @@ fn compare_versions(installed: &str, candidate: &str) -> VersionRelation {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  build_ui
+//  Toolkit start-up and the window
 // ─────────────────────────────────────────────────────────────────────────────
 
-pub fn build_ui(app: &Application) {
-    let state = Rc::new(RefCell::new(AppState::default()));
+/// The families tried for the UI font, in the order GPUI itself falls back to them.
+const UI_FONTS: [&str; 9] = ["Ubuntu", "Adwaita Sans", "Cantarell", "Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial", "Helvetica", "FreeSans"];
 
-    // ── Window ───────────────────────────────────────────────────────────────
-    let window = ApplicationWindow::builder().application(app).title("Green Light").default_width(760).default_height(640).build();
+/// The families tried for fixed-width text (the Log tab), the toolkit's own
+/// default first.
+const MONO_FONTS: [&str; 10] = [
+    "DejaVu Sans Mono",
+    "Noto Sans Mono",
+    "Liberation Mono",
+    "Ubuntu Mono",
+    "Ubuntu Sans Mono",
+    "Adwaita Mono",
+    "Source Code Pro",
+    "Hack",
+    "FreeMono",
+    "Nimbus Mono PS",
+];
 
-    let toast_overlay = ToastOverlay::new();
+/// The first of `families` that is installed.
+fn first_installed(families: &[&'static str], installed: &[String]) -> Option<&'static str> {
+    families.iter().copied().find(|family| installed.iter().any(|name| name == family))
+}
 
-    // ── Header ───────────────────────────────────────────────────────────────
-    let header = HeaderBar::new();
-
-    let refresh_btn = Button::builder().icon_name("view-refresh-symbolic").tooltip_text("Refresh version list").build();
-    header.pack_start(&refresh_btn);
-
-    let about_btn = Button::builder().icon_name("help-about-symbolic").tooltip_text("About").build();
-    header.pack_end(&about_btn);
-
-    // Driver badge in header — always visible
-    let driver_badge = Label::new(Some("Driver: checking…"));
-    driver_badge.add_css_class("dim-label");
-    driver_badge.set_margin_start(8);
-    driver_badge.set_margin_end(8);
-    header.set_title_widget(Some(&driver_badge));
-
-    // ── Stack ────────────────────────────────────────────────────────────────
-    let stack = Stack::new();
-    stack.set_transition_type(gtk4::StackTransitionType::SlideLeftRight);
-    let switcher = gtk4::StackSwitcher::builder().stack(&stack).build();
-
-    // We'll replace the header title with the switcher after sysinfo loads
-    // For now driver_badge is the title — swapped below.
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE 1: System Info
-    // ═════════════════════════════════════════════════════════════════════════
-    let sysinfo_page = GtkBox::new(Orientation::Vertical, 12);
-    sysinfo_page.set_margin_top(12);
-    sysinfo_page.set_margin_bottom(12);
-    sysinfo_page.set_margin_start(12);
-    sysinfo_page.set_margin_end(12);
-
-    let hw_group = PreferencesGroup::builder().title("Hardware").build();
-    let gpu_row = ActionRow::builder().title("GPU").subtitle("Detecting…").build();
-    let driver_row = ActionRow::builder().title("Installed Driver").subtitle("Detecting…").build();
-    let module_row = ActionRow::builder().title("Kernel Module").subtitle("Detecting…").build();
-    let kernel_row = ActionRow::builder().title("Kernel").subtitle("Detecting…").build();
-    hw_group.add(&gpu_row);
-    hw_group.add(&driver_row);
-    hw_group.add(&module_row);
-    hw_group.add(&kernel_row);
-    sysinfo_page.append(&hw_group);
-
-    let status_group = PreferencesGroup::builder().title("Status").build();
-    let dkms_row = ActionRow::builder().title("DKMS Modules").subtitle("Checking…").build();
-    let secureboot_row = ActionRow::builder().title("Secure Boot").subtitle("Checking…").build();
-    let signing_row = ActionRow::builder().title("Module Signing").subtitle("Checking…").build();
-    signing_row.set_subtitle_lines(0);
-    let signing_btn = Button::builder()
-        .label("Set Up Signing")
-        .valign(Align::Center)
-        .sensitive(false)
-        .tooltip_text("Create or reuse this computer's module-signing key and enroll it")
-        .build();
-    signing_row.add_suffix(&signing_btn);
-    let disk_row = ActionRow::builder().title("Free Disk Space").subtitle("Checking…").build();
-    let reboot_row = ActionRow::builder().title("Reboot Required").subtitle("Checking…").build();
-    status_group.add(&dkms_row);
-    status_group.add(&secureboot_row);
-    status_group.add(&signing_row);
-    status_group.add(&disk_row);
-    status_group.add(&reboot_row);
-    sysinfo_page.append(&status_group);
-
-    let refresh_sysinfo_btn = Button::builder().label("Refresh System Info").halign(Align::Center).margin_top(8).build();
-    refresh_sysinfo_btn.add_css_class("flat");
-    sysinfo_page.append(&refresh_sysinfo_btn);
-
-    stack.add_titled(&sysinfo_page, Some("sysinfo"), "System");
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE 2: Browse
-    // ═════════════════════════════════════════════════════════════════════════
-    let browse_page = GtkBox::new(Orientation::Vertical, 0);
-
-    let banner = Banner::new("");
-    banner.set_revealed(false);
-    browse_page.append(&banner);
-
-    let search_bar = gtk4::SearchBar::new();
-    let search_entry = gtk4::SearchEntry::new();
-    search_entry.set_placeholder_text(Some("Filter versions…"));
-    search_bar.set_child(Some(&search_entry));
-    search_bar.set_show_close_button(false);
-    search_bar.set_search_mode(true);
-    browse_page.append(&search_bar);
-
-    let list_box = ListBox::new();
-    list_box.set_selection_mode(SelectionMode::Single);
-    list_box.add_css_class("boxed-list");
-    list_box.set_margin_top(8);
-    list_box.set_margin_bottom(8);
-    list_box.set_margin_start(12);
-    list_box.set_margin_end(12);
-    let scroll = ScrolledWindow::builder().vexpand(true).child(&list_box).build();
-    browse_page.append(&scroll);
-
-    let list_spinner = Spinner::new();
-    list_spinner.set_halign(Align::Center);
-    list_spinner.set_size_request(48, 48);
-    browse_page.append(&list_spinner);
-
-    let selected_label = Label::builder().label("No version selected").margin_top(4).margin_bottom(4).build();
-    selected_label.add_css_class("dim-label");
-    browse_page.append(&selected_label);
-
-    let browse_bar = gtk4::ActionBar::new();
-    let open_file_btn = Button::builder().label("Open .run File…").tooltip_text("Use a locally downloaded .run file").build();
-    open_file_btn.add_css_class("flat");
-    let download_btn = Button::builder().label("Download").sensitive(false).build();
-    download_btn.add_css_class("suggested-action");
-    browse_bar.pack_start(&open_file_btn);
-    browse_bar.pack_end(&download_btn);
-    browse_page.append(&browse_bar);
-
-    stack.add_titled(&browse_page, Some("browse"), "Browse");
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE 3: Configure & Install
-    // ═════════════════════════════════════════════════════════════════════════
-    let config_page = GtkBox::new(Orientation::Vertical, 12);
-    config_page.set_margin_top(12);
-    config_page.set_margin_bottom(12);
-    config_page.set_margin_start(12);
-    config_page.set_margin_end(12);
-
-    let file_group = PreferencesGroup::builder().title("Selected Driver").build();
-    let file_row = ActionRow::builder().title("No file selected").subtitle("Go to Browse tab to select or download a driver").build();
-    let checksum_row = ActionRow::builder().title("Checksum").subtitle("—").build();
-    let version_status_row = ActionRow::builder().title("Version Status").subtitle("—").build();
-    file_group.add(&file_row);
-    file_group.add(&checksum_row);
-    file_group.add(&version_status_row);
-    config_page.append(&file_group);
-
-    // Warnings group (disk, secure boot)
-    let warn_group = PreferencesGroup::builder().title("Pre-install Checks").build();
-    let disk_warn_row = ActionRow::builder().title("Disk Space").subtitle("—").build();
-    let sb_warn_row = ActionRow::builder().title("Secure Boot").subtitle("—").build();
-    let pkg_warn_row = ActionRow::builder().title("Existing Driver Packages").subtitle("—").build();
-    for row in [&disk_warn_row, &sb_warn_row, &pkg_warn_row] {
-        row.set_subtitle_lines(0);
+/// Starts the toolkit, with installed families as its fonts. Left alone, the
+/// theme asks for GPUI's "system UI font", a family no Linux desktop ships,
+/// and for a fixed-width family that many lack; GPUI and the toolkit then
+/// log warnings and fall back to the first family they find. Naming those
+/// up front gives the same text and no warnings.
+pub fn init(cx: &mut App) {
+    let installed = cx.text_system().all_font_names();
+    let ui_font = first_installed(&UI_FONTS, &installed);
+    if let Some(ui_font) = ui_font {
+        // The toolkit keeps a theme that is already there, and families set
+        // on it are used as they are.
+        let mut theme = Theme::default();
+        theme.font_family = ui_font.into();
+        theme.mono_font_family = first_installed(&MONO_FONTS, &installed).unwrap_or(ui_font).into();
+        cx.set_global(theme);
     }
-    warn_group.add(&disk_warn_row);
-    warn_group.add(&sb_warn_row);
-    warn_group.add(&pkg_warn_row);
-    config_page.append(&warn_group);
+    gpui_kit::init(cx);
+    if ui_font.is_some() {
+        // What the toolkit does for a theme it creates itself: its light and
+        // dark colours, then the mode.
+        let registry = ThemeRegistry::global(cx);
+        let light = registry.default_light_theme().clone();
+        let dark = registry.default_dark_theme().clone();
+        let theme = Theme::global_mut(cx);
+        theme.light_theme = light;
+        theme.dark_theme = dark;
+        Theme::change(ThemeMode::Light, None, cx);
+    }
+}
 
-    let opts_group = PreferencesGroup::builder().title("Install Options").build();
+pub fn build_ui(cx: &mut App, mut activations: Activations) {
+    // With no display GPUI would run on with no window and no word about it.
+    if ["WAYLAND_DISPLAY", "DISPLAY"].into_iter().all(|name| std::env::var_os(name).is_none_or(|value| value.is_empty())) {
+        no_window("no display server to connect to");
+    }
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::centered(size(px(760.), px(640.)), cx)),
+        window_min_size: Some(size(px(560.), px(420.))),
+        app_id: Some(crate::APP_ID.to_string()),
+        // The app draws its own title bar, so it looks and works the same on
+        // every desktop, including compositors with no server-side decorations.
+        window_decorations: Some(WindowDecorations::Client),
+        ..TitleBar::window_options()
+    };
+    let opened = gpui_kit::open_window(options, cx, |window, cx| {
+        window.set_window_title("Green Light");
+        // Follow the desktop's light/dark preference, now and when it changes.
+        Theme::sync_system_appearance(Some(window), cx);
+        window
+            .observe_window_appearance(|window, cx| {
+                Theme::sync_system_appearance(Some(window), cx);
+            })
+            .detach();
+        cx.new(|cx| MainView::new(window, cx))
+    });
+    let (window, view) = match opened {
+        Ok(opened) => opened,
+        Err(e) => no_window(&format!("{e:#}")),
+    };
+    // The first loads, now that the window can show what went wrong.
+    let _ = window.update(cx, |_, window, cx| {
+        view.update(cx, |view, cx| view.start(window, cx));
+        // Closing by the desktop (Alt+F4, the window list): the same question
+        // as the title bar's close button.
+        let state = view.read(cx).state.clone();
+        let allow_close = view.read(cx).allow_close.clone();
+        window.on_window_should_close(cx, move |window, cx| close_allowed(&state, &allow_close, window, cx));
+    });
 
-    let dkms_opt_row = ActionRow::builder().title("Enable DKMS").subtitle("Automatically rebuild kernel module on kernel updates").build();
-    let dkms_switch = Switch::builder().valign(Align::Center).active(true).build();
-    dkms_opt_row.add_suffix(&dkms_switch);
-    dkms_opt_row.set_activatable_widget(Some(&dkms_switch));
-
-    let block_opt_row = ActionRow::builder().title("Block Distro Driver Packages").subtitle(BLOCK_SUBTITLE).build();
-    block_opt_row.set_subtitle_lines(0);
-    let block_switch = Switch::builder().valign(Align::Center).build();
-    block_opt_row.add_suffix(&block_switch);
-    block_opt_row.set_activatable_widget(Some(&block_switch));
-
-    let module_combo = ComboRow::builder()
-        .title("Kernel Module")
-        .subtitle("Automatic: the installer picks from the detected GPUs")
-        .model(&gtk4::StringList::new(&["Automatic (recommended)", "Open", "Proprietary"]))
-        .build();
-
-    opts_group.add(&dkms_opt_row);
-    opts_group.add(&module_combo);
-    opts_group.add(&block_opt_row);
-    config_page.append(&opts_group);
-
-    let progress = ProgressBar::new();
-    progress.set_show_text(true);
-    progress.set_text(Some(""));
-    progress.set_visible(false);
-    config_page.append(&progress);
-
-    // Download + cancel buttons in an hbox
-    let dl_cancel_box = GtkBox::new(Orientation::Horizontal, 8);
-    dl_cancel_box.set_halign(Align::Center);
-    dl_cancel_box.set_margin_top(8);
-
-    let install_btn = Button::builder().label("Install Driver").sensitive(false).build();
-    install_btn.add_css_class("pill");
-    install_btn.add_css_class("suggested-action");
-
-    let cancel_dl_btn = Button::builder().label("Cancel Download").visible(false).build();
-    cancel_dl_btn.add_css_class("pill");
-    cancel_dl_btn.add_css_class("destructive-action");
-
-    dl_cancel_box.append(&install_btn);
-    dl_cancel_box.append(&cancel_dl_btn);
-    config_page.append(&dl_cancel_box);
-
-    stack.add_titled(&config_page, Some("configure"), "Configure");
-
-    // ═════════════════════════════════════════════════════════════════════════
-    //  PAGE 4: Log
-    // ═════════════════════════════════════════════════════════════════════════
-    let log_page = GtkBox::new(Orientation::Vertical, 0);
-    let log_view = TextView::builder().editable(false).monospace(true).wrap_mode(WrapMode::Word).vexpand(true).build();
-    log_view.add_css_class("card");
-    log_view.set_margin_top(8);
-    log_view.set_margin_bottom(8);
-    log_view.set_margin_start(8);
-    log_view.set_margin_end(8);
-    let log_scroll = ScrolledWindow::builder().vexpand(true).child(&log_view).build();
-    let clear_btn = Button::builder().label("Clear Log").halign(Align::End).margin_end(8).margin_bottom(8).build();
-    clear_btn.add_css_class("flat");
-    log_page.append(&log_scroll);
-    log_page.append(&clear_btn);
-    stack.add_titled(&log_page, Some("log"), "Log");
-
-    // ── Assemble window ───────────────────────────────────────────────────────
-    // Now set the switcher as header title
-    header.set_title_widget(Some(&switcher));
-
-    let content = GtkBox::new(Orientation::Vertical, 0);
-    content.append(&header);
-
-    // AppRun's launch-time setup failed or was cancelled: say why (the install
-    // script may not be in place, and the actions that need it would fail).
-    let setup_banner = Banner::new("");
-    match setup_problem() {
-        Some(text) => {
-            setup_banner.set_title(&text);
-            setup_banner.set_revealed(true);
+    cx.on_window_closed(|cx, _| {
+        if cx.windows().is_empty() {
+            cx.quit();
         }
-        None => setup_banner.set_revealed(false),
+    })
+    .detach();
+
+    // A second launch asks this one to show its window, with the activation
+    // token the desktop gave that launch when there is one: on Wayland only
+    // that raises the window (see activation.rs). Without a token, or off
+    // Wayland, GPUI's own request is what there is; a Wayland compositor then
+    // marks the window as wanting attention instead of raising it.
+    cx.spawn(async move |cx| {
+        // From here on requests are handled: later launches get "ok" without
+        // being told this copy is still starting.
+        activations.ui_up();
+        while let Some(request) = activations.recv().await {
+            let shown = window.update(cx, |_, window, _| {
+                let raised = request.token.as_deref().is_some_and(|token| crate::activation::activate(window, token));
+                if !raised {
+                    window.activate_window();
+                }
+            });
+            // The launch that asked waits for this; without it, it reports
+            // this copy as not responding.
+            if shown.is_ok() {
+                request.done();
+            }
+        }
+    })
+    .detach();
+}
+
+/// Closing the window doesn't stop a running install (it carries on, or puts
+/// the previous driver back, on its own), but the user must not take the
+/// closed window as "done" and reboot. True when the window may close now;
+/// otherwise the question is asked, and its Close Anyway closes it.
+fn close_allowed(state: &SharedState, allow_close: &Rc<Cell<bool>>, window: &mut Window, cx: &mut App) -> bool {
+    let busy = state.borrow().busy;
+    if allow_close.get() || !matches!(busy, Some(Busy::Install) | Some(Busy::Signing)) {
+        return true;
     }
-    content.append(&setup_banner);
-
-    // Reboot required banner — shown at top of every page when relevant
-    let reboot_banner = Banner::new("A reboot is required to activate the new driver.");
-    reboot_banner.set_revealed(false);
-    content.append(&reboot_banner);
-
-    let running_banner = Banner::new(
-        "A driver install started earlier is still running. Don't reboot until it finishes; \
-         its progress is in /var/log/green-light.log.",
+    let allow_close = allow_close.clone();
+    show_choice(
+        Choice {
+            id: "close-question",
+            title: "The install is still running".into(),
+            body: "Closing Green Light doesn't stop it: the install finishes, or puts the \
+                   previous driver back, on its own. Its progress is in \
+                   /var/log/green-light.log. Don't reboot until that log says it is done."
+                .into(),
+            buttons: vec![("close-keep", "Keep Open", Look::Plain), ("close-anyway", "Close Anyway", Look::Danger)],
+            default: 0,
+            dismiss: 0,
+        },
+        move |answer, window, _| {
+            if answer == 1 {
+                allow_close.set(true);
+                window.remove_window();
+            }
+        },
+        window,
+        cx,
     );
-    running_banner.set_revealed(false);
-    content.append(&running_banner);
+    false
+}
 
-    // An install was cut off (power loss, crash) and left its journal. The
-    // banner's text and action follow the script's note (see the timer below).
-    let recover_banner = Banner::new(RECOVER_TEXT);
-    recover_banner.set_button_label(Some("Restore Previous Driver"));
-    recover_banner.set_revealed(false);
-    content.append(&recover_banner);
-    // The banner's button discards the data instead of restoring from it.
-    let recover_discards = Rc::new(std::cell::Cell::new(false));
+// ─────────────────────────────────────────────────────────────────────────────
+//  The main window
+// ─────────────────────────────────────────────────────────────────────────────
 
-    content.append(&stack);
-    toast_overlay.set_child(Some(&content));
-    window.set_content(Some(&toast_overlay));
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Page {
+    System,
+    Browse,
+    Configure,
+    Log,
+}
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Helpers
-    // ─────────────────────────────────────────────────────────────────────────
+const PAGES: [(Page, &str); 4] = [(Page::System, "System"), (Page::Browse, "Browse"), (Page::Configure, "Configure"), (Page::Log, "Log")];
 
-    let log_fn: Rc<dyn Fn(String)> = {
-        let log_view = log_view.clone();
-        Rc::new(move |msg: String| {
-            let buf = log_view.buffer();
-            let mut end = buf.end_iter();
-            buf.insert(&mut end, &format!("{}\n", msg));
-            // One mark, moved to the end: a new one per line would stay in the buffer for good.
-            let mark = buf.mark("log-end").unwrap_or_else(|| buf.create_mark(Some("log-end"), &buf.end_iter(), false));
-            buf.move_mark(&mark, &buf.end_iter());
-            log_view.scroll_to_mark(&mark, 0.0, false, 0.0, 0.0);
-        })
-    };
+enum ListStatus {
+    Loading,
+    Failed(String),
+    Loaded,
+}
 
-    // Button sensitivity, from the state; call after every change to it.
-    let refresh_actions: Rc<dyn Fn()> = {
-        let state = state.clone();
-        let download_btn = download_btn.clone();
-        let open_file_btn = open_file_btn.clone();
-        let install_btn = install_btn.clone();
-        let signing_btn = signing_btn.clone();
-        Rc::new(move || {
-            let a = actions_enabled(&state.borrow());
-            download_btn.set_sensitive(a.download);
-            open_file_btn.set_sensitive(a.open_file);
-            install_btn.set_sensitive(a.install);
-            signing_btn.set_sensitive(a.setup_signing);
-            // Nothing to set up once the key is enrolled or queued: hide the
-            // button rather than leave an action that looks needed.
-            let s = state.borrow();
-            signing_btn.set_visible(!s.sysinfo_loaded || s.sysinfo.signing_key.setup_needed());
-        })
-    };
+/// The progress bar of the Configure tab.
+#[derive(Default)]
+struct ProgressBar {
+    visible: bool,
+    /// 0.0 to 1.0; `None` is an activity animation (size unknown, or an
+    /// install, whose length nobody knows).
+    fraction: Option<f32>,
+    text: String,
+}
 
-    let update_config_tab: Rc<dyn Fn()> = {
-        let file_row = file_row.clone();
-        let checksum_row = checksum_row.clone();
-        let version_status_row = version_status_row.clone();
-        let disk_warn_row = disk_warn_row.clone();
-        let sb_warn_row = sb_warn_row.clone();
-        let pkg_warn_row = pkg_warn_row.clone();
-        let module_combo = module_combo.clone();
-        let refresh_actions = refresh_actions.clone();
-        let state = state.clone();
-        Rc::new(move || {
-            let s = state.borrow();
+/// The banner for recovery data an interrupted install left: its text and
+/// button follow the install script's note.
+struct RecoverBanner {
+    text: String,
+    button: &'static str,
+    /// The button asks whether to retry or discard instead of restoring.
+    discards: bool,
+}
 
-            // File info
-            if let Some(path) = &s.downloaded_path {
-                let fname = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
-                file_row.set_title(&fname);
-                file_row.set_subtitle(path.as_str());
-                if let Some(cs) = s.expected_checksum.as_deref().filter(|c| is_sha256_hex(c)) {
-                    checksum_row.set_subtitle(&format!("SHA256: {}… (verified)", &cs[..16]));
-                } else {
-                    checksum_row.set_subtitle("No checksum available");
-                }
-                // Version comparison
-                let parsed = version_from_filename(&fname);
-                if parsed.is_none() {
-                    // e.g. NVIDIA-Linux-x86_64-595.84-vulkan.run — don't guess.
-                    version_status_row.set_subtitle("Unknown");
-                } else if let (Some(inst), Some(candidate)) = (s.sysinfo.installed_driver.as_ref(), parsed.as_deref()) {
-                    match compare_versions(inst, candidate) {
-                        VersionRelation::Newer => version_status_row.set_subtitle(&format!("Upgrade: {} → {}", inst, candidate)),
-                        VersionRelation::Same => version_status_row.set_subtitle(&format!("Reinstall: same version ({})", inst)),
-                        VersionRelation::Older => version_status_row.set_subtitle(&format!("Downgrade: {} → {}", inst, candidate)),
-                        VersionRelation::Unknown => version_status_row.set_subtitle("—"),
-                    }
-                } else {
-                    version_status_row.set_subtitle("No driver currently installed");
-                }
-            } else {
-                file_row.set_title("No file selected");
-                file_row.set_subtitle("Go to Browse tab to select or download a driver");
-                checksum_row.set_subtitle("—");
-                version_status_row.set_subtitle("—");
+pub struct MainView {
+    state: SharedState,
+    page: Page,
+    list_status: ListStatus,
+    filter: Entity<InputState>,
+    list_scroll: UniformListScrollHandle,
+    /// The system info is being read (again).
+    sysinfo_refreshing: bool,
+    progress: ProgressBar,
+    log: Vec<SharedString>,
+    log_scroll: ScrollHandle,
+    /// AppRun's launch-time setup failed or was cancelled: why.
+    setup_problem: Option<String>,
+    recover: Option<RecoverBanner>,
+    allow_close: Rc<Cell<bool>>,
+    /// Holds the keyboard focus until a control takes it, so Tab and the
+    /// other keys work from the moment the window opens.
+    focus_handle: FocusHandle,
+    _poll: Task<()>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl MainView {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter versions…"));
+        let subscription = cx.subscribe_in(&filter, window, |this, _, event: &InputEvent, _, cx| {
+            if let InputEvent::Change = event {
+                this.filter_changed(cx);
             }
-
-            // Disk check
-            match s.sysinfo.free_disk_bytes {
-                Some(free) if free < MIN_DISK_BYTES => {
-                    disk_warn_row.set_subtitle(&format!("Low: {} free (2 GB recommended)", format_bytes(free)));
+        });
+        // Every two seconds: an install that outlived an earlier window, and
+        // recovery data an interrupted one left. The checks touch the file
+        // system, so they run off the UI thread.
+        let poll = cx.spawn_in(window, async move |this, cx| loop {
+            let checked = crate::runtime()
+                .spawn_blocking(|| {
+                    let pending = recovery_pending();
+                    let note = if pending { recovery_note() } else { None };
+                    (pending, note, install_running())
+                })
+                .await;
+            if let Ok((pending, note, running)) = checked {
+                if this.update_in(cx, |this, window, cx| this.status_checked(pending, note, running, window, cx)).is_err() {
+                    break;
                 }
-                Some(free) => {
-                    disk_warn_row.set_subtitle(&format!("{} free", format_bytes(free)));
-                }
-                None => disk_warn_row.set_subtitle("Could not determine"),
             }
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+        });
+        let view = Self {
+            state: Rc::new(RefCell::new(AppState::default())),
+            page: Page::System,
+            list_status: ListStatus::Loading,
+            filter,
+            list_scroll: UniformListScrollHandle::new(),
+            sysinfo_refreshing: false,
+            progress: ProgressBar::default(),
+            log: Vec::new(),
+            log_scroll: ScrollHandle::new(),
+            setup_problem: setup_problem(),
+            recover: None,
+            allow_close: Rc::new(Cell::new(false)),
+            focus_handle: cx.focus_handle(),
+            _poll: poll,
+            _subscriptions: vec![subscription],
+        };
+        view.focus_handle.focus(window, cx);
+        view
+    }
 
-            // Secure boot check
-            match &s.sysinfo.secure_boot {
-                SecureBootStatus::Enabled => sb_warn_row.set_subtitle(
-                    &secure_boot_advice(&s.sysinfo.secure_boot, &s.sysinfo.signing_key, s.sysinfo.signing_pair.as_ref(), s.use_dkms)
-                        .unwrap_or_else(|| "Enabled".to_string()),
-                ),
-                SecureBootStatus::Disabled => sb_warn_row.set_subtitle("Disabled"),
-                SecureBootStatus::Unknown => sb_warn_row.set_subtitle("Unknown"),
-            }
+    /// The first loads, run by `build_ui` once the window is up.
+    fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_sysinfo(window, cx);
+        self.load_versions(window, cx);
+    }
 
-            // Distro driver packages the install will remove
-            pkg_warn_row.set_subtitle(&conflict_summary(&s.sysinfo.distro_packages).unwrap_or_else(|| "None found".to_string()));
+    fn log(&mut self, msg: impl Into<String>, cx: &mut Context<Self>) {
+        self.log.push(msg.into().into());
+        self.log_scroll.scroll_to_bottom();
+        cx.notify();
+    }
 
-            // Kernel module flavor hint for the detected GPUs
-            module_combo.set_subtitle(&module_hint(&s.sysinfo.gpu_compute_caps));
-            drop(s);
-            refresh_actions();
-        })
-    };
+    // ── System info ──────────────────────────────────────────────────────────
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Load system info
-    // ─────────────────────────────────────────────────────────────────────────
+    fn load_sysinfo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sysinfo_refreshing = true;
+        self.log("Querying system info…", cx);
+        let view = cx.weak_entity();
+        spawn_async(window, cx, async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() }, move |info, _, cx| {
+            let _ = view.update(cx, |this, cx| this.sysinfo_loaded(info, cx));
+        });
+    }
 
-    let load_sysinfo = {
-        let gpu_row = gpu_row.clone();
-        let driver_row = driver_row.clone();
-        let module_row = module_row.clone();
-        let kernel_row = kernel_row.clone();
-        let dkms_row = dkms_row.clone();
-        let secureboot_row = secureboot_row.clone();
-        let signing_row = signing_row.clone();
-        let disk_row = disk_row.clone();
-        let reboot_row = reboot_row.clone();
-        let reboot_banner = reboot_banner.clone();
-        let driver_badge = driver_badge.clone();
-        let state = state.clone();
-        let update_config_tab = update_config_tab.clone();
-        let log_fn = log_fn.clone();
-        let list_box = list_box.clone();
-        let search_entry = search_entry.clone();
-        let block_switch = block_switch.clone();
-        let block_opt_row = block_opt_row.clone();
-
-        move || {
-            gpu_row.set_subtitle("Detecting…");
-            driver_row.set_subtitle("Detecting…");
-            log_fn("Querying system info…".to_string());
-
-            let log_fn = log_fn.clone();
-            let gpu_row = gpu_row.clone();
-            let driver_row = driver_row.clone();
-            let module_row = module_row.clone();
-            let kernel_row = kernel_row.clone();
-            let dkms_row = dkms_row.clone();
-            let secureboot_row = secureboot_row.clone();
-            let signing_row = signing_row.clone();
-            let disk_row = disk_row.clone();
-            let reboot_row = reboot_row.clone();
-            let reboot_banner = reboot_banner.clone();
-            let driver_badge = driver_badge.clone();
-            let state = state.clone();
-            let update_config_tab = update_config_tab.clone();
-            let list_box = list_box.clone();
-            let search_entry = search_entry.clone();
-            let block_switch = block_switch.clone();
-            let block_opt_row = block_opt_row.clone();
-
-            spawn_async(async move { tokio::task::spawn_blocking(query_system).await.unwrap_or_default() }, move |info| {
-                // GPU
-                gpu_row.set_subtitle(info.gpu_name.as_deref().unwrap_or("Not detected"));
-
-                // Driver
-                if let Some(ref ver) = info.installed_driver {
-                    driver_row.set_subtitle(ver.as_str());
-                    driver_badge.set_label(&format!("Driver: {}", ver));
-                    log_fn(format!("Installed driver: {}", ver));
-                } else {
-                    driver_row.set_subtitle("Not installed");
-                    driver_badge.set_label("Driver: not installed");
-                    log_fn("No NVIDIA driver detected".to_string());
-                }
-
-                // Kernel module flavor (loaded) and GPU generation
-                let gens = if info.gpu_compute_caps.is_empty() {
-                    String::new()
-                } else {
-                    let mut g: Vec<&str> = info.gpu_compute_caps.iter().map(|c| crate::preflight::generation_name(*c)).collect();
-                    g.dedup();
-                    format!(" ({})", g.join(", "))
-                };
-                module_row.set_subtitle(&format!("{}{}", info.module_flavor, gens));
-
-                // Kernel
-                kernel_row.set_subtitle(&info.kernel_version);
-
-                // DKMS
-                if info.dkms_status.is_empty() {
-                    dkms_row.set_subtitle("No NVIDIA DKMS modules registered");
-                } else {
-                    let summary =
-                        info.dkms_status.iter().map(|e| format!("{}/{} [{}] {}", e.module, e.version, e.kernel, e.status)).collect::<Vec<_>>().join("\n");
-                    dkms_row.set_subtitle(&summary);
-                }
-
-                // Secure boot
-                secureboot_row.set_subtitle(&secure_boot_summary(&info.secure_boot, &info.signing_key));
-
-                // Module signing: key state, installed module's signer
-                let mut signing_text = signing_summary(&info.signing_key, &info.module_signature);
-                if info.signing_pair.as_ref().is_some_and(|p| p.key_hidden) {
-                    signing_text.push_str("\nIts private key is readable only by root, so it is checked during the install.");
-                }
-                signing_row.set_subtitle(&signing_text);
-
-                // Disk
-                match info.free_disk_bytes {
-                    Some(free) => disk_row.set_subtitle(&format!("{} free on /", format_bytes(free))),
-                    None => disk_row.set_subtitle("Could not determine"),
-                }
-
-                // Reboot
-                if info.reboot_required {
-                    reboot_row.set_subtitle("Yes — new driver installed, reboot to activate");
-                    reboot_banner.set_revealed(true);
-                } else {
-                    reboot_row.set_subtitle("No");
-                    reboot_banner.set_revealed(false);
-                }
-
-                // The block option shows what is in place now: leaving it
-                // on keeps an existing block, turning it off removes it.
-                block_switch.set_active(info.distro_driver_blocked);
-                block_switch.set_sensitive(info.block_supported);
-                block_opt_row.set_subtitle(if info.block_supported {
-                    BLOCK_SUBTITLE
-                } else {
-                    "Not available here: this dnf has no way to exclude packages for good"
-                });
-
-                {
-                    let mut s = state.borrow_mut();
-                    s.block_distro_driver = info.distro_driver_blocked && info.block_supported;
-                    s.sysinfo = info;
-                    s.sysinfo_loaded = true;
-                }
-                // Update configure tab with new disk/secureboot/version info
-                update_config_tab();
-                // Re-populate browse list with version badges now that driver is known
-                let versions = state.borrow().versions.clone();
-                if !versions.is_empty() {
-                    let installed = state.borrow().sysinfo.installed_driver.clone();
-                    // Rebuilding the rows clears the selection: the version chosen stays chosen.
-                    let selected = state.borrow().selected_version.as_ref().map(|v| v.version.clone());
-                    populate_list(&list_box, &versions, &search_entry.text(), installed.as_deref());
-                    if let Some(selected) = selected {
-                        select_row_titled(&list_box, &selected);
-                    }
-                }
-            });
+    fn sysinfo_loaded(&mut self, info: SystemInfo, cx: &mut Context<Self>) {
+        self.sysinfo_refreshing = false;
+        match &info.installed_driver {
+            Some(ver) => self.log(format!("Installed driver: {ver}"), cx),
+            None => self.log("No NVIDIA driver detected", cx),
         }
-    };
-
-    load_sysinfo();
-
-    {
-        let ls = load_sysinfo.clone();
-        refresh_sysinfo_btn.connect_clicked(move |_| ls());
+        let mut s = self.state.borrow_mut();
+        // The block option shows what is in place now: leaving it on keeps
+        // an existing block, turning it off removes it.
+        s.block_distro_driver = info.distro_driver_blocked && info.block_supported;
+        s.sysinfo = info;
+        s.sysinfo_loaded = true;
+        drop(s);
+        cx.notify();
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Set Up Signing: one-time MOK password, then the privileged setup
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-        let window = window.clone();
-        let log_fn = log_fn.clone();
-        let toast_overlay = toast_overlay.clone();
-        let stack = stack.clone();
-        let load_sysinfo = load_sysinfo.clone();
-        let state = state.clone();
-        let refresh_actions = refresh_actions.clone();
+    // ── Versions ─────────────────────────────────────────────────────────────
 
-        signing_btn.connect_clicked(move |_| {
-            let pw1 = gtk4::PasswordEntry::builder().placeholder_text("One-time password").show_peek_icon(true).build();
-            let pw2 = gtk4::PasswordEntry::builder().placeholder_text("Type it again").show_peek_icon(true).build();
-            let hint = Label::builder().label(MOK_PASSWORD_HINT).wrap(true).xalign(0.0).build();
-            hint.add_css_class("dim-label");
-            let fields = GtkBox::new(Orientation::Vertical, 8);
-            fields.append(&pw1);
-            fields.append(&pw2);
-            fields.append(&hint);
-
-            let dialog = libadwaita::AlertDialog::new(
-                Some("Set Up Module Signing"),
-                Some(
-                    "Pick a one-time password to approve this computer's module-signing key. \
-                     On the next restart a blue MOK Manager screen appears before Linux starts: \
-                     choose Enroll MOK and type this same password there once. Any key another \
-                     app has already queued (such as a kernel-signing key) is kept in the same \
-                     request, and this password enrolls all of them; a password chosen earlier \
-                     no longer works.",
-                ),
-            );
-            dialog.set_extra_child(Some(&fields));
-            dialog.add_responses(&[("cancel", "Cancel"), ("setup", "Set Up Signing")]);
-            dialog.set_response_appearance("setup", libadwaita::ResponseAppearance::Suggested);
-            dialog.set_response_enabled("setup", false);
-            dialog.set_close_response("cancel");
-
-            // Weak references: the entries' handlers must not keep the dialog alive.
-            for (entry, other) in [(&pw1, &pw2), (&pw2, &pw1)] {
-                let dialog = dialog.downgrade();
-                let other = other.downgrade();
-                let hint = hint.downgrade();
-                entry.connect_changed(move |entry| {
-                    let (Some(dialog), Some(other), Some(hint)) = (dialog.upgrade(), other.upgrade(), hint.upgrade()) else {
-                        return;
-                    };
-                    match validate_mok_password(&entry.text(), &other.text()) {
-                        Ok(()) => {
-                            hint.set_label("Passwords match.");
-                            dialog.set_response_enabled("setup", true);
-                        }
-                        Err(msg) => {
-                            hint.set_label(&msg);
-                            dialog.set_response_enabled("setup", false);
-                        }
-                    }
-                });
-            }
-
-            let log_fn = log_fn.clone();
-            let toast_overlay = toast_overlay.clone();
-            let stack = stack.clone();
-            let load_sysinfo = load_sysinfo.clone();
-            let state = state.clone();
-            let refresh_actions = refresh_actions.clone();
-            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response != "setup" {
-                    return;
-                }
-                let password = pw1.text().to_string();
-                pw1.set_text("");
-                pw2.set_text("");
-                if validate_mok_password(&password, &password).is_err() {
-                    return;
-                }
-                let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Signing) else {
-                    return;
-                };
-                stack.set_visible_child_name("log");
-                log_fn("Setting up module signing…".to_string());
-
-                spawn_async(async move { tokio::task::spawn_blocking(move || run_privileged_setup_signing(&password)).await }, move |outcome| {
-                    guard.release();
-                    match outcome {
-                        Ok(outcome) => {
-                            for line in &outcome.lines {
-                                log_fn(line.clone());
-                            }
-                            match outcome.result {
-                                Ok(()) => {
-                                    log_fn("Module signing setup finished.".to_string());
-                                    toast_overlay.add_toast(Toast::new("Module signing set up — see Log tab"));
-                                }
-                                Err(e) => {
-                                    log_fn(format!("Module signing setup failed: {}", e));
-                                    toast_overlay.add_toast(Toast::new("Signing setup failed — see Log tab"));
-                                }
-                            }
-                        }
-                        Err(e) => log_fn(format!("Task error: {}", e)),
-                    }
-                    load_sysinfo();
-                });
-            });
-        });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Load versions
-    // ─────────────────────────────────────────────────────────────────────────
-
-    let load_versions = {
-        let list_box = list_box.clone();
-        let list_spinner = list_spinner.clone();
-        let refresh_actions = refresh_actions.clone();
-        let selected_label = selected_label.clone();
-        let banner = banner.clone();
-        let state = state.clone();
-        let log_fn = log_fn.clone();
-        let search_entry = search_entry.clone();
-
-        move || {
-            list_spinner.start();
-            list_spinner.set_visible(true);
-            banner.set_revealed(false);
-            while let Some(c) = list_box.first_child() {
-                list_box.remove(&c);
-            }
-            refresh_actions();
-            selected_label.set_label("Loading…");
-            log_fn("Fetching version list from NVIDIA…".to_string());
-
-            let list_box = list_box.clone();
-            let list_spinner = list_spinner.clone();
-            let selected_label = selected_label.clone();
-            let banner = banner.clone();
-            let state = state.clone();
-            let log_fn = log_fn.clone();
-            let search_entry = search_entry.clone();
-
-            spawn_async(fetch_versions(), move |result| {
-                list_spinner.stop();
-                list_spinner.set_visible(false);
-                match result {
-                    Err(e) => {
-                        log_fn(format!("Error fetching versions: {}", e));
-                        banner.set_title(&format!("Failed to load versions: {}", e));
-                        banner.set_revealed(true);
-                        selected_label.set_label("Could not load version list");
-                    }
-                    Ok(versions) => {
-                        log_fn(format!("Found {} versions", versions.len()));
-                        selected_label.set_label("No version selected");
-                        state.borrow_mut().versions = versions.clone();
-                        let installed = state.borrow().sysinfo.installed_driver.clone();
-                        populate_list(&list_box, &versions, &search_entry.text(), installed.as_deref());
-
-                        // The branch labels come separately and may be slow or
-                        // unavailable; the list is usable without them.
-                        let list_box = list_box.clone();
-                        let state = state.clone();
-                        let log_fn = log_fn.clone();
-                        spawn_async(
-                            async { tokio::time::timeout(BRANCH_LABEL_TIMEOUT, fetch_branches(UNIX_DRIVERS_PAGE)).await },
-                            move |result| match result {
-                                Ok(Ok(branches)) => {
-                                    {
-                                        let mut s = state.borrow_mut();
-                                        for v in &mut s.versions {
-                                            v.branch = branches.classify(&v.version);
-                                        }
-                                    }
-                                    add_branch_badges(&list_box, &state.borrow().versions);
-                                }
-                                Ok(Err(e)) => log_fn(format!("No branch labels: NVIDIA's branch data is unavailable ({e:#})")),
-                                Err(_) => log_fn("No branch labels: NVIDIA's branch data took too long".to_string()),
-                            },
-                        );
-                    }
-                }
-            });
+    fn load_versions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.list_status = ListStatus::Loading;
+        {
+            let mut s = self.state.borrow_mut();
+            s.versions.clear();
+            s.selected_version = None;
         }
-    };
-
-    load_versions();
-
-    {
-        let lv = load_versions.clone();
-        refresh_btn.connect_clicked(move |_| lv());
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Row selection — connected exactly once. The version is looked up by the
-    //  row's title (the version string), never by row index: when the search
-    //  filter is active the visible rows are a subset, so an index into the
-    //  full versions vec would select the wrong driver.
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-        let state = state.clone();
-        let refresh_actions = refresh_actions.clone();
-        let selected_label = selected_label.clone();
-        list_box.connect_row_selected(move |_, row| {
-            let selected = row
-                .and_then(|r| r.downcast_ref::<ActionRow>().map(|ar| ar.title().to_string()))
-                .and_then(|title| state.borrow().versions.iter().find(|v| v.version == title).cloned());
-
-            match selected {
-                Some(ver) => {
-                    selected_label.set_label(&format!("Selected: {}", ver.version));
-                    state.borrow_mut().selected_version = Some(ver);
-                }
-                None => {
-                    selected_label.set_label("No version selected");
-                    state.borrow_mut().selected_version = None;
-                }
-            }
-            // Selecting a row never enables Download while something runs.
-            refresh_actions();
+        self.log("Fetching version list from NVIDIA…", cx);
+        let view = cx.weak_entity();
+        spawn_async(window, cx, fetch_versions(), move |result, window, cx| {
+            let _ = view.update(cx, |this, cx| this.versions_loaded(result, window, cx));
         });
     }
 
-    {
-        let list_box = list_box.clone();
-        let state = state.clone();
-        search_entry.connect_search_changed(move |entry| {
-            // Clone what we need and drop the borrow BEFORE populate_list:
-            // rebuilding the list can remove the selected row, which fires
-            // row-selected(None) and borrow_mut()s the state.
-            let (versions, installed) = {
-                let s = state.borrow();
-                (s.versions.clone(), s.sysinfo.installed_driver.clone())
-            };
-            populate_list(&list_box, &versions, &entry.text(), installed.as_deref());
-        });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Download
-    // ─────────────────────────────────────────────────────────────────────────
-    let dl_ui = DownloadUi {
-        state: state.clone(),
-        progress: progress.clone(),
-        cancel_btn: cancel_dl_btn.clone(),
-        log: log_fn.clone(),
-        update_config_tab: update_config_tab.clone(),
-        refresh_actions: refresh_actions.clone(),
-        stack: stack.clone(),
-        toast: toast_overlay.clone(),
-        window: window.clone(),
-        guard: None,
-    };
-    {
-        let dl_ui = dl_ui.clone();
-        download_btn.connect_clicked(move |_| {
-            let mut ui = dl_ui.clone();
-            let (ver, free) = {
-                let s = ui.state.borrow();
-                (s.selected_version.clone(), s.sysinfo.free_disk_bytes)
-            };
-            let Some(ver) = ver else { return };
-            let Some(guard) = BusyGuard::start(&ui.state, &ui.refresh_actions, Busy::Download) else {
+    fn versions_loaded(&mut self, result: anyhow::Result<Vec<DriverVersion>>, window: &mut Window, cx: &mut Context<Self>) {
+        let versions = match result {
+            Err(e) => {
+                self.log(format!("Error fetching versions: {e}"), cx);
+                self.list_status = ListStatus::Failed(format!("Failed to load versions: {e}"));
                 return;
-            };
-            ui.guard = Some(guard);
-
-            if free.is_some_and(|f| f < MIN_DISK_BYTES) {
-                ui.toast.add_toast(Toast::new("Low disk space — install may fail"));
             }
+            Ok(versions) => versions,
+        };
+        self.log(format!("Found {} versions", versions.len()), cx);
+        self.list_status = ListStatus::Loaded;
+        self.state.borrow_mut().versions = versions;
+        // The branch labels come separately and may be slow or unavailable;
+        // the list is usable without them.
+        let view = cx.weak_entity();
+        spawn_async(window, cx, async { tokio::time::timeout(BRANCH_LABEL_TIMEOUT, fetch_branches(UNIX_DRIVERS_PAGE)).await }, move |result, _, cx| {
+            let _ = view.update(cx, |this, cx| match result {
+                Ok(Ok(branches)) => {
+                    let mut s = this.state.borrow_mut();
+                    for v in &mut s.versions {
+                        v.branch = branches.classify(&v.version);
+                    }
+                    drop(s);
+                    cx.notify();
+                }
+                Ok(Err(e)) => this.log(format!("No branch labels: NVIDIA's branch data is unavailable ({e:#})"), cx),
+                Err(_) => this.log("No branch labels: NVIDIA's branch data took too long", cx),
+            });
+        });
+    }
 
-            let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            ui.state.borrow_mut().download_cancel = Some(cancel_flag.clone());
-            ui.cancel_btn.set_visible(true);
-            ui.progress.set_visible(true);
-            ui.progress.set_fraction(0.0);
-            ui.progress.set_text(Some(&format!("Downloading {}…", ver.version)));
+    /// The versions the filter lets through.
+    fn visible_versions(&self, cx: &App) -> Vec<DriverVersion> {
+        let filter = self.filter.read(cx).value().to_lowercase();
+        self.state.borrow().versions.iter().filter(|v| filter.is_empty() || v.version.contains(&filter)).cloned().collect()
+    }
 
-            // XDG_DOWNLOAD_DIR normally lives only in ~/.config/user-dirs.dirs,
-            // not the environment — ask GLib, which reads that file.
-            let dest_dir = glib::user_special_dir(glib::UserDirectory::Downloads)
-                .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join("Downloads"));
+    /// A version the filter hides is no longer the chosen one: Download must
+    /// not fetch a driver the list doesn't show.
+    fn filter_changed(&mut self, cx: &mut Context<Self>) {
+        let visible = self.visible_versions(cx);
+        let mut s = self.state.borrow_mut();
+        if s.selected_version.as_ref().is_some_and(|sel| !visible.iter().any(|v| v.version == sel.version)) {
+            s.selected_version = None;
+        }
+        drop(s);
+        cx.notify();
+    }
 
-            // Progress channel — sent from the Tokio side, drained on the GTK
-            // main context. The loop exits when the sender drops at download
-            // end, so nothing is leaked.
-            let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
-            let download_start = std::time::Instant::now();
-            {
-                let progress = ui.progress.clone();
-                glib::MainContext::default().spawn_local(async move {
-                    let mut last_ui = std::time::Instant::now();
-                    while let Some(mut msg) = prog_rx.recv().await {
-                        // Coalesce bursts — jump to the newest queued update
-                        while let Ok(newer) = prog_rx.try_recv() {
-                            msg = newer;
+    /// Selection by version string, never by row index: with a filter the
+    /// visible rows are a subset of the versions.
+    fn select_version(&mut self, version: &str, cx: &mut Context<Self>) {
+        let found = self.state.borrow().versions.iter().find(|v| v.version == version).cloned();
+        self.state.borrow_mut().selected_version = found;
+        cx.notify();
+    }
+
+    /// Up and Down in the list move the selection.
+    fn list_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let step: isize = match event.keystroke.key.as_str() {
+            "up" => -1,
+            "down" => 1,
+            _ => return,
+        };
+        let visible = self.visible_versions(cx);
+        if visible.is_empty() {
+            return;
+        }
+        let current = self.state.borrow().selected_version.as_ref().and_then(|sel| visible.iter().position(|v| v.version == sel.version));
+        let next = match current {
+            Some(i) => (i as isize + step).clamp(0, visible.len() as isize - 1) as usize,
+            None => 0,
+        };
+        self.list_scroll.scroll_to_item(next, ScrollStrategy::Center);
+        self.select_version(&visible[next].version, cx);
+        cx.stop_propagation();
+    }
+
+    // ── Download ─────────────────────────────────────────────────────────────
+
+    fn download_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (ver, free) = {
+            let s = self.state.borrow();
+            (s.selected_version.clone(), s.sysinfo.free_disk_bytes)
+        };
+        let Some(ver) = ver else { return };
+        let Some(guard) = BusyGuard::start(&self.state, Busy::Download) else {
+            return;
+        };
+
+        if free.is_some_and(|f| f < MIN_DISK_BYTES) {
+            toast(window, cx, "Low disk space — install may fail");
+        }
+
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.state.borrow_mut().download_cancel = Some(cancel_flag.clone());
+        self.progress = ProgressBar { visible: true, fraction: Some(0.0), text: format!("Downloading {}…", ver.version) };
+        cx.notify();
+
+        // XDG_DOWNLOAD_DIR normally lives only in ~/.config/user-dirs.dirs,
+        // not the environment; dirs reads that file.
+        let dest_dir = dirs::download_dir().unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into())).join("Downloads"));
+
+        // Progress, sent from the Tokio side and drained on the UI thread. The
+        // loop ends when the sender drops at the end of the download.
+        let (prog_tx, mut prog_rx) = tokio::sync::mpsc::unbounded_channel::<(u64, Option<u64>)>();
+        let download_start = std::time::Instant::now();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut last_ui: Option<std::time::Instant> = None;
+            while let Some(mut msg) = prog_rx.recv().await {
+                // Coalesce bursts: jump to the newest queued update.
+                while let Ok(newer) = prog_rx.try_recv() {
+                    msg = newer;
+                }
+                // Throttle redraws to ~10 Hz.
+                if last_ui.is_some_and(|t| t.elapsed() < Duration::from_millis(100)) {
+                    continue;
+                }
+                last_ui = Some(std::time::Instant::now());
+                let (fraction, text) = progress_text(msg, download_start.elapsed().as_secs_f64());
+                let updated = this.update(cx, |this, cx| {
+                    if this.state.borrow().busy == Some(Busy::Download) {
+                        this.progress.fraction = fraction;
+                        if let Some(text) = text {
+                            this.progress.text = text;
                         }
-                        // Throttle UI redraws to ~10 Hz
-                        if last_ui.elapsed() < std::time::Duration::from_millis(100) {
-                            continue;
-                        }
-                        last_ui = std::time::Instant::now();
-                        let (dl, total) = msg;
-                        if let Some(t) = total {
-                            progress.set_fraction(dl as f64 / t as f64);
-                            let elapsed = download_start.elapsed().as_secs_f64();
-                            let speed = if elapsed > 0.0 { dl as f64 / elapsed } else { 0.0 };
-                            let eta = if speed > 0.0 {
-                                let remaining = t.saturating_sub(dl) as f64 / speed;
-                                if remaining < 60.0 {
-                                    format!("{:.0}s remaining", remaining)
-                                } else {
-                                    format!("{:.0}m remaining", remaining / 60.0)
-                                }
-                            } else {
-                                "calculating…".to_string()
-                            };
-                            progress.set_text(Some(&format!(
-                                "{:.1} / {:.1} MB  ({:.1} MB/s)  {}",
-                                dl as f64 / 1_000_000.0,
-                                t as f64 / 1_000_000.0,
-                                speed / 1_000_000.0,
-                                eta
-                            )));
-                        } else {
-                            progress.pulse();
-                        }
+                        cx.notify();
                     }
                 });
+                if updated.is_err() {
+                    break;
+                }
             }
+        })
+        .detach();
 
-            let url = ver.url.clone();
-            let filename = ver.filename.clone();
-            spawn_async(
-                async move {
-                    // Fetch errors stay distinct from "no checksum published":
-                    // only the latter may lead to an unverified install.
-                    let checksum = fetch_checksum(&ver).await.map_err(|e| format!("{e:#}"));
-                    let tx = prog_tx;
-                    let result = download_run_file(
-                        &url,
-                        &dest_dir,
-                        &filename,
-                        move |dl, total| {
-                            let _ = tx.send((dl, total));
-                        },
-                        cancel_flag,
-                    )
-                    .await;
-                    (ver, checksum, result)
-                },
-                move |(ver, checksum, result)| {
-                    ui.cancel_btn.set_visible(false);
-                    ui.state.borrow_mut().download_cancel = None;
+        let url = ver.url.clone();
+        let filename = ver.filename.clone();
+        let view = cx.weak_entity();
+        spawn_async(
+            window,
+            cx,
+            async move {
+                // Fetch errors stay distinct from "no checksum published":
+                // only the latter may lead to an unverified install.
+                let checksum = fetch_checksum(&ver).await.map_err(|e| format!("{e:#}"));
+                let tx = prog_tx;
+                let result = download_run_file(
+                    &url,
+                    &dest_dir,
+                    &filename,
+                    move |dl, total| {
+                        let _ = tx.send((dl, total));
+                    },
+                    cancel_flag,
+                )
+                .await;
+                (ver, checksum, result)
+            },
+            move |(ver, checksum, result), window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.state.borrow_mut().download_cancel = None;
                     match result {
                         Err(e) => {
                             if e.to_string().contains("cancelled") {
-                                (ui.log)("Download cancelled.".to_string());
-                                ui.progress.set_text(Some("Cancelled"));
+                                this.log("Download cancelled.", cx);
+                                this.progress.text = "Cancelled".into();
                             } else {
-                                (ui.log)(format!("Download failed: {e:#}"));
-                                ui.progress.set_text(Some("Download failed"));
-                                ui.toast.add_toast(Toast::new("Download failed — see Log tab"));
+                                this.log(format!("Download failed: {e:#}"), cx);
+                                this.progress.text = "Download failed".into();
+                                toast(window, cx, "Download failed — see Log tab");
                             }
-                            ui.end();
+                            this.progress.fraction = Some(0.0);
+                            guard.release();
+                            cx.notify();
                         }
                         Ok(path) => {
-                            (ui.log)(format!("Download complete: {}", path.display()));
-                            ui.progress.set_fraction(1.0);
-                            finish_download(ui, ver, path, checksum);
+                            this.log(format!("Download complete: {}", path.display()), cx);
+                            this.progress.fraction = Some(1.0);
+                            this.finish_download(guard, ver, path, checksum, window, cx);
                         }
-                    }
-                },
-            );
-        });
-    }
-
-    // Cancel download button
-    {
-        let state = state.clone();
-        cancel_dl_btn.connect_clicked(move |_| {
-            if let Some(flag) = &state.borrow().download_cancel {
-                flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Open local file
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-        let window = window.clone();
-        let state = state.clone();
-        let update_config_tab = update_config_tab.clone();
-        let stack = stack.clone();
-        let log_fn = log_fn.clone();
-
-        open_file_btn.connect_clicked(move |_| {
-            if state.borrow().busy.is_some() {
-                return;
-            }
-            let dialog = FileDialog::builder().title("Select NVIDIA .run File").modal(true).build();
-            let filter = gtk4::FileFilter::new();
-            filter.add_pattern("*.run");
-            filter.set_name(Some("NVIDIA .run files"));
-            let filters = gio::ListStore::new::<gtk4::FileFilter>();
-            filters.append(&filter);
-            dialog.set_filters(Some(&filters));
-
-            let state = state.clone();
-            let update_config_tab = update_config_tab.clone();
-            let stack = stack.clone();
-            let log_fn = log_fn.clone();
-            let window = window.clone();
-
-            dialog.open(Some(&window.clone()), gio::Cancellable::NONE, move |result| {
-                let Some(path) = result.ok().and_then(|f| f.path()) else { return };
-                // The install script refuses symlinks; use the file itself.
-                // The checks run commands (getent, getfacl): not on this thread.
-                spawn_async(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            let path = std::fs::canonicalize(&path).unwrap_or(path);
-                            let path_str = path.to_string_lossy().to_string();
-                            let checked = check_run_file(&path_str);
-                            (path_str, checked)
-                        })
-                        .await
-                    },
-                    move |checked| {
-                        let Ok((path_str, checked)) = checked else { return };
-                        if let Err(e) = checked {
-                            log_fn(format!("Can't use {path_str}: {e}"));
-                            show_error(&window, "This file can't be installed", &e.to_string());
-                            return;
-                        }
-                        log_fn(format!("Opened local file: {}", path_str));
-                        {
-                            let mut s = state.borrow_mut();
-                            s.downloaded_path = Some(path_str);
-                            s.expected_checksum = None;
-                        }
-                        update_config_tab();
-                        stack.set_visible_child_name("configure");
-                    },
-                );
-            });
-        });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Switches
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-        let s = state.clone();
-        let update_config_tab = update_config_tab.clone();
-        dkms_switch.connect_active_notify(move |sw| {
-            s.borrow_mut().use_dkms = sw.is_active();
-            // The Secure Boot advice depends on it.
-            update_config_tab();
-        });
-    }
-    {
-        let s = state.clone();
-        module_combo.connect_selected_notify(move |row| {
-            s.borrow_mut().module_choice = match row.selected() {
-                1 => ModuleChoice::Open,
-                2 => ModuleChoice::Proprietary,
-                _ => ModuleChoice::Auto,
-            };
-        });
-    }
-    {
-        let s = state.clone();
-        block_switch.connect_active_notify(move |sw| {
-            s.borrow_mut().block_distro_driver = sw.is_active();
-        });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Install
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-        let state = state.clone();
-        let log_fn = log_fn.clone();
-        let stack = stack.clone();
-        let toast_overlay = toast_overlay.clone();
-        let progress = progress.clone();
-        let load_sysinfo = load_sysinfo.clone();
-        let refresh_actions = refresh_actions.clone();
-        let window = window.clone();
-
-        install_btn.connect_clicked(move |install_btn| {
-            let install_btn = install_btn.clone();
-            let s = state.borrow();
-            if s.busy.is_some() {
-                return;
-            }
-            let Some(ref run_file) = s.downloaded_path else { return };
-
-            if let Some(free) = s.sysinfo.free_disk_bytes {
-                if free < MIN_DISK_BYTES {
-                    toast_overlay.add_toast(Toast::new("Warning: low disk space — install may fail"));
-                }
-            }
-
-            // Refuse module flavors that cannot work, before asking for a password.
-            let driver_major = Path::new(run_file)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(version_from_filename)
-                .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
-            if let Err(msg) = validate_module_choice(s.module_choice, &s.sysinfo.gpu_compute_caps, driver_major) {
-                log_fn(format!("Install not started: {}", msg));
-                toast_overlay.add_toast(Toast::new(&msg));
-                return;
-            }
-
-            let opts = InstallOptions {
-                use_dkms: s.use_dkms,
-                block_distro_driver: s.block_distro_driver,
-                module: s.module_choice,
-                run_file: run_file.clone(),
-                sha256: s.expected_checksum.clone(),
-                discard_recovery: s.discard_recovery_next,
-            };
-            drop(s);
-            state.borrow_mut().discard_recovery_next = false;
-
-            let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
-                return;
-            };
-            progress.set_visible(true);
-            progress.set_text(Some("Installing… the desktop stays up; this takes a few minutes"));
-            stack.set_visible_child_name("log");
-            log_fn(format!("Starting install: {}", opts.run_file));
-            log_fn("The new driver installs alongside the running one; reboot afterward to switch over.".to_string());
-
-            // Pulse the bar while the install runs; the timer stops itself
-            // once the install is no longer running.
-            {
-                let progress = progress.clone();
-                let state = state.clone();
-                glib::timeout_add_local(std::time::Duration::from_millis(150), move || {
-                    if state.borrow().busy == Some(Busy::Install) {
-                        progress.pulse();
-                        glib::ControlFlow::Continue
-                    } else {
-                        glib::ControlFlow::Break
                     }
                 });
-            }
+            },
+        );
+    }
 
-            // The script's output goes into the Log tab line by line as it
-            // runs; the result is shown only after the last line (the sender
-            // is dropped when the install call returns, before the result is
-            // sent).
-            let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-            crate::runtime().spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    run_privileged_install(&opts, |line| {
-                        let _ = line_tx.send(line.to_string());
-                    })
-                })
-                .await;
-                let _ = result_tx.send(result);
-            });
-
-            let log_fn = log_fn.clone();
-            let toast_overlay = toast_overlay.clone();
-            let progress = progress.clone();
-            let load_sysinfo = load_sysinfo.clone();
-            let window = window.clone();
-            let state = state.clone();
-
-            glib::MainContext::default().spawn_local(async move {
-                while let Some(line) = line_rx.recv().await {
-                    log_fn(line);
-                }
-                let result: Result<anyhow::Result<()>, String> = match result_rx.await {
-                    Ok(Ok(r)) => Ok(r),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("the install task ended unexpectedly".to_string()),
-                };
-                guard.release();
-                progress.set_visible(false);
-                {
-                    match result {
-                        Ok(Ok(())) => {
-                            log_fn("Install completed successfully.".to_string());
-                            log_fn("Reboot to switch to the new driver.".to_string());
-                            toast_overlay.add_toast(Toast::new("Install complete — reboot to activate"));
-                        }
-                        Ok(Err(e)) if e.downcast_ref::<StaleRecovery>().is_some() => {
-                            log_fn(format!("Install not started: {e}"));
-                            // Only on the user's word: install anyway, dropping that data.
-                            let dialog = libadwaita::AlertDialog::new(Some("Recovery data from an interrupted install"), Some(&e.to_string()));
-                            dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard and Install")]);
-                            dialog.set_response_appearance("discard", libadwaita::ResponseAppearance::Destructive);
-                            dialog.set_default_response(Some("cancel"));
-                            dialog.set_close_response("cancel");
-                            let state = state.clone();
-                            let install_btn = install_btn.clone();
-                            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                                if response == "discard" {
-                                    state.borrow_mut().discard_recovery_next = true;
-                                    install_btn.emit_clicked();
-                                }
-                            });
-                        }
-                        Ok(Err(e)) => {
-                            log_fn(format!("Install failed: {e:#}"));
-                            show_error(&window, "Install failed", &format!("{e:#}"));
+    /// Verify a finished download against NVIDIA's checksum. With none
+    /// published (`Ok(None)`) the user decides whether to use the file
+    /// unverified; when the checksum couldn't be fetched (`Err`), the choice
+    /// is to retry or to discard the file — never to skip the check.
+    fn finish_download(
+        &mut self,
+        guard: Rc<BusyGuard>,
+        ver: DriverVersion,
+        path: PathBuf,
+        checksum: Result<Option<String>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let view = cx.weak_entity();
+        match checksum {
+            Ok(Some(cs)) => {
+                self.log("Verifying SHA256…", cx);
+                self.progress.text = "Verifying…".into();
+                let file = path.clone();
+                let expected = cs.clone();
+                spawn_async(window, cx, async move { verify_sha256(&file, &expected).await }, move |verified, window, cx| {
+                    let _ = view.update(cx, |this, cx| match verified {
+                        Ok(()) => {
+                            this.log("SHA256 verified OK", cx);
+                            this.accept_download(&guard, &path, Some(cs), "Verified", "Download complete", window, cx);
                         }
                         Err(e) => {
-                            log_fn(format!("Task error: {}", e));
+                            this.log(format!("SHA256 FAILED: {e}"), cx);
+                            this.discard_download(&guard, &path, "Checksum mismatch — file deleted", "Checksum mismatch — do not install", window, cx);
                         }
-                    }
-                    // A failed install may have changed (or put back) packages too.
-                    load_sysinfo();
-                }
-            });
-        });
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    //  About dialog
-    // ─────────────────────────────────────────────────────────────────────────
-    {
-        let window = window.clone();
-        let state = state.clone();
-        about_btn.connect_clicked(move |_| {
-            let (driver, gpu, kernel) = {
-                let s = state.borrow();
-                (
-                    s.sysinfo.installed_driver.clone().unwrap_or_else(|| "Not detected".to_string()),
-                    s.sysinfo.gpu_name.clone().unwrap_or_else(|| "Not detected".to_string()),
-                    s.sysinfo.kernel_version.clone(),
-                )
-            };
-
-            let dialog = AboutDialog::builder()
-                .application_name("Green Light")
-                .version(env!("CARGO_PKG_VERSION"))
-                .developers(vec!["Linnard Alex Brown Jr."])
-                // GTK's Agpl30 is "AGPL version 3 or later" (Agpl30Only is the
-                // strict variant), matching AGPL-3.0-or-later in Cargo.toml.
-                .license_type(gtk4::License::Agpl30)
-                .website("https://github.com/labj1987/green-light")
-                .issue_url("https://github.com/labj1987/green-light/issues")
-                .comments(format!(
-                    "GTK4 + Rust GUI for installing NVIDIA drivers from official .run files.\n\nGPU: {}\nDriver: {}\nKernel: {}",
-                    gpu, driver, kernel
-                ))
-                .build();
-            // The website and issue links: opened with the system's environment, not GTK's fallback
-            // (which would start the browser with the AppImage's GTK variables).
-            dialog.connect_activate_link(|_, uri| crate::host_env::open_uri(uri));
-            dialog.add_credit_section(Some("Built with"), &["Claude Code (Anthropic)", "Codex (OpenAI)"]);
-            dialog.present(Some(&window));
-        });
-    }
-
-    // Clear log
-    {
-        let lv = log_view.clone();
-        clear_btn.connect_clicked(move |_| {
-            lv.buffer().set_text("");
-        });
-    }
-
-    // Closing the window doesn't stop a running install (it carries on, or
-    // puts the previous driver back, on its own), but the user must not take
-    // the closed window as "done" and reboot.
-    {
-        let state = state.clone();
-        let allow_close = Rc::new(std::cell::Cell::new(false));
-        window.connect_close_request(move |w| {
-            let busy = state.borrow().busy;
-            if allow_close.get() || !matches!(busy, Some(Busy::Install) | Some(Busy::Signing)) {
-                return glib::Propagation::Proceed;
+                    });
+                });
             }
-            let dialog = libadwaita::AlertDialog::new(
-                Some("The install is still running"),
-                Some(
-                    "Closing Green Light doesn't stop it: the install finishes, or puts the \
-                     previous driver back, on its own. Its progress is in \
-                     /var/log/green-light.log. Don't reboot until that log says it is done.",
-                ),
-            );
-            dialog.add_responses(&[("keep", "Keep Open"), ("close", "Close Anyway")]);
-            dialog.set_response_appearance("close", libadwaita::ResponseAppearance::Destructive);
-            dialog.set_default_response(Some("keep"));
-            dialog.set_close_response("keep");
-            let allow_close = allow_close.clone();
-            let window = w.clone();
-            dialog.choose(Some(w), gio::Cancellable::NONE, move |response| {
-                if response == "close" {
-                    allow_close.set(true);
-                    window.close();
-                }
-            });
-            glib::Propagation::Stop
-        });
+            Ok(None) => {
+                self.log("NVIDIA publishes no SHA256 checksum for this version", cx);
+                self.progress.text = "Downloaded — not verified".into();
+                show_choice(
+                    Choice {
+                        id: "unverified",
+                        title: "Install without verification?".into(),
+                        body: "NVIDIA does not publish a SHA256 checksum for this version, so the download \
+                               cannot be checked against it. Only continue if you trust the network you \
+                               downloaded it over."
+                            .into(),
+                        buttons: vec![("unverified-discard", "Discard Download", Look::Plain), ("unverified-use", "Use Unverified", Look::Danger)],
+                        default: 0,
+                        dismiss: 0,
+                    },
+                    move |answer, window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if answer == 1 {
+                                this.log("User chose to continue WITHOUT checksum verification", cx);
+                                this.accept_download(&guard, &path, None, "Complete (unverified)", "Download complete (unverified)", window, cx);
+                            } else {
+                                this.discard_download(&guard, &path, "Discarded (not verified)", "Unverified download discarded", window, cx);
+                            }
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+            Err(e) => {
+                self.log(format!("Could not fetch the SHA256 checksum: {e}"), cx);
+                self.progress.text = "Downloaded — checksum not fetched yet".into();
+                show_choice(
+                    Choice {
+                        id: "checksum-failed",
+                        title: "Couldn't get NVIDIA's checksum".into(),
+                        body: format!(
+                            "The driver downloaded, but its SHA256 checksum could not be fetched to \
+                             check it:\n\n{e}\n\nTry again once the connection to NVIDIA works."
+                        )
+                        .into(),
+                        buttons: vec![("checksum-discard", "Discard Download", Look::Plain), ("checksum-retry", "Try Again", Look::Primary)],
+                        default: 1,
+                        dismiss: 0,
+                    },
+                    move |answer, window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if answer != 1 {
+                                this.discard_download(&guard, &path, "Discarded (not verified)", "Download discarded", window, cx);
+                                return;
+                            }
+                            this.log("Fetching the SHA256 checksum again…", cx);
+                            this.progress.text = "Fetching checksum…".into();
+                            let v = ver.clone();
+                            let view = cx.weak_entity();
+                            spawn_async(window, cx, async move { fetch_checksum(&v).await.map_err(|e| format!("{e:#}")) }, move |checksum, window, cx| {
+                                let _ = view.update(cx, |this, cx| this.finish_download(guard, ver, path, checksum, window, cx));
+                            });
+                        });
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+        cx.notify();
     }
 
-    // Restore Previous Driver: roll back a cut-off install from its journal.
-    {
-        let state = state.clone();
-        let refresh_actions = refresh_actions.clone();
-        let log_fn = log_fn.clone();
-        let stack = stack.clone();
-        let progress = progress.clone();
-        let toast_overlay = toast_overlay.clone();
-        let load_sysinfo = load_sysinfo.clone();
-        let window = window.clone();
-        let recover_discards = recover_discards.clone();
-        let banner = recover_banner.clone();
-        let dialog_window = window.clone();
-        // Restore (false) or discard (true) the recovery data.
-        let run_op: Rc<dyn Fn(bool)> = Rc::new(move |discard: bool| {
-            let Some(guard) = BusyGuard::start(&state, &refresh_actions, Busy::Install) else {
-                // The banner stays up while something else runs: say why nothing happened.
-                toast_overlay.add_toast(Toast::new("Wait until the running operation has finished"));
-                return;
-            };
-            banner.set_revealed(false);
-            stack.set_visible_child_name("log");
-            progress.set_visible(true);
-            if discard {
-                progress.set_text(Some("Discarding the recovery data…"));
-                log_fn("Discarding the recovery data of the interrupted install, as chosen…".to_string());
-            } else {
-                progress.set_text(Some("Restoring the previous driver…"));
-                log_fn("Restoring the driver setup from before the interrupted install…".to_string());
+    /// Make the file the one to install.
+    #[allow(clippy::too_many_arguments)]
+    fn accept_download(
+        &mut self,
+        guard: &BusyGuard,
+        path: &Path,
+        checksum: Option<String>,
+        progress_text: &str,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.progress.text = progress_text.into();
+        {
+            let mut s = self.state.borrow_mut();
+            s.downloaded_path = Some(path.to_string_lossy().to_string());
+            s.expected_checksum = checksum;
+        }
+        guard.release();
+        self.page = Page::Configure;
+        toast(window, cx, message);
+        cx.notify();
+    }
+
+    fn discard_download(&mut self, guard: &BusyGuard, path: &Path, progress_text: &str, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                self.log(format!("Deleted {}", path.display()), cx);
+                self.progress.text = progress_text.into();
             }
-            let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-            crate::runtime().spawn(async move {
-                let result = tokio::task::spawn_blocking(move || {
-                    let send = |line: &str| {
-                        let _ = line_tx.send(line.to_string());
-                    };
-                    if discard {
-                        run_privileged_discard_recovery(send).map(|()| Recovered::Discarded)
-                    } else {
-                        run_privileged_recover(send)
+            Err(e) => {
+                self.log(format!("Could not delete {}: {}", path.display(), e), cx);
+                self.progress.text = "Could not delete the download — remove it by hand".into();
+            }
+        }
+        guard.release();
+        toast(window, cx, message);
+        cx.notify();
+    }
+
+    fn cancel_download(&mut self) {
+        if let Some(flag) = &self.state.borrow().download_cancel {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    // ── Open a local file ────────────────────────────────────────────────────
+
+    fn open_file_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !actions_enabled(&self.state.borrow()).open_file {
+            return;
+        }
+        // The desktop's file dialog, through the portal. GPUI can't give it a
+        // file-type filter, so the name is checked after the pick.
+        let picked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Open".into()) });
+        let view = cx.weak_entity();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = picked.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        let _ = view.update(cx, |this, cx| this.file_picked(path, window, cx));
                     }
+                }
+                Ok(Ok(None)) | Err(_) => {}
+                Ok(Err(e)) => toast(window, cx, &format!("Could not open the file dialog: {e:#}")),
+            });
+        })
+        .detach();
+    }
+
+    fn file_picked(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if !path.to_string_lossy().ends_with(".run") {
+            show_error(NOT_A_RUN_FILE, &format!("{} is not an NVIDIA driver .run file.", path.display()), window, cx);
+            return;
+        }
+        // The install script refuses symlinks; use the file itself. The
+        // checks run commands (getent, getfacl): not on this thread.
+        let view = cx.weak_entity();
+        spawn_async(
+            window,
+            cx,
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let path = std::fs::canonicalize(&path).unwrap_or(path);
+                    let path_str = path.to_string_lossy().to_string();
+                    let checked = check_run_file(&path_str);
+                    (path_str, checked)
                 })
-                .await;
-                let _ = result_tx.send(result);
-            });
-            let log_fn = log_fn.clone();
-            let progress = progress.clone();
-            let toast_overlay = toast_overlay.clone();
-            let load_sysinfo = load_sysinfo.clone();
-            let window = window.clone();
-            glib::MainContext::default().spawn_local(async move {
-                while let Some(line) = line_rx.recv().await {
-                    log_fn(line);
-                }
-                let result = match result_rx.await {
-                    Ok(Ok(r)) => r.map_err(|e| format!("{e:#}")),
-                    Ok(Err(e)) => Err(e.to_string()),
-                    Err(_) => Err("the restore task ended unexpectedly".to_string()),
-                };
-                guard.release();
-                progress.set_visible(false);
-                match result {
-                    Ok(Recovered::Restored) => {
-                        log_fn("The previous driver setup is back and checked.".to_string());
-                        toast_overlay.add_toast(Toast::new("Previous driver restored"));
+                .await
+            },
+            move |checked, window, cx| {
+                let Ok((path_str, checked)) = checked else { return };
+                let _ = view.update(cx, |this, cx| {
+                    if let Err(e) = checked {
+                        this.log(format!("Can't use {path_str}: {e}"), cx);
+                        show_error("This file can't be installed", &e.to_string(), window, cx);
+                        return;
                     }
-                    Ok(Recovered::Nothing) => {
-                        log_fn("Nothing needed putting back: that install had finished.".to_string());
-                        toast_overlay.add_toast(Toast::new("Nothing needed restoring"));
+                    this.log(format!("Opened local file: {path_str}"), cx);
+                    {
+                        let mut s = this.state.borrow_mut();
+                        s.downloaded_path = Some(path_str);
+                        s.expected_checksum = None;
                     }
-                    Ok(Recovered::Discarded) => {
-                        log_fn("The recovery data was discarded; the driver is left as it is.".to_string());
-                        toast_overlay.add_toast(Toast::new("Recovery data discarded"));
-                    }
-                    Err(e) if discard => {
-                        log_fn(format!("Discarding failed: {e}"));
-                        show_error(&window, "Discarding the recovery data failed", &e);
-                    }
-                    Err(e) => {
-                        log_fn(format!("Restoring failed: {e}"));
-                        show_error(&window, "Restoring the previous driver failed", &e);
-                    }
-                }
-                load_sysinfo();
-            });
+                    this.page = Page::Configure;
+                    cx.notify();
+                });
+            },
+        );
+    }
+
+    // ── Install ──────────────────────────────────────────────────────────────
+
+    fn install_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let s = self.state.borrow();
+        if !actions_enabled(&s).install {
+            return;
+        }
+        let Some(run_file) = s.downloaded_path.clone() else { return };
+
+        if s.sysinfo.free_disk_bytes.is_some_and(|free| free < MIN_DISK_BYTES) {
+            toast(window, cx, "Warning: low disk space — install may fail");
+        }
+
+        // Refuse module flavors that cannot work, before asking for a password.
+        let driver_major = Path::new(&run_file)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(version_from_filename)
+            .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
+        if let Err(msg) = validate_module_choice(s.module_choice, &s.sysinfo.gpu_compute_caps, driver_major) {
+            drop(s);
+            self.log(format!("Install not started: {msg}"), cx);
+            toast(window, cx, &msg);
+            return;
+        }
+
+        let opts = InstallOptions {
+            use_dkms: s.use_dkms,
+            block_distro_driver: s.block_distro_driver,
+            module: s.module_choice,
+            run_file,
+            sha256: s.expected_checksum.clone(),
+            discard_recovery: s.discard_recovery_next,
+        };
+        drop(s);
+        self.state.borrow_mut().discard_recovery_next = false;
+
+        let Some(guard) = BusyGuard::start(&self.state, Busy::Install) else {
+            return;
+        };
+        self.progress = ProgressBar { visible: true, fraction: None, text: "Installing… the desktop stays up; this takes a few minutes".into() };
+        self.page = Page::Log;
+        self.log(format!("Starting install: {}", opts.run_file), cx);
+        self.log("The new driver installs alongside the running one; reboot afterward to switch over.", cx);
+
+        // The script's output goes into the Log tab line by line as it runs;
+        // the result is shown only after the last line (the sender is dropped
+        // when the install call returns, before the result is sent).
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        crate::runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                run_privileged_install(&opts, |line| {
+                    let _ = line_tx.send(line.to_string());
+                })
+            })
+            .await;
+            let _ = result_tx.send(result);
         });
+
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(line) = line_rx.recv().await {
+                if this.update(cx, |this, cx| this.log(line, cx)).is_err() {
+                    return;
+                }
+            }
+            let result: Result<anyhow::Result<()>, String> = match result_rx.await {
+                Ok(Ok(r)) => Ok(r),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("the install task ended unexpectedly".to_string()),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                guard.release();
+                this.progress.visible = false;
+                match result {
+                    Ok(Ok(())) => {
+                        this.log("Install completed successfully.", cx);
+                        this.log("Reboot to switch to the new driver.", cx);
+                        toast(window, cx, "Install complete — reboot to activate");
+                    }
+                    Ok(Err(e)) if e.downcast_ref::<StaleRecovery>().is_some() => {
+                        this.log(format!("Install not started: {e}"), cx);
+                        // Only on the user's word: install anyway, dropping that data.
+                        let view = cx.weak_entity();
+                        show_choice(
+                            Choice {
+                                id: "stale-recovery",
+                                title: "Recovery data from an interrupted install".into(),
+                                body: e.to_string().into(),
+                                buttons: vec![("stale-cancel", "Cancel", Look::Plain), ("stale-discard", "Discard and Install", Look::Danger)],
+                                default: 0,
+                                dismiss: 0,
+                            },
+                            move |answer, window, cx| {
+                                if answer == 1 {
+                                    let _ = view.update(cx, |this, cx| {
+                                        this.state.borrow_mut().discard_recovery_next = true;
+                                        this.install_clicked(window, cx);
+                                    });
+                                }
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                    Ok(Err(e)) => {
+                        this.log(format!("Install failed: {e:#}"), cx);
+                        show_error("Install failed", &format!("{e:#}"), window, cx);
+                    }
+                    Err(e) => this.log(format!("Task error: {e}"), cx),
+                }
+                // A failed install may have changed (or put back) packages too.
+                this.load_sysinfo(window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    // ── Module signing ───────────────────────────────────────────────────────
+
+    fn signing_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !actions_enabled(&self.state.borrow()).setup_signing {
+            return;
+        }
+        let prompt = cx.new(|cx| SigningPrompt::new(window, cx));
+        let view = cx.weak_entity();
+        let first = Cell::new(true);
+        let setup_focus = cx.focus_handle();
+        let cancel_focus = cx.focus_handle();
+        let done = Rc::new(Cell::new(false));
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if first.replace(false) {
+                prompt.read(cx).first.focus_handle(cx).focus(window, cx);
+            }
+            let valid = prompt.read(cx).valid;
+            // Takes the password out of the fields (they are cleared), then
+            // starts the setup once the dialog is out of the way.
+            let set_up = {
+                let prompt = prompt.clone();
+                let view = view.clone();
+                let done = done.clone();
+                move |window: &mut Window, cx: &mut App| {
+                    if done.replace(true) {
+                        return;
+                    }
+                    let password = prompt.update(cx, |prompt, cx| prompt.take_password(window, cx));
+                    if validate_mok_password(&password, &password).is_err() {
+                        return;
+                    }
+                    let view = view.clone();
+                    window.defer(cx, move |window, cx| {
+                        let _ = view.update(cx, |this, cx| this.run_signing_setup(password, window, cx));
+                    });
+                }
+            };
+            let enter = set_up.clone();
+            let (on_setup, on_cancel) = (setup_focus.clone(), cancel_focus.clone());
+            dialog
+                .title(dialog_title(SIGNING_TITLE))
+                .overlay(false)
+                .w(px(460.))
+                // Enter on Set Up Signing (once the passwords are fine) sets
+                // up, on Cancel cancels; in a field it does nothing.
+                .on_ok(move |_, window, cx| match enter_key(&[on_cancel.is_focused(window), on_setup.is_focused(window)]) {
+                    Some(1) if valid => {
+                        enter(window, cx);
+                        true
+                    }
+                    Some(0) => true,
+                    _ => false,
+                })
+                .child(
+                    named_group("signing", SIGNING_TITLE).child(div().id("body").max_h(dialog_room(window)).overflow_y_scroll().child(prompt.clone())).child(
+                        dialog_buttons()
+                            .child(Button::new("signing-cancel").label("Cancel").track_focus(&cancel_focus).on_click(|_, window, cx| window.close_dialog(cx)))
+                            .child(Button::new("signing-setup").primary().label("Set Up Signing").disabled(!valid).track_focus(&setup_focus).on_click(
+                                move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    set_up(window, cx);
+                                },
+                            )),
+                    ),
+                )
+        });
+    }
+
+    fn run_signing_setup(&mut self, password: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(guard) = BusyGuard::start(&self.state, Busy::Signing) else {
+            return;
+        };
+        self.page = Page::Log;
+        self.log("Setting up module signing…", cx);
+        let view = cx.weak_entity();
+        spawn_async(
+            window,
+            cx,
+            async move { tokio::task::spawn_blocking(move || run_privileged_setup_signing(&password)).await },
+            move |outcome, window, cx| {
+                guard.release();
+                let _ = view.update(cx, |this, cx| {
+                    match outcome {
+                        Ok(outcome) => {
+                            for line in &outcome.lines {
+                                this.log(line.clone(), cx);
+                            }
+                            match outcome.result {
+                                Ok(()) => {
+                                    this.log("Module signing setup finished.", cx);
+                                    toast(window, cx, "Module signing set up — see Log tab");
+                                }
+                                Err(e) => {
+                                    this.log(format!("Module signing setup failed: {e}"), cx);
+                                    toast(window, cx, "Signing setup failed — see Log tab");
+                                }
+                            }
+                        }
+                        Err(e) => this.log(format!("Task error: {e}"), cx),
+                    }
+                    this.load_sysinfo(window, cx);
+                });
+            },
+        );
+        cx.notify();
+    }
+
+    // ── Recovery from an interrupted install ─────────────────────────────────
+
+    fn status_checked(&mut self, pending: bool, note: Option<RecoveryNote>, running: bool, window: &mut Window, cx: &mut Context<Self>) {
+        run_deferred_releases();
+        // Redrawn on every check: an operation whose task ended without its
+        // callback (see BusyGuard) shows as ended within two seconds.
+        cx.notify();
+        if self.state.borrow().busy.is_some() {
+            return;
+        }
+        self.recover = pending.then(|| match note {
+            Some(RecoveryNote::Refused(why)) => RecoverBanner {
+                text: format!(
+                    "An earlier driver install was interrupted, but its recovery data no \
+                     longer matches this computer: {why}. Nothing was restored."
+                ),
+                button: "Retry or Discard…",
+                discards: true,
+            },
+            Some(RecoveryNote::Failed(why)) => {
+                RecoverBanner { text: format!("Restoring the driver from before an interrupted install failed: {why}."), button: "Try Again", discards: false }
+            }
+            None => RecoverBanner { text: RECOVER_TEXT.to_string(), button: "Restore Previous Driver", discards: false },
+        });
+        if running != self.state.borrow().external_install {
+            self.state.borrow_mut().external_install = running;
+            if !running {
+                self.load_sysinfo(window, cx);
+            }
+        }
+    }
+
+    fn recover_clicked(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.recover.as_ref().is_some_and(|r| r.discards) {
+            self.run_recovery(false, window, cx);
+            return;
+        }
         // Data that no longer matched the computer when last checked: the
         // user picks between trying again (it is checked again, and restored
         // if the reason has gone) and discarding it.
-        recover_banner.connect_button_clicked(move |_| {
-            if !recover_discards.get() {
-                run_op(false);
-                return;
-            }
-            let dialog = libadwaita::AlertDialog::new(
-                Some("Recovery data from an interrupted install"),
-                Some(
-                    "When it was last checked, this data no longer matched the computer. Retry \
-                     Recovery checks again and restores the previous driver if it matches now. \
-                     Discard Recovery Data drops it for good, keeping the driver as it is.",
-                ),
-            );
-            dialog.add_responses(&[("cancel", "Cancel"), ("discard", "Discard Recovery Data"), ("retry", "Retry Recovery")]);
-            dialog.set_response_appearance("discard", libadwaita::ResponseAppearance::Destructive);
-            dialog.set_default_response(Some("retry"));
-            dialog.set_close_response("cancel");
-            let run_op = run_op.clone();
-            dialog.choose(Some(&dialog_window), gio::Cancellable::NONE, move |response| match response.as_str() {
-                "retry" => run_op(false),
-                "discard" => run_op(true),
-                _ => {}
-            });
-        });
+        let view = cx.weak_entity();
+        show_choice(
+            Choice {
+                id: "recovery-question",
+                title: "Recovery data from an interrupted install".into(),
+                body: "When it was last checked, this data no longer matched the computer. Retry \
+                       Recovery checks again and restores the previous driver if it matches now. \
+                       Discard Recovery Data drops it for good, keeping the driver as it is."
+                    .into(),
+                buttons: vec![
+                    ("recovery-cancel", "Cancel", Look::Plain),
+                    ("recovery-discard", "Discard Recovery Data", Look::Danger),
+                    ("recovery-retry", "Retry Recovery", Look::Primary),
+                ],
+                default: 2,
+                dismiss: 0,
+            },
+            move |answer, window, cx| {
+                let _ = view.update(cx, |this, cx| match answer {
+                    2 => this.run_recovery(false, window, cx),
+                    1 => this.run_recovery(true, window, cx),
+                    _ => {}
+                });
+            },
+            window,
+            cx,
+        );
     }
 
-    // An install started before this window opened (the app was closed
-    // during it) is still running: say so and start nothing until it ends.
-    {
-        let state = state.clone();
-        let refresh_actions = refresh_actions.clone();
-        let running_banner = running_banner.clone();
-        let recover_banner = recover_banner.clone();
-        let recover_discards = recover_discards.clone();
-        let load_sysinfo = load_sysinfo.clone();
-        let check = move || {
-            if state.borrow().busy.is_some() {
-                return glib::ControlFlow::Continue;
-            }
-            if recovery_pending() {
-                let (text, button, discards) = match recovery_note() {
-                    Some(RecoveryNote::Refused(why)) => (
-                        format!(
-                            "An earlier driver install was interrupted, but its recovery data no \
-                             longer matches this computer: {why}. Nothing was restored."
-                        ),
-                        "Retry or Discard…",
-                        true,
-                    ),
-                    Some(RecoveryNote::Failed(why)) => (format!("Restoring the driver from before an interrupted install failed: {why}."), "Try Again", false),
-                    None => (RECOVER_TEXT.to_string(), "Restore Previous Driver", false),
+    /// Restore (false) or discard (true) the recovery data.
+    fn run_recovery(&mut self, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(guard) = BusyGuard::start(&self.state, Busy::Install) else {
+            // The banner stays up while something else runs: say why nothing happened.
+            toast(window, cx, "Wait until the running operation has finished");
+            return;
+        };
+        self.recover = None;
+        self.page = Page::Log;
+        if discard {
+            self.progress = ProgressBar { visible: true, fraction: None, text: "Discarding the recovery data…".into() };
+            self.log("Discarding the recovery data of the interrupted install, as chosen…", cx);
+        } else {
+            self.progress = ProgressBar { visible: true, fraction: None, text: "Restoring the previous driver…".into() };
+            self.log("Restoring the driver setup from before the interrupted install…", cx);
+        }
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        crate::runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let send = |line: &str| {
+                    let _ = line_tx.send(line.to_string());
                 };
-                recover_banner.set_title(&text);
-                recover_banner.set_button_label(Some(button));
-                recover_discards.set(discards);
-                recover_banner.set_revealed(true);
-            } else {
-                recover_banner.set_revealed(false);
-            }
-            let running = install_running();
-            if running != state.borrow().external_install {
-                state.borrow_mut().external_install = running;
-                running_banner.set_revealed(running);
-                refresh_actions();
-                if !running {
-                    load_sysinfo();
+                if discard {
+                    run_privileged_discard_recovery(send).map(|()| Recovered::Discarded)
+                } else {
+                    run_privileged_recover(send)
+                }
+            })
+            .await;
+            let _ = result_tx.send(result);
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            while let Some(line) = line_rx.recv().await {
+                if this.update(cx, |this, cx| this.log(line, cx)).is_err() {
+                    return;
                 }
             }
-            glib::ControlFlow::Continue
-        };
-        check();
-        glib::timeout_add_seconds_local(2, check);
+            let result = match result_rx.await {
+                Ok(Ok(r)) => r.map_err(|e| format!("{e:#}")),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err("the restore task ended unexpectedly".to_string()),
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                guard.release();
+                this.progress.visible = false;
+                match result {
+                    Ok(Recovered::Restored) => {
+                        this.log("The previous driver setup is back and checked.", cx);
+                        toast(window, cx, "Previous driver restored");
+                    }
+                    Ok(Recovered::Nothing) => {
+                        this.log("Nothing needed putting back: that install had finished.", cx);
+                        toast(window, cx, "Nothing needed restoring");
+                    }
+                    Ok(Recovered::Discarded) => {
+                        this.log("The recovery data was discarded; the driver is left as it is.", cx);
+                        toast(window, cx, "Recovery data discarded");
+                    }
+                    Err(e) if discard => {
+                        this.log(format!("Discarding failed: {e}"), cx);
+                        show_error("Discarding the recovery data failed", &e, window, cx);
+                    }
+                    Err(e) => {
+                        this.log(format!("Restoring failed: {e}"), cx);
+                        show_error("Restoring the previous driver failed", &e, window, cx);
+                    }
+                }
+                this.load_sysinfo(window, cx);
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
-    window.present();
+    // ── Rendering ────────────────────────────────────────────────────────────
+
+    fn render_system(&self, cx: &mut Context<Self>) -> AnyElement {
+        let s = self.state.borrow();
+        let loaded = s.sysinfo_loaded;
+        let info = &s.sysinfo;
+        let refreshing = self.sysinfo_refreshing;
+        let value = |checking: &str, text: String| if loaded { text } else { checking.to_string() };
+
+        let gpu = if refreshing { "Detecting…".to_string() } else { value("Detecting…", info.gpu_name.clone().unwrap_or_else(|| "Not detected".into())) };
+        let driver = if refreshing {
+            "Detecting…".to_string()
+        } else {
+            value("Detecting…", info.installed_driver.clone().unwrap_or_else(|| "Not installed".into()))
+        };
+        let gens = if info.gpu_compute_caps.is_empty() {
+            String::new()
+        } else {
+            let mut g: Vec<&str> = info.gpu_compute_caps.iter().map(|c| crate::preflight::generation_name(*c)).collect();
+            g.dedup();
+            format!(" ({})", g.join(", "))
+        };
+        let module = value("Detecting…", format!("{}{}", info.module_flavor, gens));
+        let kernel = value("Detecting…", info.kernel_version.clone());
+        let dkms = value(
+            "Checking…",
+            if info.dkms_status.is_empty() {
+                "No NVIDIA DKMS modules registered".to_string()
+            } else {
+                info.dkms_status.iter().map(|e| format!("{}/{} [{}] {}", e.module, e.version, e.kernel, e.status)).collect::<Vec<_>>().join("\n")
+            },
+        );
+        let secure_boot = value("Checking…", secure_boot_summary(&info.secure_boot, &info.signing_key));
+        let mut signing_text = signing_summary(&info.signing_key, &info.module_signature);
+        if info.signing_pair.as_ref().is_some_and(|p| p.key_hidden) {
+            signing_text.push_str("\nIts private key is readable only by root, so it is checked during the install.");
+        }
+        let signing = value("Checking…", signing_text);
+        let disk =
+            value("Checking…", info.free_disk_bytes.map(|free| format!("{} free on /", format_bytes(free))).unwrap_or_else(|| "Could not determine".into()));
+        let reboot = value("Checking…", if info.reboot_required { "Yes — new driver installed, reboot to activate".into() } else { "No".into() });
+        let actions = actions_enabled(&s);
+        // Nothing to set up once the key is enrolled or queued: no button
+        // rather than an action that looks needed.
+        let show_signing = !loaded || info.signing_key.setup_needed();
+        drop(s);
+
+        let signing_button = show_signing.then(|| {
+            Button::new("setup-signing")
+                .label("Set Up Signing")
+                .disabled(!actions.setup_signing)
+                .tooltip("Create or reuse this computer's module-signing key and enroll it")
+                .on_click(cx.listener(|this, _, window, cx| this.signing_clicked(window, cx)))
+        });
+
+        page_scroll("system-page")
+            .child(group(
+                "hardware",
+                "Hardware",
+                vec![
+                    row("gpu", "GPU", gpu, None, cx),
+                    row("driver", "Installed Driver", driver, None, cx),
+                    row("module", "Kernel Module", module, None, cx),
+                    row("kernel", "Kernel", kernel, None, cx),
+                ],
+                cx,
+            ))
+            .child(group(
+                "status",
+                "Status",
+                vec![
+                    row("dkms", "DKMS Modules", dkms, None, cx),
+                    row("secure-boot", "Secure Boot", secure_boot, None, cx),
+                    row("signing", "Module Signing", signing, signing_button.map(|b| b.into_any_element()), cx),
+                    row("disk", "Free Disk Space", disk, None, cx),
+                    row("reboot", "Reboot Required", reboot, None, cx),
+                ],
+                cx,
+            ))
+            .child(h_flex().justify_center().child(
+                Button::new("refresh-sysinfo").ghost().label("Refresh System Info").on_click(cx.listener(|this, _, window, cx| this.load_sysinfo(window, cx))),
+            ))
+            .into_any_element()
+    }
+
+    fn render_browse(&self, cx: &mut Context<Self>) -> AnyElement {
+        let visible = self.visible_versions(cx);
+        let s = self.state.borrow();
+        let installed = s.sysinfo.installed_driver.clone();
+        let selected = s.selected_version.as_ref().map(|v| v.version.clone());
+        let actions = actions_enabled(&s);
+        drop(s);
+
+        let status_text = match (&self.list_status, &selected) {
+            (ListStatus::Loading, _) => "Loading…".to_string(),
+            (ListStatus::Failed(_), _) => "Could not load version list".to_string(),
+            (ListStatus::Loaded, Some(v)) => format!("Selected: {v}"),
+            (ListStatus::Loaded, None) => "No version selected".to_string(),
+        };
+
+        let theme = cx.theme().clone();
+        let count = visible.len();
+        let rows = Rc::new(visible);
+        let list = uniform_list("versions", count, {
+            let rows = rows.clone();
+            let installed = installed.clone();
+            let selected = selected.clone();
+            cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                range
+                    .map(|ix| {
+                        let ver = &rows[ix];
+                        version_row(ver, ix, installed.as_deref(), selected.as_deref() == Some(ver.version.as_str()), cx)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .track_scroll(&self.list_scroll)
+        .size_full();
+
+        v_flex()
+            .size_full()
+            .when_some(
+                match &self.list_status {
+                    ListStatus::Failed(e) => Some(e.clone()),
+                    _ => None,
+                },
+                |page, e| page.child(banner("list-error", e, None, cx)),
+            )
+            .child(div().px_3().pt_3().child(Input::new(&self.filter).cleanable(true).aria_label("Filter versions")))
+            .child(
+                div()
+                    .id("version-list")
+                    .role(Role::List)
+                    .aria_label("Driver versions")
+                    .flex_1()
+                    .min_h_0()
+                    .m_3()
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(theme.radius)
+                    .bg(theme.secondary)
+                    .focusable()
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.list_key(event, cx)))
+                    .map(|list_box| match self.list_status {
+                        ListStatus::Loading => list_box.flex().items_center().justify_center().child(Progress::new("list-loading").loading(true).w(px(160.))),
+                        _ => list_box.child(list),
+                    }),
+            )
+            .child(h_flex().justify_center().text_sm().text_color(theme.muted_foreground).child(label("selected", status_text)))
+            .child(
+                h_flex()
+                    .justify_between()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new("open-file")
+                            .ghost()
+                            .label("Open .run File…")
+                            .tooltip("Use a locally downloaded .run file")
+                            .disabled(!actions.open_file)
+                            .on_click(cx.listener(|this, _, window, cx| this.open_file_clicked(window, cx))),
+                    )
+                    .child(
+                        Button::new("download")
+                            .primary()
+                            .label("Download")
+                            .disabled(!actions.download)
+                            .on_click(cx.listener(|this, _, window, cx| this.download_clicked(window, cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_configure(&self, cx: &mut Context<Self>) -> AnyElement {
+        let s = self.state.borrow();
+        let actions = actions_enabled(&s);
+
+        // The file to install.
+        let (file_title, file_sub, checksum, version_status) = match &s.downloaded_path {
+            Some(path) => {
+                let fname = Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
+                let checksum = match s.expected_checksum.as_deref().filter(|c| is_sha256_hex(c)) {
+                    Some(cs) => format!("SHA256: {}… (verified)", &cs[..16]),
+                    None => "No checksum available".to_string(),
+                };
+                let parsed = version_from_filename(&fname);
+                let status = if parsed.is_none() {
+                    // e.g. NVIDIA-Linux-x86_64-595.84-vulkan.run — don't guess.
+                    "Unknown".to_string()
+                } else if let (Some(inst), Some(candidate)) = (s.sysinfo.installed_driver.as_ref(), parsed.as_deref()) {
+                    match compare_versions(inst, candidate) {
+                        VersionRelation::Newer => format!("Upgrade: {inst} → {candidate}"),
+                        VersionRelation::Same => format!("Reinstall: same version ({inst})"),
+                        VersionRelation::Older => format!("Downgrade: {inst} → {candidate}"),
+                        VersionRelation::Unknown => "—".to_string(),
+                    }
+                } else {
+                    "No driver currently installed".to_string()
+                };
+                (fname, path.clone(), checksum, status)
+            }
+            None => ("No file selected".to_string(), "Go to Browse tab to select or download a driver".to_string(), "—".to_string(), "—".to_string()),
+        };
+
+        let disk = match s.sysinfo.free_disk_bytes {
+            Some(free) if free < MIN_DISK_BYTES => format!("Low: {} free (2 GB recommended)", format_bytes(free)),
+            Some(free) => format!("{} free", format_bytes(free)),
+            None => "Could not determine".to_string(),
+        };
+        let secure_boot = match &s.sysinfo.secure_boot {
+            SecureBootStatus::Enabled => secure_boot_advice(&s.sysinfo.secure_boot, &s.sysinfo.signing_key, s.sysinfo.signing_pair.as_ref(), s.use_dkms)
+                .unwrap_or_else(|| "Enabled".to_string()),
+            SecureBootStatus::Disabled => "Disabled".to_string(),
+            SecureBootStatus::Unknown => "Unknown".to_string(),
+        };
+        let packages = conflict_summary(&s.sysinfo.distro_packages).unwrap_or_else(|| "None found".to_string());
+        let hint = module_hint(&s.sysinfo.gpu_compute_caps);
+        let use_dkms = s.use_dkms;
+        let block = s.block_distro_driver;
+        let block_supported = !s.sysinfo_loaded || s.sysinfo.block_supported;
+        let module_index = match s.module_choice {
+            ModuleChoice::Auto => 0,
+            ModuleChoice::Open => 1,
+            ModuleChoice::Proprietary => 2,
+        };
+        let downloading = s.busy == Some(Busy::Download) && s.download_cancel.is_some();
+        drop(s);
+
+        let dkms_switch =
+            Switch::new("dkms-switch").checked(use_dkms).accessibility_label("Enable DKMS").on_click(cx.listener(|this, checked: &bool, _, cx| {
+                // The Secure Boot advice depends on it.
+                this.state.borrow_mut().use_dkms = *checked;
+                cx.notify();
+            }));
+        let block_switch = Switch::new("block-switch").checked(block).disabled(!block_supported).accessibility_label("Block Distro Driver Packages").on_click(
+            cx.listener(|this, checked: &bool, _, cx| {
+                this.state.borrow_mut().block_distro_driver = *checked;
+                cx.notify();
+            }),
+        );
+        let modules = RadioGroup::horizontal("module-choice")
+            .selected_index(Some(module_index))
+            .children([
+                Radio::new("module-auto").label("Automatic (recommended)"),
+                Radio::new("module-open").label("Open"),
+                Radio::new("module-proprietary").label("Proprietary"),
+            ])
+            .on_click(cx.listener(|this, index: &usize, _, cx| {
+                this.state.borrow_mut().module_choice = match index {
+                    1 => ModuleChoice::Open,
+                    2 => ModuleChoice::Proprietary,
+                    _ => ModuleChoice::Auto,
+                };
+                cx.notify();
+            }));
+
+        let progress = &self.progress;
+        page_scroll("configure-page")
+            .child(group(
+                "selected-driver",
+                "Selected Driver",
+                vec![
+                    row("file", file_title, file_sub, None, cx),
+                    row("checksum", "Checksum", checksum, None, cx),
+                    row("version-status", "Version Status", version_status, None, cx),
+                ],
+                cx,
+            ))
+            .child(group(
+                "checks",
+                "Pre-install Checks",
+                vec![
+                    row("disk-check", "Disk Space", disk, None, cx),
+                    row("secure-boot-check", "Secure Boot", secure_boot, None, cx),
+                    row("packages-check", "Existing Driver Packages", packages, None, cx),
+                ],
+                cx,
+            ))
+            .child(group(
+                "options",
+                "Install Options",
+                vec![
+                    row("dkms-option", "Enable DKMS", "Automatically rebuild kernel module on kernel updates", Some(dkms_switch.into_any_element()), cx),
+                    v_flex().gap_2().child(row("module-option", "Kernel Module", hint, None, cx)).child(div().px_3().pb_3().child(modules)).into_any_element(),
+                    row(
+                        "block-option",
+                        "Block Distro Driver Packages",
+                        if block_supported { BLOCK_SUBTITLE } else { "Not available here: this dnf has no way to exclude packages for good" },
+                        Some(block_switch.into_any_element()),
+                        cx,
+                    ),
+                ],
+                cx,
+            ))
+            .when(progress.visible, |page| {
+                page.child(
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            Progress::new("progress")
+                                .accessibility_label(progress.text.clone())
+                                .loading(progress.fraction.is_none())
+                                .value(progress.fraction.unwrap_or(0.0) * 100.0),
+                        )
+                        .child(h_flex().justify_center().text_sm().child(label("progress-text", progress.text.clone()))),
+                )
+            })
+            .child(
+                h_flex()
+                    .justify_center()
+                    .gap_2()
+                    .pt_2()
+                    .child(
+                        Button::new("install")
+                            .primary()
+                            .label("Install Driver")
+                            .disabled(!actions.install)
+                            .on_click(cx.listener(|this, _, window, cx| this.install_clicked(window, cx))),
+                    )
+                    .when(downloading, |buttons| {
+                        buttons.child(
+                            Button::new("cancel-download").danger().label("Cancel Download").on_click(cx.listener(|this, _, _, _| this.cancel_download())),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_log(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let text: String = self.log.iter().map(|l| format!("{l}\n")).collect();
+        v_flex()
+            .size_full()
+            .child(
+                div()
+                    .id("log")
+                    .role(Role::Log)
+                    .aria_label("Log")
+                    .flex_1()
+                    .min_h_0()
+                    .m_2()
+                    .p_2()
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded(theme.radius)
+                    .bg(theme.secondary)
+                    .font_family(theme.mono_font_family.clone())
+                    .text_sm()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.log_scroll)
+                    .children(self.log.iter().enumerate().map(|(i, line)| div().w_full().child(label(("log-line", i), line.clone())))),
+            )
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_2()
+                    .px_2()
+                    .pb_2()
+                    .child(
+                        Button::new("copy-log")
+                            .ghost()
+                            .label("Copy Log")
+                            .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone()))),
+                    )
+                    .child(Button::new("clear-log").ghost().label("Clear Log").on_click(cx.listener(|this, _, _, cx| {
+                        this.log.clear();
+                        cx.notify();
+                    }))),
+            )
+            .into_any_element()
+    }
 }
+
+impl Render for MainView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let page_index = PAGES.iter().position(|(p, _)| *p == self.page).unwrap_or(0);
+        let (reboot_required, external_install) = {
+            let s = self.state.borrow();
+            (s.sysinfo.reboot_required, s.external_install)
+        };
+        let state = self.state.clone();
+        let allow_close = self.allow_close.clone();
+
+        let title_bar = TitleBar::new()
+            .on_close_window(move |_, window, cx| {
+                if close_allowed(&state, &allow_close, window, cx) {
+                    window.remove_window();
+                }
+            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    // Clicks on the buttons must not start a window drag.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new("refresh")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw))
+                            .tooltip("Refresh version list")
+                            .accessibility_label("Refresh version list")
+                            .on_click(cx.listener(|this, _, window, cx| this.load_versions(window, cx))),
+                    ),
+            )
+            .child(div().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(
+                TabBar::new("pages").segmented().small().selected_index(page_index).children(PAGES.iter().map(|(_, name)| Tab::new().label(*name))).on_click(
+                    cx.listener(|this, index: &usize, _, cx| {
+                        this.page = PAGES[*index].0;
+                        cx.notify();
+                    }),
+                ),
+            ))
+            .child(
+                h_flex().px_2().on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()).child(
+                    Button::new("about")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(gpui_kit::component::IconName::Info))
+                        .tooltip("About")
+                        .accessibility_label("About")
+                        .on_click(cx.listener(|this, _, window, cx| this.show_about(window, cx))),
+                ),
+            );
+
+        let content = match self.page {
+            Page::System => self.render_system(cx),
+            Page::Browse => self.render_browse(cx),
+            Page::Configure => self.render_configure(cx),
+            Page::Log => self.render_log(cx),
+        };
+
+        let recover_banner = self.recover.as_ref().map(|r| {
+            let button = Button::new("recover").small().label(r.button).on_click(cx.listener(|this, _, window, cx| this.recover_clicked(window, cx)));
+            banner("recover-banner", r.text.clone(), Some(button.into_any_element()), cx)
+        });
+
+        v_flex()
+            .id("main")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .child(title_bar)
+            .when_some(self.setup_problem.clone(), |main, text| main.child(banner("setup-banner", text, None, cx)))
+            .when(reboot_required, |main| main.child(banner("reboot-banner", "A reboot is required to activate the new driver.", None, cx)))
+            .when(external_install, |main| {
+                main.child(banner(
+                    "running-banner",
+                    "A driver install started earlier is still running. Don't reboot until it finishes; \
+                     its progress is in /var/log/green-light.log.",
+                    None,
+                    cx,
+                ))
+            })
+            .children(recover_banner)
+            .child(div().flex_1().min_h_0().child(content))
+            .child(Announcer(ANNOUNCEMENT.with(|text| text.borrow().clone())))
+    }
+}
+
+impl MainView {
+    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (driver, gpu, kernel) = {
+            let s = self.state.borrow();
+            (
+                s.sysinfo.installed_driver.clone().unwrap_or_else(|| "Not detected".to_string()),
+                s.sysinfo.gpu_name.clone().unwrap_or_else(|| "Not detected".to_string()),
+                s.sysinfo.kernel_version.clone(),
+            )
+        };
+        let icon = Arc::new(Image::from_bytes(ImageFormat::Png, include_bytes!("../data/green-light-128.png").to_vec()));
+        let close_focus = cx.focus_handle();
+        let first = Cell::new(true);
+        window.open_dialog(cx, move |dialog, window, cx| {
+            if first.replace(false) {
+                close_focus.focus(window, cx);
+            }
+            let muted = cx.theme().muted_foreground;
+            dialog.title(dialog_title(ABOUT_TITLE)).overlay(false).w(px(400.)).child(
+                named_group("about", ABOUT_TITLE)
+                    .child(
+                        v_flex()
+                            .id("body")
+                            .max_h(dialog_room(window))
+                            .overflow_y_scroll()
+                            .gap_1()
+                            .items_center()
+                            // Fixed size: in the scrolling column it would otherwise shrink
+                            // when the dialog is short (to 16 px on a small screen).
+                            .child(img(icon.clone()).size(px(64.)).flex_none())
+                            .child(div().text_xl().font_weight(FontWeight::BOLD).child(label("name", "Green Light")))
+                            .child(div().text_color(muted).child(label("version", env!("CARGO_PKG_VERSION"))))
+                            .child(div().text_center().child(label("summary", "A GUI for installing NVIDIA drivers from official .run files.")))
+                            .child(
+                                v_flex()
+                                    .items_center()
+                                    .text_sm()
+                                    .child(label("gpu", format!("GPU: {gpu}")))
+                                    .child(label("driver", format!("Driver: {driver}")))
+                                    .child(label("kernel", format!("Kernel: {kernel}"))),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_4()
+                                    .child(Link::new("about-website").href(WEBSITE).child("Website"))
+                                    .child(Link::new("about-issues").href(ISSUES).child("Report an Issue")),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .text_center()
+                                    .child(label("developer", "Developer: Linnard Alex Brown Jr."))
+                                    .child(label("built-with", "Built with: Claude Code (Anthropic), Codex (OpenAI)"))
+                                    .child(label("license", "License: AGPL-3.0-or-later")),
+                            ),
+                    )
+                    .child(
+                        dialog_buttons()
+                            .child(Button::new("about-close").track_focus(&close_focus).label("Close").on_click(|_, window, cx| window.close_dialog(cx))),
+                    ),
+            )
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Building blocks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A page's scrollable column.
+fn page_scroll(id: &'static str) -> Stateful<Div> {
+    v_flex().id(id).size_full().overflow_y_scroll().p_3().gap_4()
+}
+
+/// A titled box of rows.
+fn group(id: &'static str, title: &'static str, rows: Vec<AnyElement>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let count = rows.len();
+    v_flex()
+        .id(id)
+        .role(Role::Group)
+        .aria_label(title)
+        .gap_2()
+        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(label((id, 0usize), title)))
+        .child(
+            v_flex()
+                .w_full()
+                .border_1()
+                .border_color(theme.border)
+                .rounded(theme.radius)
+                .bg(theme.secondary)
+                .children(rows.into_iter().enumerate().map(|(i, r)| div().when(i > 0 && i < count, |d| d.border_t_1().border_color(theme.border)).child(r))),
+        )
+}
+
+/// A row: a title, a line (or more) of text under it, and an optional
+/// control on the right.
+fn row(id: &'static str, title: impl Into<SharedString>, subtitle: impl Into<SharedString>, suffix: Option<AnyElement>, cx: &App) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    h_flex()
+        .id(id)
+        .w_full()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(label((id, 0usize), title.into()))
+                .child(div().text_sm().text_color(muted).child(label((id, 1usize), subtitle.into()))),
+        )
+        .children(suffix)
+        .into_any_element()
+}
+
+/// A notice across the top of the window, with an optional button.
+fn banner(id: &'static str, text: impl Into<SharedString>, button: Option<AnyElement>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    h_flex()
+        .id(id)
+        .role(Role::Status)
+        .w_full()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .bg(theme.accent)
+        .text_color(theme.accent_foreground)
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().flex_1().min_w_0().text_sm().child(label((id, 0usize), text.into())))
+        .children(button)
+}
+
+/// One version in the Browse list.
+fn version_row(ver: &DriverVersion, index: usize, installed: Option<&str>, selected: bool, cx: &mut Context<MainView>) -> impl IntoElement {
+    let theme = cx.theme().clone();
+    let subtitle = match installed {
+        Some(inst) => match compare_versions(inst, &ver.version) {
+            VersionRelation::Newer => format!("{} · Upgrade available", ver.filename),
+            VersionRelation::Same => format!("{} · Currently installed", ver.filename),
+            VersionRelation::Older => format!("{} · Older than installed", ver.filename),
+            VersionRelation::Unknown => ver.filename.clone(),
+        },
+        None => ver.filename.clone(),
+    };
+    let is_installed = installed == Some(ver.version.as_str());
+    let key = ver.version.clone();
+    let id = |part: &str| ElementId::Name(format!("{part}:{key}").into());
+    let version = ver.version.clone();
+    h_flex()
+        .id(id("row"))
+        .role(Role::ListItem)
+        .aria_label(format!("{}, {}", ver.version, subtitle))
+        .aria_selected(selected)
+        .w_full()
+        .h(px(VERSION_ROW_HEIGHT))
+        .gap_3()
+        .px_3()
+        .when(index > 0, |r| r.border_t_1().border_color(theme.border))
+        .when(selected, |r| r.bg(theme.list_active).border_color(theme.list_active_border))
+        .when(!selected, |r| r.hover(|r| r.bg(theme.list_hover)))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _, _, cx| this.select_version(&version, cx)))
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div().when(is_installed, |d| d.text_color(theme.success)).font_weight(FontWeight::MEDIUM).child(label(id("version"), ver.version.clone())),
+                )
+                .child(div().text_sm().text_color(theme.muted_foreground).truncate().child(label(id("file"), subtitle))),
+        )
+        .when_some(ver.branch, |r, branch| r.child(branch_tag(branch, theme.is_dark()).child(label(id("branch"), branch.label()))))
+}
+
+/// The rows of the Browse list all have this height (the list draws only
+/// the rows in view).
+const VERSION_ROW_HEIGHT: f32 = 52.;
+
+/// Branch badge (Production/New Feature/Older Production/Legacy), from
+/// NVIDIA's own data; omitted rather than guessed without it.
+fn branch_tag(branch: DriverBranch, dark: bool) -> Tag {
+    let (background, text) = branch_colors(branch, dark);
+    Tag::custom(background, text, text.opacity(0.4)).small().rounded_full()
+}
+
+/// A branch badge's background and text colours: a tint of the branch's
+/// colour with text of the same hue that reads on it, in the light and the
+/// dark theme alike (at least 4.5:1, see the tests). The toolkit's own
+/// success and info tags put light text on a light green or cyan in its dark
+/// theme.
+fn branch_colors(branch: DriverBranch, dark: bool) -> (Hsla, Hsla) {
+    let (hue, saturation) = match branch {
+        DriverBranch::Production => (142., 0.65),
+        DriverBranch::NewFeature => (199., 0.75),
+        DriverBranch::OlderProduction => (38., 0.85),
+        DriverBranch::Legacy => (220., 0.12),
+    };
+    let hue = hue / 360.;
+    if dark {
+        (hsla(hue, saturation * 0.6, 0.17, 1.), hsla(hue, saturation, 0.80, 1.))
+    } else {
+        (hsla(hue, saturation, 0.92, 1.), hsla(hue, saturation, 0.24, 1.))
+    }
+}
+
+/// The download's progress bar value and text for (downloaded, total) bytes
+/// after `elapsed` seconds; with no total, an activity animation and the
+/// text unchanged.
+fn progress_text((dl, total): (u64, Option<u64>), elapsed: f64) -> (Option<f32>, Option<String>) {
+    let Some(t) = total.filter(|t| *t > 0) else {
+        return (None, None);
+    };
+    let speed = if elapsed > 0.0 { dl as f64 / elapsed } else { 0.0 };
+    let eta = if speed > 0.0 {
+        let remaining = t.saturating_sub(dl) as f64 / speed;
+        if remaining < 60.0 {
+            format!("{remaining:.0}s remaining")
+        } else {
+            format!("{:.0}m remaining", remaining / 60.0)
+        }
+    } else {
+        "calculating…".to_string()
+    };
+    let text = format!("{:.1} / {:.1} MB  ({:.1} MB/s)  {}", dl as f64 / 1_000_000.0, t as f64 / 1_000_000.0, speed / 1_000_000.0, eta);
+    (Some((dl as f64 / t as f64) as f32), Some(text))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  The signing dialog's content: two password fields and the rule
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SIGNING_TITLE: &str = "Set Up Module Signing";
+
+struct SigningPrompt {
+    first: Entity<InputState>,
+    second: Entity<InputState>,
+    /// The password rule, or what is wrong with what was typed.
+    hint: SharedString,
+    valid: bool,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SigningPrompt {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let first = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("One-time password"));
+        let second = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Type it again"));
+        let subscriptions = [&first, &second]
+            .into_iter()
+            .map(|input| {
+                cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+                    if let InputEvent::Change = event {
+                        this.check(cx);
+                    }
+                })
+            })
+            .collect();
+        Self { first, second, hint: MOK_PASSWORD_HINT.into(), valid: false, _subscriptions: subscriptions }
+    }
+
+    fn check(&mut self, cx: &mut Context<Self>) {
+        let (a, b) = (self.first.read(cx).value(), self.second.read(cx).value());
+        match validate_mok_password(&a, &b) {
+            Ok(()) => {
+                self.hint = "Passwords match.".into();
+                self.valid = true;
+            }
+            Err(msg) => {
+                self.hint = msg.into();
+                self.valid = false;
+            }
+        }
+        cx.notify();
+    }
+
+    /// The password typed; both fields are emptied.
+    fn take_password(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
+        let password = self.first.read(cx).value().to_string();
+        for input in [&self.first, &self.second] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.valid = false;
+        password
+    }
+}
+
+impl Render for SigningPrompt {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(label(
+                "signing-text",
+                "Pick a one-time password to approve this computer's module-signing key. \
+                 On the next restart a blue MOK Manager screen appears before Linux starts: \
+                 choose Enroll MOK and type this same password there once. Any key another \
+                 app has already queued (such as a kernel-signing key) is kept in the same \
+                 request, and this password enrolls all of them; a password chosen earlier \
+                 no longer works.",
+            ))
+            .child(Input::new(&self.first).mask_toggle().aria_label("One-time password"))
+            .child(Input::new(&self.second).mask_toggle().aria_label("Type it again"))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(label("signing-hint", self.hint.clone())))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ABOUT_TITLE: &str = "About Green Light";
+
+const NOT_A_RUN_FILE: &str = "Not an NVIDIA .run file";
 
 const RECOVER_TEXT: &str = "An earlier driver install was cut off before it finished. Restore \
      the driver this computer had before (this also happens on its own at the next boot).";
 
 const BLOCK_SUBTITLE: &str = "Keep apt or dnf from installing the distribution's NVIDIA driver over this one later";
 
-/// A message the user has to see, in a dialog over the window.
-fn show_error(window: &ApplicationWindow, heading: &str, body: &str) {
-    let dialog = libadwaita::AlertDialog::new(Some(heading), Some(body));
-    dialog.add_responses(&[("close", "Close")]);
-    dialog.set_close_response("close");
-    dialog.present(Some(window));
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  After a download: checksum verification, or a decision without one
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct DownloadUi {
-    state: Rc<RefCell<AppState>>,
-    progress: ProgressBar,
-    cancel_btn: Button,
-    log: Rc<dyn Fn(String)>,
-    update_config_tab: Rc<dyn Fn()>,
-    refresh_actions: Rc<dyn Fn()>,
-    stack: gtk4::Stack,
-    toast: ToastOverlay,
-    window: ApplicationWindow,
-    /// The running download; shared by every step of it (verification,
-    /// questions), so it ends when the last of them is done.
-    guard: Option<Rc<BusyGuard>>,
-}
-
-impl DownloadUi {
-    /// The download is over, whichever way it went.
-    fn end(&self) {
-        if let Some(guard) = &self.guard {
-            guard.release();
-        }
-    }
-
-    /// Make the file the one to install.
-    fn accept(&self, path: &Path, checksum: Option<String>, progress_text: &str, toast: &str) {
-        self.progress.set_text(Some(progress_text));
-        {
-            let mut s = self.state.borrow_mut();
-            s.downloaded_path = Some(path.to_string_lossy().to_string());
-            s.expected_checksum = checksum;
-        }
-        self.end();
-        (self.update_config_tab)();
-        self.stack.set_visible_child_name("configure");
-        self.toast.add_toast(Toast::new(toast));
-    }
-
-    fn discard(&self, path: &Path, progress_text: &str, toast: &str) {
-        match std::fs::remove_file(path) {
-            Ok(()) => {
-                (self.log)(format!("Deleted {}", path.display()));
-                self.progress.set_text(Some(progress_text));
-            }
-            Err(e) => {
-                (self.log)(format!("Could not delete {}: {}", path.display(), e));
-                self.progress.set_text(Some("Could not delete the download — remove it by hand"));
-            }
-        }
-        self.end();
-        self.toast.add_toast(Toast::new(toast));
-    }
-}
-
-/// Verify a finished download against NVIDIA's checksum. With none published
-/// (`Ok(None)`) the user decides whether to use the file unverified; when
-/// the checksum couldn't be fetched (`Err`), the choice is to retry or to
-/// discard the file — never to skip the check.
-fn finish_download(ui: DownloadUi, ver: DriverVersion, path: PathBuf, checksum: Result<Option<String>, String>) {
-    match checksum {
-        Ok(Some(cs)) => {
-            (ui.log)("Verifying SHA256…".to_string());
-            ui.progress.set_text(Some("Verifying…"));
-            let file = path.clone();
-            let expected = cs.clone();
-            spawn_async(async move { verify_sha256(&file, &expected).await }, move |verified| match verified {
-                Ok(()) => {
-                    (ui.log)("SHA256 verified OK".to_string());
-                    ui.accept(&path, Some(cs), "Verified", "Download complete");
-                }
-                Err(e) => {
-                    (ui.log)(format!("SHA256 FAILED: {}", e));
-                    ui.discard(&path, "Checksum mismatch — file deleted", "Checksum mismatch — do not install");
-                }
-            });
-        }
-        Ok(None) => {
-            (ui.log)("NVIDIA publishes no SHA256 checksum for this version".to_string());
-            ui.progress.set_text(Some("Downloaded — not verified"));
-            let dialog = libadwaita::AlertDialog::new(
-                Some("Install without verification?"),
-                Some(
-                    "NVIDIA does not publish a SHA256 checksum for this version, so the download \
-                     cannot be checked against it. Only continue if you trust the network you \
-                     downloaded it over.",
-                ),
-            );
-            dialog.add_responses(&[("cancel", "Discard Download"), ("use", "Use Unverified")]);
-            dialog.set_response_appearance("use", libadwaita::ResponseAppearance::Destructive);
-            dialog.set_default_response(Some("cancel"));
-            dialog.set_close_response("cancel");
-            let window = ui.window.clone();
-            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response == "use" {
-                    (ui.log)("User chose to continue WITHOUT checksum verification".to_string());
-                    ui.accept(&path, None, "Complete (unverified)", "Download complete (unverified)");
-                } else {
-                    ui.discard(&path, "Discarded (not verified)", "Unverified download discarded");
-                }
-            });
-        }
-        Err(e) => {
-            (ui.log)(format!("Could not fetch the SHA256 checksum: {}", e));
-            ui.progress.set_text(Some("Downloaded — checksum not fetched yet"));
-            let dialog = libadwaita::AlertDialog::new(
-                Some("Couldn't get NVIDIA's checksum"),
-                Some(&format!(
-                    "The driver downloaded, but its SHA256 checksum could not be fetched to \
-                     check it:\n\n{e}\n\nTry again once the connection to NVIDIA works."
-                )),
-            );
-            dialog.add_responses(&[("discard", "Discard Download"), ("retry", "Try Again")]);
-            dialog.set_response_appearance("retry", libadwaita::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("retry"));
-            dialog.set_close_response("discard");
-            let window = ui.window.clone();
-            dialog.choose(Some(&window), gio::Cancellable::NONE, move |response| {
-                if response != "retry" {
-                    ui.discard(&path, "Discarded (not verified)", "Download discarded");
-                    return;
-                }
-                (ui.log)("Fetching the SHA256 checksum again…".to_string());
-                ui.progress.set_text(Some("Fetching checksum…"));
-                let v = ver.clone();
-                spawn_async(async move { fetch_checksum(&v).await.map_err(|e| format!("{e:#}")) }, move |checksum| finish_download(ui, ver, path, checksum));
-            });
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Populate version list with version-status badges
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Selects the row whose title is `title`, if the list shows it.
-fn select_row_titled(list_box: &ListBox, title: &str) {
-    let mut child = list_box.first_child();
-    while let Some(c) = child {
-        if let Some(row) = c.downcast_ref::<ActionRow>() {
-            if row.title() == title {
-                list_box.select_row(Some(row));
-                return;
-            }
-        }
-        child = c.next_sibling();
-    }
-}
-
-fn populate_list(list_box: &ListBox, versions: &[DriverVersion], filter: &str, installed: Option<&str>) {
-    while let Some(c) = list_box.first_child() {
-        list_box.remove(&c);
-    }
-    let filter = filter.to_lowercase();
-
-    for ver in versions {
-        if !filter.is_empty() && !ver.version.contains(&filter) {
-            continue;
-        }
-
-        let subtitle = if let Some(inst) = installed {
-            match compare_versions(inst, &ver.version) {
-                VersionRelation::Newer => format!("{} · Upgrade available", ver.filename),
-                VersionRelation::Same => format!("{} · Currently installed", ver.filename),
-                VersionRelation::Older => format!("{} · Older than installed", ver.filename),
-                VersionRelation::Unknown => ver.filename.clone(),
-            }
-        } else {
-            ver.filename.clone()
-        };
-
-        let row = ActionRow::builder().title(&ver.version).subtitle(&subtitle).activatable(true).build();
-
-        // Highlight the currently installed version
-        if installed.map(|i| i == ver.version).unwrap_or(false) {
-            row.add_css_class("success");
-        }
-
-        if let Some(branch) = ver.branch {
-            add_branch_badge(&row, branch);
-        }
-
-        list_box.append(&row);
-    }
-}
-
 /// How long the branch labels may take before the list goes without them.
-const BRANCH_LABEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Branch badge (Production/New Feature/Older Production/Legacy), from
-/// NVIDIA's own data; omitted rather than guessed without it.
-fn add_branch_badge(row: &ActionRow, branch: DriverBranch) {
-    let badge = Label::new(Some(branch.label()));
-    badge.add_css_class("caption");
-    badge.add_css_class("pill");
-    badge.add_css_class(branch.css_class());
-    badge.set_valign(Align::Center);
-    row.add_suffix(&badge);
-    row.set_widget_name("badged");
-}
-
-/// Badges for rows already shown, once the labels have arrived; the list
-/// isn't rebuilt, so the selection stays.
-fn add_branch_badges(list_box: &ListBox, versions: &[DriverVersion]) {
-    let mut child = list_box.first_child();
-    while let Some(c) = child {
-        child = c.next_sibling();
-        let Ok(row) = c.downcast::<ActionRow>() else { continue };
-        if row.widget_name() == "badged" {
-            continue;
-        }
-        let title = row.title();
-        if let Some(branch) = versions.iter().find(|v| v.version == title).and_then(|v| v.branch) {
-            add_branch_badge(&row, branch);
-        }
-    }
-}
+const BRANCH_LABEL_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(test)]
 mod tests {
@@ -1891,29 +2587,132 @@ mod tests {
 
     #[test]
     fn busy_guard_ends_only_its_own_operation() {
-        let state = Rc::new(RefCell::new(AppState::default()));
-        let refreshed = Rc::new(std::cell::Cell::new(0));
-        let r = refreshed.clone();
-        let refresh: Rc<dyn Fn()> = Rc::new(move || r.set(r.get() + 1));
-        let first = BusyGuard::start(&state, &refresh, Busy::Download).unwrap();
-        assert!(BusyGuard::start(&state, &refresh, Busy::Install).is_none());
+        let state: SharedState = Rc::new(RefCell::new(AppState::default()));
+        let first = BusyGuard::start(&state, Busy::Download).unwrap();
+        assert!(BusyGuard::start(&state, Busy::Install).is_none());
         // Dropped without running its callback, as after a panic: ends it.
         drop(first);
         assert_eq!(state.borrow().busy, None);
-        let second = BusyGuard::start(&state, &refresh, Busy::Install).unwrap();
+        let second = BusyGuard::start(&state, Busy::Install).unwrap();
         // A stale guard of the finished operation must not end the new one.
-        let stale = BusyGuard { state: state.clone(), refresh: refresh.clone(), token: 1 };
+        let stale = BusyGuard { state: state.clone(), token: 1 };
         drop(stale);
         assert_eq!(state.borrow().busy, Some(Busy::Install));
         second.release();
         assert_eq!(state.borrow().busy, None);
         drop(second);
-        assert!(refreshed.get() >= 3);
+    }
+
+    #[test]
+    fn a_release_while_the_state_is_borrowed_happens_later() {
+        let state: SharedState = Rc::new(RefCell::new(AppState::default()));
+        let guard = BusyGuard::start(&state, Busy::Signing).unwrap();
+        {
+            let _borrowed = state.borrow();
+            guard.release();
+        }
+        assert_eq!(state.borrow().busy, Some(Busy::Signing), "not while borrowed");
+        run_deferred_releases();
+        assert_eq!(state.borrow().busy, None, "done by the next poll");
     }
 
     #[test]
     fn compare_unknown_on_unparseable() {
         assert!(compare_versions("", "595.84") == VersionRelation::Unknown);
         assert!(compare_versions("595.84", "abc") == VersionRelation::Unknown);
+    }
+
+    #[test]
+    fn enter_acts_as_the_focused_button() {
+        assert_eq!(enter_key(&[false, true]), Some(1));
+        assert_eq!(enter_key(&[true, false, false]), Some(0), "Enter on Cancel cancels");
+        assert_eq!(enter_key(&[false, false]), None, "Enter anywhere else decides nothing");
+    }
+
+    #[test]
+    fn download_progress_text() {
+        let (fraction, text) = progress_text((50_000_000, Some(100_000_000)), 10.0);
+        assert_eq!(fraction, Some(0.5));
+        assert_eq!(text.as_deref(), Some("50.0 / 100.0 MB  (5.0 MB/s)  10s remaining"));
+        assert_eq!(progress_text((5, None), 1.0), (None, None), "no size: activity only");
+    }
+
+    #[test]
+    fn an_error_dialog_that_was_seen_is_not_shown_twice() {
+        assert!(helper_showed("zenity", Some(0), ""));
+        assert!(helper_showed("zenity", Some(1), ""), "closed without OK: still seen");
+        assert!(helper_showed("kdialog", Some(1), ""));
+        assert!(!helper_showed("zenity", Some(255), ""), "an error of its own");
+        // zenity that can't reach the display exits 1 too: that is not "seen".
+        assert!(!helper_showed("zenity", Some(1), "(zenity:12): Gtk-WARNING **: cannot open display: :9"));
+        assert!(!helper_showed("zenity", Some(1), "Failed to open display"));
+        assert!(!helper_showed("kdialog", None, ""), "killed by a signal");
+        assert!(helper_showed("notify-send", Some(0), ""));
+        assert!(!helper_showed("notify-send", Some(1), ""), "no notification service");
+        assert!(helper_showed("gdbus", Some(0), ""));
+        assert!(!helper_showed("gdbus", Some(1), ""), "no notification service");
+    }
+
+    #[test]
+    fn without_notify_send_a_notification_goes_over_dbus_then_xmessage() {
+        let dialogs = error_dialogs("it's\nbroken");
+        let programs: Vec<_> = dialogs.iter().map(|(program, _)| *program).collect();
+        // The same order as AppRun's libcheck_show.
+        assert_eq!(programs, ["zenity", "kdialog", "notify-send", "gdbus", "xmessage"]);
+        let gdbus = &dialogs[3].1;
+        assert!(gdbus.windows(2).any(|w| w == ["--method", "org.freedesktop.Notifications.Notify"]));
+        assert!(gdbus.contains(&"'it\\'s\\nbroken'".to_string()), "{gdbus:?}");
+        assert_eq!(dialogs[4].1.last().map(String::as_str), Some("it's\nbroken"));
+        // Notifications stay until closed (COSMIC drops others after seconds).
+        assert!(dialogs[2].1.contains(&"--expire-time=0".to_string()));
+        assert!(gdbus.contains(&"int32 0".to_string()));
+        // Markup-taking bodies get plain text; xmessage gets wrapped lines.
+        let dialogs = error_dialogs("a <b> & c");
+        assert_eq!(dialogs[1].1.last().map(String::as_str), Some("a ‹b› and c"));
+        assert_eq!(dialogs[2].1.last().map(String::as_str), Some("a ‹b› and c"));
+        assert!(dialogs[3].1.contains(&"'a ‹b› and c'".to_string()));
+        assert_eq!(dialogs[0].1.last().map(String::as_str), Some("a <b> & c"), "zenity takes it as plain text");
+        assert_eq!(wrap("aaa bbb ccc", 7), "aaa bbb\nccc");
+        assert_eq!(wrap("x\nyy zz", 4), "x\nyy\nzz");
+        assert_eq!(wrap(&"w".repeat(9), 4), "w".repeat(9), "a long word stays whole");
+        assert_eq!(gvariant_string("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn the_no_window_message_names_the_real_cause() {
+        let gpu = no_window_message("x", true);
+        assert!(gpu.contains("graphics driver") && gpu.contains("software renderer") && gpu.ends_with("Details: x"));
+        let headless = no_window_message("x", false);
+        assert!(headless.contains("no display") && !headless.contains("graphics driver"));
+    }
+
+    /// WCAG contrast ratio of two opaque colours.
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let luminance = |c: Hsla| {
+            let c = gpui_kit::Rgba::from(c);
+            let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+            0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+        };
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn branch_badges_are_readable_in_both_themes() {
+        for branch in [DriverBranch::Production, DriverBranch::NewFeature, DriverBranch::OlderProduction, DriverBranch::Legacy] {
+            for dark in [false, true] {
+                let (background, text) = branch_colors(branch, dark);
+                let ratio = contrast(background, text);
+                assert!(ratio >= 4.5, "{} badge, dark={dark}: contrast {ratio:.2}", branch.label());
+            }
+        }
+    }
+
+    #[test]
+    fn fonts_are_the_first_installed_of_the_list() {
+        let installed = ["Noto Sans Mono", "Noto Sans", "Cantarell"].map(String::from);
+        assert_eq!(first_installed(&UI_FONTS, &installed), Some("Cantarell"));
+        assert_eq!(first_installed(&MONO_FONTS, &installed), Some("Noto Sans Mono"));
+        assert_eq!(first_installed(&UI_FONTS, &[]), None);
     }
 }

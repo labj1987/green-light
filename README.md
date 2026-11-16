@@ -1,6 +1,6 @@
 # Green Light
 
-A Linux desktop app for installing NVIDIA drivers from the official `.run` files. Written in Rust with GTK4 and libadwaita.
+A Linux desktop app for installing NVIDIA drivers from the official `.run` files. Written in Rust with [GPUI Kit](https://github.com/longbridge/gpui-kit), so it draws its own window and looks the same on every desktop.
 
 I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag behind and I sometimes need a specific version. The usual routine for that is dropping to a TTY, stopping the display manager, running the installer blind, and hoping the desktop comes back. This app skips all of that. It installs the new driver to disk the same way a package manager does, while the current driver keeps running. The swap happens on your next reboot and your desktop never goes down.
 
@@ -38,12 +38,13 @@ I run NVIDIA's `.run` drivers instead of the packaged ones because the repos lag
 
 - x86_64 Linux with systemd and polkit
 - Either an apt-based distro (Ubuntu, Debian, Mint) or a dnf-based distro (Fedora, RHEL, Nobara). The install script detects which one you have and uses the right package manager. Anything else, the GUI runs fine through the AppImage but the install script will refuse to run.
-- GTK 4.12+ and libadwaita 1.5+ from the system are used when they are there, so the window looks like the rest of your desktop (theme, accent colour). Without them, or with older ones, the AppImage uses the GTK 4 and libadwaita it brings, so it also runs on desktops that ship neither (a stock KDE Plasma or Hyprland install); that copy (libadwaita 1.5) follows dark mode but not the desktop's accent colour. `GREEN_LIGHT_GTK=bundled` or `GREEN_LIGHT_GTK=host` forces one or the other. Either way it takes the basics every desktop has from the system: glibc 2.39 or newer, OpenGL/EGL drivers and the Vulkan loader, X11 or Wayland client libraries, and fontconfig, freetype, harfbuzz and fribidi. If one of those is missing, Green Light names it before it asks for a password
+- glibc 2.39 or newer, the X11 and Wayland client libraries every desktop has (libxcb, libxkbcommon), and a Vulkan or OpenGL ES (EGL) driver to draw the window with. No GTK or libadwaita is needed. If one of those is missing, Green Light names it, with the command that installs it, before it asks for a password
+- **It works while the NVIDIA driver is broken or missing.** The window is drawn with whatever works: the NVIDIA driver's Vulkan, or Mesa's software renderers (lavapipe for Vulkan, llvmpipe for OpenGL ES), which most desktops install by default (`mesa-vulkan-drivers` / `libegl-mesa0` on Debian and Ubuntu, `mesa-vulkan-drivers` / `mesa-libEGL` on Fedora, `vulkan-swrast` / `mesa` on Arch). So you can still reinstall a driver after a failed update or a kernel change left the old one unloadable. With no working renderer at all, Green Light says so in a desktop dialog instead of showing nothing
 - Kernel headers and DKMS, which the script installs for you if missing (`linux-headers`/`build-essential` on apt, `kernel-devel`/`kernel-headers` on dnf)
 
 Developed and tested on Ubuntu 26.04, GNOME on Wayland, RTX 5070, 595.x driver branch. Fedora support added in 2.4.0, less battle-tested than the Ubuntu path — if something's off on Fedora, open an issue.
 
-Tested desktops: GNOME, KDE Plasma, Hyprland and COSMIC. Other Wayland and X11 desktops should work too.
+Tested desktops: GNOME on Wayland and X11 (Xvfb) with the NVIDIA driver, lavapipe and llvmpipe. Earlier GTK releases were tested on KDE Plasma, Hyprland and COSMIC; the window is drawn the same way everywhere, so other Wayland and X11 desktops should work too.
 
 ## Install
 
@@ -111,6 +112,15 @@ Module-signing setup runs headless too; the script reads the one-time MOK passwo
 sudo ./privileged-install.sh --setup-signing
 ```
 
+## Known issues
+
+- **While a dialog is open, move the window by the dialog's title**; the window's own title bar does not respond until the dialog is closed. Dialogs don't dim the window behind them and don't close when you click outside them.
+- **The file dialog shows every file**, not only `.run` files. Picking anything else is refused with a message.
+- **The Log tab's text can't be selected with the mouse.** Copy Log copies all of it.
+- **The font is one your system already has** (Ubuntu, Adwaita Sans, Cantarell, Noto Sans or DejaVu Sans, whichever is found first), not necessarily the one your desktop is set to, and the window follows your desktop's light or dark setting but not its accent colour.
+- **Screen readers.** Buttons, rows and the text in dialogs are exposed, and notifications are announced. A dialog itself has no name: its title names the group that holds its content, where the keyboard focus goes when it opens. The window's minimise, maximise and close buttons and the two links in About are not exposed (close the window with your desktop's shortcut, such as Alt+F4). These are limits of the UI toolkit, GPUI Kit.
+- **Starting Green Light a second time** shows the window that is already open, without asking for a password again. On Wayland it comes to the front when the second start came from your launcher, dock or menu (GNOME shows a "Green Light is ready" notice instead, as it does for other apps); started from a terminal, the desktop only marks the window as wanting attention. If the open copy has stopped responding, the second start says so, with the PID to close.
+
 ## Logs and troubleshooting
 
 Two files tell you everything:
@@ -120,7 +130,7 @@ Two files tell you everything:
 
 If an install fails, the reason is in one of those, and the Log tab shows the script's output as it runs. The most common cause is missing kernel headers for a brand new kernel, which resolves once your distro publishes them; the script checks for headers and a compiler before it removes anything, and stops without changes if they're missing. Before it removes anything it also test-builds the new driver's kernel module for your kernel. Before the first change it saves everything needed to undo it, including copies of the packages it is about to remove. If NVIDIA's installer then fails, or the install is stopped before the installer has run, the script removes what the installer had put in place, reinstalls the removed packages (and the packages that depend on them) from those copies, puts back holds, block and boot configuration, and checks that the previous driver is back (signed, under Secure Boot) before it says so; if it can't confirm that, it says not to reboot yet. If the computer loses power or the install is killed partway, the same happens at the next boot (`green-light-recover.service`), or from Restore Previous Driver in the app, or at the start of the next install. Closing Green Light or logging out doesn't interrupt an install, and while it is changing the system, shutting down or suspending is blocked (an administrator can still force it). If the driver was changed by other means after an install was cut off, Green Light leaves that alone and offers to discard the old recovery data instead.
 
-If a password dialog never appears and Green Light says that no polkit authentication agent is running, start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use `hyprpolkitagent`, on sway or i3 use `polkit-gnome` (`policykit-1-gnome` on Debian/Ubuntu) or `lxqt-policykit`.
+If a password dialog never appears and Green Light says that no polkit authentication agent is running, start one and try again. KDE, GNOME and COSMIC include one; on Hyprland use `hyprpolkitagent`, on sway or i3 use `polkit-gnome` (`policykit-1-gnome` on Debian/Ubuntu) or `lxqt-policykit`. If it says that pkexec is not installed (some minimal Hyprland or sway installs have no polkit at all), install the package it names (`polkit`, or `pkexec` on Debian and Ubuntu) and an agent.
 
 ## Uninstalling
 
@@ -148,7 +158,7 @@ sudo systemctl daemon-reload
 
 ## Building from source
 
-Needs Rust 1.100 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `libgtk-4-dev`, `libadwaita-1-dev`, and `pkg-config`. The packaging step also needs `wget`, `file`, `desktop-file-utils`, `zsync`, `patchelf`, and the GTK runtime pieces it bundles: `librsvg2-common`, `dconf-gsettings-backend`, `ibus-gtk4`, `libgdk-pixbuf2.0-bin` and `gsettings-desktop-schemas`. Release builds run on Ubuntu 24.04, whose GTK and glibc set the floor above. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
+Needs Rust 1.100 (pinned in `rust-toolchain.toml`, which rustup picks up; a distro's `cargo`/`rustc` may be older), `build-essential`, `pkg-config`, and the headers the UI toolkit links against: `libxcb1-dev`, `libxkbcommon-dev`, `libxkbcommon-x11-dev` and `libfontconfig1-dev`. The packaging step also needs `wget`, `file`, `desktop-file-utils` and `zsync`. Release builds run on Ubuntu 24.04, whose glibc sets the floor above. The AppImage carries the licence notices of every Rust crate built into it. The build script runs as an ordinary user; only on a machine with no toolchain does it install these through apt, and that one case needs root.
 
 ```bash
 bash build-appimage.sh
