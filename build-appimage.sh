@@ -370,18 +370,18 @@ libcheck_show() {
         libcheck_dialog kdialog --error "$plain" --title "$1" && return 0
     fi
     if command -v notify-send >/dev/null 2>&1; then
-        notify-send -u critical -t 0 "$1" "$plain" >/dev/null 2>&1 && return 0
+        notify-send -u critical -t 0 "$1" "$plain" </dev/null >/dev/null 2>&1 && return 0
     fi
     if command -v gdbus >/dev/null 2>&1; then
         gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
             --method org.freedesktop.Notifications.Notify "$(libcheck_gvariant "$1")" 'uint32 0' "''" \
             "$(libcheck_gvariant "$1")" "$(libcheck_gvariant "$plain")" '@as []' "{'urgency': <byte 2>}" 'int32 0' \
-            >/dev/null 2>&1 && return 0
+            </dev/null >/dev/null 2>&1 && return 0
     fi
     if command -v xmessage >/dev/null 2>&1; then
         plain="$2"
         command -v fold >/dev/null 2>&1 && plain="$(printf '%s\n' "$2" | fold -s -w 80)"
-        xmessage -center -title "$1" "$plain" >/dev/null 2>&1
+        xmessage -center -title "$1" "$plain" </dev/null >/dev/null 2>&1
     fi
     return 0
 }

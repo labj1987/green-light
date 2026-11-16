@@ -14,7 +14,9 @@ under 2.3.0.
 - **Starting again right after closing works at once.** A start just as the previous window closes,
   or after Green Light could not open its window, now opens a new window instead of waiting for the
   old copy and calling it not responding.
-- A message shown without a window no longer waits for helper programs the dialog left running.
+- A message shown without a window no longer waits for helper programs the dialog left running,
+  and a dialog that could not open is no longer taken as shown, so the message still comes as a
+  notification.
 - `GREEN_LIGHT_LOG` no longer shows two harmless warnings: the D-Bus library's "Failed to populate
   properties cache", and the toolkit's "set_focus called more than once" with a screen reader.
 

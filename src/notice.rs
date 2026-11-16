@@ -33,7 +33,7 @@ fn show(kind: Kind, message: &str) {
         return;
     }
     for (program, args) in commands(kind, message) {
-        if run(program, &args).is_some_and(|(code, stderr)| showed(program, code, &stderr)) {
+        if run(program, &args).is_some_and(|(code, stderr)| showed(program, code, stderr.as_deref())) {
             break;
         }
     }
@@ -43,29 +43,63 @@ fn show(kind: Kind, message: &str) {
 /// what it wrote on stderr. Its stderr goes to a private temporary file,
 /// read once the program has ended: reading a pipe to its end would also
 /// wait for any process the program started that kept the pipe open.
-fn run(program: &str, args: &[String]) -> Option<(Option<i32>, String)> {
-    use std::io::{Read as _, Seek as _};
+fn run(program: &str, args: &[String]) -> Option<(Option<i32>, Option<String>)> {
+    run_with(program, args, stderr_file(&std::env::temp_dir()))
+}
+
+/// `run` with stderr going to `file`. Without a file, stderr is unknown
+/// (`None`), not empty.
+fn run_with(program: &str, args: &[String], file: Option<std::fs::File>) -> Option<(Option<i32>, Option<String>)> {
+    let (reader, stderr) = match file.and_then(|file| Some((file.try_clone().ok()?, file))) {
+        Some((writer, reader)) => (Some(reader), std::process::Stdio::from(writer)),
+        None => (None, std::process::Stdio::null()),
+    };
+    let status = std::process::Command::new(program).args(args).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(stderr).status();
+    let text = reader.and_then(|mut file| {
+        use std::io::{Read as _, Seek as _};
+        let mut bytes = Vec::new();
+        (file.rewind().is_ok() && file.read_to_end(&mut bytes).is_ok()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    });
+    status.ok().map(|status| (status.code(), text))
+}
+
+/// A file in `dir` for a program's stderr that no other process can know the
+/// name of: an unnamed one (`O_TMPFILE`) where the file system has them,
+/// otherwise one with a random name (`named_file`). `None` when neither can
+/// be made.
+fn stderr_file(dir: &std::path::Path) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static SERIAL: AtomicU32 = AtomicU32::new(0);
-    let path = std::env::temp_dir().join(format!("green-light-notice-{}-{}", std::process::id(), SERIAL.fetch_add(1, Ordering::Relaxed)));
-    let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path).ok();
-    // Removed at once: the open file is all that is needed, and nothing is
-    // left behind if this process is killed while the dialog is up.
-    if file.is_some() {
-        let _ = std::fs::remove_file(&path);
-    }
-    let stderr = file.as_ref().and_then(|file| file.try_clone().ok()).map_or_else(Stdio::null, Stdio::from);
-    let status = Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr).status();
-    let mut bytes = Vec::new();
-    if let Some(mut file) = file {
-        if file.rewind().is_ok() {
-            let _ = file.read_to_end(&mut bytes);
+    let unnamed = std::fs::OpenOptions::new().read(true).write(true).mode(0o600).custom_flags(libc::O_TMPFILE).open(dir);
+    unnamed.ok().or_else(|| named_file(dir))
+}
+
+/// A file in `dir` with a random name, removed as soon as it is open (nothing
+/// is left behind if this process is killed while the dialog is up); a name
+/// that is taken is tried again with another.
+fn named_file(dir: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    for _ in 0..16 {
+        let path = dir.join(format!("green-light-notice-{:016x}", random()));
+        match std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(&path) {
+            Ok(file) => {
+                let _ = std::fs::remove_file(&path);
+                return Some(file);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
         }
     }
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    status.ok().map(|status| (status.code(), text))
+    None
+}
+
+/// 64 unpredictable bits: the standard library's hash keys (seeded from the
+/// system's random source) over the clock.
+fn random() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    hasher.write_u128(now.map_or(0, |now| now.as_nanos()));
+    hasher.finish()
 }
 
 /// Whether there is a display server to show anything on.
@@ -130,11 +164,14 @@ fn commands(kind: Kind, message: &str) -> Vec<(&'static str, Vec<String>)> {
 /// dialog that could not open the display (zenity then also exits 1; `stderr`
 /// says so). notify-send and gdbus show nothing themselves: only 0 says the
 /// desktop took the message; xmessage ends with 1 when it could not open the
-/// display.
-fn showed(program: &str, code: Option<i32>, stderr: &str) -> bool {
-    match program {
-        "notify-send" | "gdbus" | "xmessage" => code == Some(0),
-        _ => matches!(code, Some(0 | 1)) && !["open display", "connect to display", "connect to X server"].iter().any(|text| stderr.contains(text)),
+/// display. With `stderr` unknown (`None`), a dialog's 1 is not taken as seen.
+fn showed(program: &str, code: Option<i32>, stderr: Option<&str>) -> bool {
+    match (program, stderr) {
+        ("notify-send" | "gdbus" | "xmessage", _) => code == Some(0),
+        (_, None) => code == Some(0),
+        (_, Some(stderr)) => {
+            matches!(code, Some(0 | 1)) && !["open display", "connect to display", "connect to X server"].iter().any(|text| stderr.contains(text))
+        }
     }
 }
 
@@ -203,20 +240,20 @@ mod tests {
 
     #[test]
     fn an_error_dialog_that_was_seen_is_not_shown_twice() {
-        assert!(showed("zenity", Some(0), ""));
-        assert!(showed("zenity", Some(1), ""), "closed without OK: still seen");
-        assert!(showed("kdialog", Some(1), ""));
-        assert!(!showed("zenity", Some(255), ""), "an error of its own");
+        assert!(showed("zenity", Some(0), Some("")));
+        assert!(showed("zenity", Some(1), Some("")), "closed without OK: still seen");
+        assert!(showed("kdialog", Some(1), Some("")));
+        assert!(!showed("zenity", Some(255), Some("")), "an error of its own");
         // zenity that can't reach the display exits 1 too: that is not "seen".
-        assert!(!showed("zenity", Some(1), "(zenity:12): Gtk-WARNING **: cannot open display: :9"));
-        assert!(!showed("zenity", Some(1), "Failed to open display"));
-        assert!(!showed("kdialog", None, ""), "killed by a signal");
-        assert!(showed("notify-send", Some(0), ""));
-        assert!(!showed("notify-send", Some(1), ""), "no notification service");
-        assert!(showed("gdbus", Some(0), ""));
-        assert!(!showed("gdbus", Some(1), ""), "no notification service");
-        assert!(showed("xmessage", Some(0), ""));
-        assert!(!showed("xmessage", Some(1), ""), "could not open the display");
+        assert!(!showed("zenity", Some(1), Some("(zenity:12): Gtk-WARNING **: cannot open display: :9")));
+        assert!(!showed("zenity", Some(1), Some("Failed to open display")));
+        assert!(!showed("kdialog", None, Some("")), "killed by a signal");
+        assert!(showed("notify-send", Some(0), Some("")));
+        assert!(!showed("notify-send", Some(1), Some("")), "no notification service");
+        assert!(showed("gdbus", Some(0), Some("")));
+        assert!(!showed("gdbus", Some(1), Some("")), "no notification service");
+        assert!(showed("xmessage", Some(0), Some("")));
+        assert!(!showed("xmessage", Some(1), Some("")), "could not open the display");
     }
 
     #[test]
@@ -256,6 +293,9 @@ mod tests {
         assert_eq!(commands[2].1.last().map(String::as_str), Some("a ‹b› and c"));
         assert_eq!(commands[4].1.last().map(String::as_str), Some("a <b> & c"));
         assert_eq!(wrap(&"word ".repeat(30), 80).lines().map(|l| l.chars().count()).max(), Some(79));
+        assert_eq!(wrap("aaa bbb ccc", 7), "aaa bbb\nccc");
+        assert_eq!(wrap("x\nyy zz", 4), "x\nyy\nzz", "a paragraph break stays");
+        assert_eq!(wrap(&"w".repeat(9), 4), "w".repeat(9), "a long word stays whole");
     }
 
     #[test]
@@ -266,18 +306,42 @@ mod tests {
         let (code, stderr) = run("sh", &["-c".to_string(), "echo 'cannot open display: :9999' >&2; sleep 5 & exit 1".to_string()]).unwrap();
         assert!(started.elapsed() < std::time::Duration::from_secs(3), "{:?}", started.elapsed());
         assert_eq!(code, Some(1));
-        assert!(!showed("zenity", code, &stderr), "{stderr}");
+        assert!(!showed("zenity", code, stderr.as_deref()), "{stderr:?}");
     }
 
     #[test]
-    fn a_dialogs_stderr_is_read_whatever_its_bytes_and_no_file_is_left() {
+    fn a_dialogs_stderr_is_read_whatever_its_bytes() {
         let (code, stderr) = run("sh", &["-c".to_string(), "printf '\\377\\376 Failed to open display\\n' >&2; exit 1".to_string()]).unwrap();
         assert_eq!(code, Some(1));
+        let stderr = stderr.unwrap();
         assert!(stderr.contains("Failed to open display"), "{stderr:?}");
-        assert!(!showed("zenity", code, &stderr));
-        let prefix = format!("green-light-notice-{}-", std::process::id());
-        let left: Vec<_> =
-            std::fs::read_dir(std::env::temp_dir()).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix)).collect();
-        assert!(left.is_empty(), "{left:?}");
+        assert!(!showed("zenity", code, Some(&stderr)));
+    }
+
+    #[test]
+    fn a_named_stderr_file_is_gone_as_soon_as_it_is_open() {
+        let dir = std::env::temp_dir().join(format!("green-light-notice-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file system without unnamed files gets the random names.
+        for _ in 0..3 {
+            let (_, stderr) = run_with("sh", &["-c".to_string(), "echo seen >&2".to_string()], named_file(&dir)).unwrap();
+            assert_eq!(stderr.as_deref(), Some("seen\n"));
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_ne!(random(), random());
+    }
+
+    #[test]
+    fn a_dialog_whose_stderr_could_not_be_kept_does_not_stop_the_chain() {
+        // Nowhere to put its stderr: a dialog's exit 1 may be "no display".
+        let nowhere = std::path::Path::new("/nonexistent/green-light");
+        assert!(stderr_file(nowhere).is_none() && named_file(nowhere).is_none());
+        let (code, stderr) = run_with("sh", &["-c".to_string(), "exit 1".to_string()], None).unwrap();
+        assert_eq!((code, stderr.as_deref()), (Some(1), None));
+        assert!(!showed("zenity", code, None), "the next program is tried");
+        assert!(!showed("kdialog", code, None));
+        assert!(showed("zenity", Some(0), None), "0 is pressed, whatever stderr said");
     }
 }

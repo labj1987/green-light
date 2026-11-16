@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 /// A later launch's request to show the running window, with the activation
 /// token of that launch when it had one (see `launch_token`).
@@ -90,9 +90,10 @@ impl Activations {
     }
 }
 
-/// Says the primary copy's UI is up (see `Activations::up_signal`). Set from
-/// the window's first drawn frame: a window that has been created but never
-/// drawn is not up yet, and a later launch is told to wait for it.
+/// Says the primary copy's UI is up (see `Activations::up_signal`). Set once
+/// the window's first frame has been drawn and presented: a window that has
+/// been created but never shown is not up yet, and a later launch is told to
+/// wait for it.
 #[derive(Clone, Default)]
 pub struct UiUp(Arc<AtomicBool>);
 
@@ -124,17 +125,20 @@ impl Listening {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        // The file first: a launch from now on finds nobody and binds its
-        // own socket, instead of connecting to this one's backlog.
-        let _ = std::fs::remove_file(&self.path);
-        // Wakes the listening thread's accept with an error, and refuses
-        // connections from here on; the thread then ends.
-        // SAFETY: shutdown on a socket this struct keeps open.
-        unsafe { libc::shutdown(self.listener.as_raw_fd(), libc::SHUT_RDWR) };
+        // The running lock first: AppRun must not see a copy running once
+        // its socket is gone, or it would skip its setup for a launch that
+        // then becomes the primary copy itself.
         if let Some(running) = &self.running {
             // SAFETY: flock on a file this struct keeps open.
             unsafe { libc::flock(running.as_raw_fd(), libc::LOCK_UN) };
         }
+        // Then the file: a launch from now on finds nobody and binds its own
+        // socket, instead of connecting to this one's backlog.
+        let _ = std::fs::remove_file(&self.path);
+        // Wakes the listening thread's accept with an error once the backlog
+        // is empty, and refuses connections from here on; the thread then ends.
+        // SAFETY: shutdown on a socket this struct keeps open.
+        unsafe { libc::shutdown(self.listener.as_raw_fd(), libc::SHUT_RDWR) };
     }
 }
 
@@ -378,31 +382,7 @@ fn try_claim(path: &Path, token: Option<&str>, waits: Waits) -> Result<Claim, Cl
             let listening =
                 Listening { listener: Arc::new(listener), path: path.to_path_buf(), running: mark_running(path).map(Arc::new), closed: Arc::default() };
             let activations = Activations::new(rx, ui_up.clone(), Some(listening.clone()));
-            std::thread::spawn(move || {
-                for connection in listening.listener.incoming() {
-                    let mut connection = match connection {
-                        Ok(connection) => connection,
-                        // Closed by `release`: no more requests.
-                        Err(_) if listening.closed.load(Ordering::Acquire) => break,
-                        Err(_) => {
-                            std::thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                    };
-                    // Released between the accept and now: dropped unanswered,
-                    // so that launch asks again and finds nobody.
-                    if listening.closed.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let token = read_request(&connection);
-                    if !ui_up.is_set() {
-                        let _ = connection.write_all(STARTING);
-                    }
-                    if tx.send(Activation { token, reply: Some(connection) }).is_err() {
-                        break;
-                    }
-                }
-            });
+            std::thread::spawn(move || serve(&listening, &tx, &ui_up));
             activations
         }
         Err(e) => {
@@ -414,6 +394,37 @@ fn try_claim(path: &Path, token: Option<&str>, waits: Waits) -> Result<Claim, Cl
         }
     };
     Ok(Claim::Primary(activations))
+}
+
+/// The listening thread: hands each later launch's request to the UI. A
+/// connection accepted after `release`, or one the UI no longer takes, is
+/// dropped unanswered, so that launch hears the end of the connection and
+/// asks again. The loop goes on after one: every launch already waiting in
+/// the backlog is taken and dropped the same way, and only the accept error
+/// that `release`'s shutdown causes once the backlog is empty ends it.
+fn serve(listening: &Listening, tx: &UnboundedSender<Activation>, ui_up: &UiUp) {
+    for connection in listening.listener.incoming() {
+        let mut connection = match connection {
+            Ok(connection) => connection,
+            // Closed by `release`, and the backlog is empty: no more requests.
+            Err(_) if listening.closed.load(Ordering::Acquire) => break,
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+        };
+        // Released between the accept and now: dropped unanswered, so that
+        // launch asks again and finds nobody.
+        if listening.closed.load(Ordering::Acquire) {
+            continue;
+        }
+        let token = read_request(&connection);
+        if !ui_up.is_set() {
+            let _ = connection.write_all(STARTING);
+        }
+        // A UI that no longer takes requests drops this one, unanswered.
+        let _ = tx.send(Activation { token, reply: Some(connection) });
+    }
 }
 
 /// The token a second launch sent with its request, if any. A launch that
@@ -433,7 +444,8 @@ fn parse_request(line: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_at, nobody_listening, not_responding_message, parse_request, running_file, starting_message, valid_token, Activations, Claim, Waits, MAX_TOKEN,
+        claim_at, nobody_listening, not_responding_message, parse_request, running_file, serve, starting_message, valid_token, Activations, Claim, Listening,
+        UiUp, Waits, MAX_TOKEN,
     };
     use std::os::fd::AsRawFd;
     use std::path::Path;
@@ -676,6 +688,63 @@ mod tests {
         assert!(matches!(claim, Claim::HandedOver), "no hung-copy message");
         assert!(taken > 2, "asked again in short steps: {taken}");
         assert!(waited >= Duration::from_millis(500) && waited < Duration::from_secs(2), "{waited:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A primary copy's socket with nobody serving it yet.
+    fn bound(path: &Path) -> Listening {
+        Listening {
+            listener: std::sync::Arc::new(std::os::unix::net::UnixListener::bind(path).unwrap()),
+            path: path.to_path_buf(),
+            running: None,
+            closed: Default::default(),
+        }
+    }
+
+    /// What a launch heard before its connection ended; `None` when it is
+    /// still open a second later (nobody took the connection).
+    fn heard(mut stream: std::os::unix::net::UnixStream) -> Option<Vec<u8>> {
+        use std::io::Read;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let mut bytes = Vec::new();
+        stream.read_to_end(&mut bytes).ok().map(|_| bytes)
+    }
+
+    #[test]
+    fn every_launch_queued_at_a_released_socket_hears_the_end_at_once() {
+        let dir = scratch("backlog");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        // Three launches wait in the backlog when the copy releases its socket.
+        let waiting: Vec<_> = (0..3).map(|_| std::os::unix::net::UnixStream::connect(&path).unwrap()).collect();
+        listening.close();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        serve(&listening, &tx, &UiUp::default());
+        for stream in waiting {
+            assert_eq!(heard(stream), Some(Vec::new()), "dropped unanswered, so that launch asks again");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_request_the_ui_no_longer_takes_is_dropped_unanswered() {
+        use std::io::Write;
+        let dir = scratch("no-ui");
+        let path = dir.join("test.sock");
+        let listening = bound(&path);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        let serving = {
+            let listening = listening.clone();
+            std::thread::spawn(move || serve(&listening, &tx, &UiUp::default()))
+        };
+        for _ in 0..3 {
+            let stream = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            writeln!(&stream, "activate").unwrap();
+            assert_eq!(heard(stream).as_deref(), Some(&b"starting\n"[..]));
+        }
+        listening.close();
+        serving.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
