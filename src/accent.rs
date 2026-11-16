@@ -30,6 +30,12 @@ const TEXT_CONTRAST: f32 = 4.5;
 /// What a control's outline or fill needs against its background to be seen
 /// (WCAG 2 non-text contrast).
 const UI_CONTRAST: f32 = 3.0;
+/// Links: the toolkit draws a hovered link at 80% and a pressed one at 60%
+/// opacity, ignoring the theme's own hover and active link colours, so the
+/// link itself reads at [`LINK_CONTRAST`] and still at [`TEXT_CONTRAST`] when
+/// pressed.
+const LINK_CONTRAST: f32 = 7.0;
+const LINK_PRESSED_OPACITY: f32 = 0.6;
 /// Text on an accent surface when white does not reach [`TEXT_CONTRAST`].
 const NEAR_BLACK: Rgb = Rgb { r: 10. / 255., g: 10. / 255., b: 10. / 255. };
 const WHITE: Rgb = Rgb { r: 1., g: 1., b: 1. };
@@ -84,10 +90,21 @@ pub fn with_contrast(color: Rgb, against: Rgb, ratio: f32) -> Rgb {
     (0..=50).map(|step| color.mix(target, step as f32 / 50.)).find(|&c| contrast(c, against) >= ratio).unwrap_or(target)
 }
 
+/// The link colour for `accent` on `background`: the accent, darkened or
+/// lightened until it reads at [`LINK_CONTRAST`], and at [`TEXT_CONTRAST`]
+/// at the opacity the toolkit draws a pressed link with.
+pub fn link_on(accent: Rgb, background: Rgb) -> Rgb {
+    let target = if background.luminance() > 0.18 { BLACK } else { WHITE };
+    let reads = |c: Rgb| contrast(c, background) >= LINK_CONTRAST && contrast(background.mix(c, LINK_PRESSED_OPACITY), background) >= TEXT_CONTRAST;
+    (0..=50).map(|step| accent.mix(target, step as f32 / 50.)).find(|&c| reads(c)).unwrap_or(target)
+}
+
 /// The colours the accent sets, for one mode.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
     /// Filled controls: primary buttons, checked boxes, radios and switches.
+    /// The accent itself where it stands out from the window (3:1), else
+    /// darkened or lightened until it does.
     pub fill: Rgb,
     pub fill_hover: Rgb,
     pub fill_active: Rgb,
@@ -108,16 +125,18 @@ impl Palette {
     /// text. Hover and active move away from the text colour, so the text on
     /// them keeps its contrast.
     pub fn new(accent: Rgb, background: Rgb, foreground: Rgb) -> Palette {
-        let on_fill = text_on(accent);
+        let line = with_contrast(accent, background, UI_CONTRAST);
+        let fill = line;
+        let on_fill = text_on(fill);
         let away = if on_fill == WHITE { BLACK } else { WHITE };
-        let link = with_contrast(accent, background, TEXT_CONTRAST);
+        let link = link_on(accent, background);
         let further = if background.luminance() > 0.18 { BLACK } else { WHITE };
         Palette {
-            fill: accent,
-            fill_hover: accent.mix(away, 0.08),
-            fill_active: accent.mix(away, 0.16),
+            fill,
+            fill_hover: fill.mix(away, 0.08),
+            fill_active: fill.mix(away, 0.16),
             on_fill,
-            line: with_contrast(accent, background, UI_CONTRAST),
+            line,
             link,
             link_hover: link.mix(further, 0.2),
             selection: with_contrast(accent, foreground, TEXT_CONTRAST),
@@ -160,11 +179,9 @@ pub fn paint(colors: &mut ThemeColor, accent: Option<Rgb>, base: &ThemeColor) {
     colors.list_active = accent.hsla(base.list_active.a);
     colors.table_active = accent.hsla(base.table_active.a);
     colors.drop_target = accent.hsla(base.drop_target.a);
-    // A switch's thumb sits on the accent when on: the theme's own thumb where it stands out (3:1), else the
-    // accent's text colour.
-    if contrast(Rgb::from_hsla(base.switch_thumb), accent) < UI_CONTRAST {
-        colors.switch_thumb = on_fill;
-    }
+    // A switch's thumb sits on the fill when on: the theme's own thumb where it stands out (3:1), else the
+    // fill's text colour.
+    colors.switch_thumb = if contrast(Rgb::from_hsla(base.switch_thumb), p.fill) < UI_CONTRAST { on_fill } else { base.switch_thumb };
 }
 
 /// Every colour [`paint`] sets, from `base`.
@@ -241,25 +258,65 @@ fn set(accent: Option<Rgb>, cx: &mut App) {
     }
 }
 
-/// Reads the accent from the portal and follows its changes. Without a portal
-/// or an accent the theme is left as it is.
+/// The portal's bus name.
+const PORTAL: &str = "org.freedesktop.portal.Desktop";
+
+/// Reads the accent from the portal and follows its changes, reading it again
+/// whenever the portal (re)starts: at login it may come up after the window,
+/// and it can be restarted. Without a portal or an accent the theme is left as
+/// it is.
 pub fn follow(cx: &mut App) {
+    cx.spawn(async move |cx| watch(cx).await).detach();
+}
+
+/// Whether a `NameOwnerChanged` for the portal says it is now running.
+fn portal_started(new_owner: Option<&str>) -> bool {
+    new_owner.is_some_and(|owner| !owner.is_empty())
+}
+
+async fn watch(cx: &mut gpui_kit::AsyncApp) -> Option<()> {
     use ashpd::desktop::settings::Settings;
+    use ashpd::zbus;
+    use futures_util::future::{select, Either};
     use futures_util::StreamExt as _;
 
-    cx.spawn(async move |cx| {
-        let settings = Settings::new().await.ok()?;
+    let connection = zbus::Connection::session().await.ok()?;
+    let bus = zbus::fdo::DBusProxy::new(&connection).await.ok()?;
+    let mut owners = bus.receive_name_owner_changed_with_args(&[(0, PORTAL)]).await.ok()?;
+    loop {
         // Listen first, so a change between the read and the subscription is not lost.
-        let changes = settings.receive_accent_color_changed().await.ok();
-        let accent = settings.accent_color().await.ok().and_then(|c| Rgb::from_portal(c.red(), c.green(), c.blue()));
-        cx.update(|cx| set(accent, cx));
-        let mut changes = changes?;
-        while let Some(c) = changes.next().await {
-            cx.update(|cx| set(Rgb::from_portal(c.red(), c.green(), c.blue()), cx));
+        let settings = Settings::with_connection(connection.clone()).await.ok();
+        let mut changes = match &settings {
+            Some(settings) => settings.receive_accent_color_changed().await.ok(),
+            None => None,
+        };
+        if let Some(settings) = &settings {
+            let accent = settings.accent_color().await.ok().and_then(|c| Rgb::from_portal(c.red(), c.green(), c.blue()));
+            cx.update(|cx| set(accent, cx));
         }
-        Some(())
-    })
-    .detach();
+        // Follow changes until the portal starts again under a new owner.
+        loop {
+            let restart = owners.next();
+            let owner_change = match changes.as_mut() {
+                Some(stream) => match select(stream.next(), restart).await {
+                    Either::Left((Some(c), _)) => {
+                        cx.update(|cx| set(Rgb::from_portal(c.red(), c.green(), c.blue()), cx));
+                        continue;
+                    }
+                    Either::Left((None, _)) => {
+                        changes = None;
+                        continue;
+                    }
+                    Either::Right((signal, _)) => signal,
+                },
+                None => restart.await,
+            };
+            let args = owner_change?.args().ok()?.new_owner().as_ref().map(|owner| owner.to_string());
+            if portal_started(args.as_deref()) {
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -340,7 +397,7 @@ mod tests {
                 assert!(contrast(fg, p.selection) >= TEXT_CONTRAST, "selected text for {accent:?}");
                 let mut colors = base;
                 paint(&mut colors, Some(accent), &base);
-                assert!(contrast(Rgb::from_hsla(colors.switch_thumb), accent) >= UI_CONTRAST, "a switch's thumb on {accent:?}");
+                assert!(contrast(Rgb::from_hsla(colors.switch_thumb), p.fill) >= UI_CONTRAST, "a switch's thumb on {accent:?}");
             }
         }
     }
@@ -354,6 +411,7 @@ mod tests {
         assert_eq!(in_light.fill, accent, "buttons are the colour the user picked");
         assert_eq!(in_dark.fill, accent);
         assert!(in_light.link.luminance() < accent.luminance(), "darker links on white");
+        assert!(in_light.fill.luminance() <= accent.luminance(), "never a lighter fill on white");
         assert!(in_dark.link.luminance() >= accent.luminance(), "never darker links on black");
         assert!(in_light.selection.luminance() >= accent.luminance(), "never a darker selection under dark text");
         assert!(in_dark.selection.luminance() < accent.luminance(), "a darker selection under light text");
@@ -408,6 +466,56 @@ mod tests {
             paint(&mut colors, None, &base);
             assert_eq!(colors, base);
         }
+    }
+
+    #[test]
+    fn links_read_even_when_the_toolkit_dims_them() {
+        for base in [light(), dark()] {
+            let bg = Rgb::from_hsla(base.background);
+            for accent in ACCENTS.map(hex) {
+                let link = link_on(accent, bg);
+                assert!(contrast(link, bg) >= LINK_CONTRAST, "{accent:?}");
+                assert!(contrast(bg.mix(link, 0.8), bg) >= TEXT_CONTRAST, "hovered (80%) link for {accent:?}");
+                assert!(contrast(bg.mix(link, 0.6), bg) >= TEXT_CONTRAST, "pressed (60%) link for {accent:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pale_and_dark_accents_still_stand_out_as_fills() {
+        // KDE's yellow and a near-white on white, a near-black on the dark theme.
+        for (accent, base) in [(0xe8cb2d, light()), (0xf0f0f0, light()), (0x111111, dark()), (0x1a1a40, dark())] {
+            let bg = Rgb::from_hsla(base.background);
+            let p = Palette::new(hex(accent), bg, Rgb::from_hsla(base.foreground));
+            assert!(contrast(p.fill, bg) >= UI_CONTRAST, "{accent:06x}: a checked radio or switch must be seen");
+            assert!(contrast(p.on_fill, p.fill) >= TEXT_CONTRAST);
+        }
+        // An accent that already stands out is used as it is.
+        let purple = Palette::new(hex(0x9141ac), WHITE, BLACK);
+        assert_eq!(purple.fill, hex(0x9141ac));
+    }
+
+    #[test]
+    fn a_live_change_paints_as_a_fresh_start_would() {
+        for base in [light(), dark()] {
+            for a in ACCENTS.map(hex) {
+                for b in [hex(0x9141ac), hex(0x3daee9), hex(0xf6d32d), hex(0x111111)] {
+                    let mut live = base;
+                    paint(&mut live, Some(a), &base);
+                    paint(&mut live, Some(b), &base);
+                    let mut fresh = base;
+                    paint(&mut fresh, Some(b), &base);
+                    assert_eq!(live, fresh, "{a:?} then {b:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_portal_with_an_owner_is_read_again() {
+        assert!(portal_started(Some(":1.42")));
+        assert!(!portal_started(Some("")), "the portal went away");
+        assert!(!portal_started(None));
     }
 
     #[test]
