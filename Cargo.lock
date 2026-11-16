@@ -2721,9 +2721,10 @@ dependencies = [
 
 [[package]]
 name = "green-light"
-version = "2.12.1"
+version = "2.12.2"
 dependencies = [
  "anyhow",
+ "ashpd",
  "dirs 6.0.0",
  "futures-util",
  "gpui-kit",

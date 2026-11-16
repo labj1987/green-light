@@ -1,6 +1,6 @@
 [package]
 name = "green-light"
-version = "2.12.1"
+version = "2.12.2"
 edition = "2021"
 rust-version = "1.100"
 description = "Green Light — a GUI for installing NVIDIA drivers on Linux"
@@ -19,6 +19,9 @@ reqwest = { version = "0.13", features = ["stream"] }
 sha2 = "0.11"
 hex = "0.4"
 futures-util = "0.3"
+# The desktop's accent colour (accent.rs), from the XDG desktop portal: the portal client the toolkit
+# already uses for its file dialogs and light/dark setting, with the same features.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "settings"] }
 scraper = "0.29"
 regex = "1"
 anyhow = "1"

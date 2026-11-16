@@ -613,13 +613,16 @@ pub fn build_ui(cx: &mut App, mut activations: Activations) {
         window_decorations: Some(WindowDecorations::Client),
         ..TitleBar::window_options()
     };
+    crate::accent::follow(cx);
     let opened = gpui_kit::open_window(options, cx, |window, cx| {
         window.set_window_title("Green Light");
-        // Follow the desktop's light/dark preference, now and when it changes.
+        // Follow the desktop's light/dark preference and accent colour, now and when they change.
         Theme::sync_system_appearance(Some(window), cx);
+        crate::accent::apply(cx);
         window
             .observe_window_appearance(|window, cx| {
                 Theme::sync_system_appearance(Some(window), cx);
+                crate::accent::apply(cx);
             })
             .detach();
         cx.new(|cx| MainView::new(window, cx))
