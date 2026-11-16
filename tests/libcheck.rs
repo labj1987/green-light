@@ -373,7 +373,13 @@ fn without_zenity_kdialog_or_notify_send_the_message_goes_over_dbus() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(out.status.success());
     assert!(calls.starts_with("== gdbus\ncall\n--session\n--dest\norg.freedesktop.Notifications\n"), "{calls}");
-    assert!(calls.contains("\norg.freedesktop.Notifications.Notify\n'Green Light'\nuint32 0\n''\n'Green Light'\n'It\\'s ‹missing›'\n@as []\n"), "{calls}");
+    assert!(
+        calls.contains(
+            "\norg.freedesktop.Notifications.Notify\n'Green Light'\nuint32 0\n''\n'Green Light'\n'It\\'s ‹missing›'\n@as []\n{'urgency': <byte 2>}\nint32 0\n"
+        ),
+        "{calls}"
+    );
+    // It stays until it is closed: COSMIC drops a notification with the default expiry after seconds.
     assert!(!calls.contains("xmessage"), "shown once: {calls}");
 }
 

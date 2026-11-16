@@ -516,7 +516,8 @@ pub fn show_error_without_window(message: &str) {
 /// The programs tried, in order, to show an error when the app has no
 /// window, with their arguments. gdbus sends a notification straight over
 /// D-Bus, for desktops with a notification service but no notify-send (Pop!_OS
-/// COSMIC); xmessage is the last resort.
+/// COSMIC); xmessage is the last resort The notification has no expiry: COSMIC drops
+/// one with the default after a few seconds.
 fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
     let args = |fixed: &[&str]| fixed.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
     let with_message = |fixed: &[&str]| {
@@ -546,7 +547,7 @@ fn error_dialogs(message: &str) -> Vec<(&'static str, Vec<String>)> {
                 &gvariant_string(message),
                 "@as []",
                 "{'urgency': <byte 2>}",
-                "int32 -1",
+                "int32 0",
             ]),
         ),
         ("xmessage", with_message(&["-center", "-title", "Green Light"])),

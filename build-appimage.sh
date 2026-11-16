@@ -333,7 +333,8 @@ libcheck_gvariant() {
 # libcheck_show TITLE TEXT: TEXT on stderr and, in a desktop session, in the first of these that
 # shows it: zenity, kdialog (both end with 0 or 1 once seen), a notification through notify-send or
 # straight over D-Bus with gdbus (0: the desktop took it; Pop!_OS COSMIC has gdbus but no
-# notify-send), and xmessage.
+# notify-send; expiry 0 keeps it up until it is closed, COSMIC drops others after seconds), and
+# xmessage.
 libcheck_show() {
     local rc plain
     printf '%s: %s\n' "$1" "$2" >&2
@@ -354,7 +355,7 @@ libcheck_show() {
     if command -v gdbus >/dev/null 2>&1; then
         gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
             --method org.freedesktop.Notifications.Notify "$(libcheck_gvariant "$1")" 'uint32 0' "''" \
-            "$(libcheck_gvariant "$1")" "$(libcheck_gvariant "$plain")" '@as []' "{'urgency': <byte 2>}" 'int32 -1' \
+            "$(libcheck_gvariant "$1")" "$(libcheck_gvariant "$plain")" '@as []' "{'urgency': <byte 2>}" 'int32 0' \
             >/dev/null 2>&1 && return 0
     fi
     if command -v xmessage >/dev/null 2>&1; then
