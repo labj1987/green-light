@@ -5,6 +5,17 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.12.2 — 2026-11-16
+
+- **The window takes your desktop's accent colour.** On GNOME, KDE Plasma and COSMIC, primary
+  buttons, switches, checkboxes and radio buttons, focus rings, links, the selected driver and
+  progress bars now use the accent colour you picked, in light and dark mode alike, and change with
+  it at once. Text on accent-coloured buttons stays readable: it is white or near-black, whichever
+  stands out. On desktops without an accent colour (Hyprland, sway, GNOME before 47) the colours
+  stay as they were.
+- Unselected radio buttons and checkboxes are easier to see in dark mode (and light): their outline now
+  stands out from the window, for example the module type choice on the Configure page.
+
 ## 2.12.1 — 2026-11-16
 
 - **A second start no longer reports a copy that is still starting as stuck.** If Green Light is
