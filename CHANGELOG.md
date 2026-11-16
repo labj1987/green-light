@@ -5,7 +5,7 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
-## 2.12.0 — 2026-11-15
+## 2.12.0 — 2026-11-16
 
 - **Works while the NVIDIA driver is broken or missing.** Green Light now draws its own window instead
   of using GTK 4 and libadwaita. It draws with the NVIDIA driver when that works, and otherwise with
