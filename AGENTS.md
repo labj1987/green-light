@@ -202,8 +202,26 @@ copy of that logic.
   make, dkms with `--dkms`), then **test-build** it: `--extract-only` and
   `make -C <flavor> KERNEL_UNAME=$KVER modules` with the compiler chosen as
   DKMS does (`LLVM=1` for clang kernels, the gcc named in
-  `CONFIG_CC_VERSION_TEXT` when installed), for the chosen flavor or both.
-  Any of these failing is "No changes made" (exit 1).
+  `CONFIG_CC_VERSION_TEXT` when installed), for the chosen flavor, else the
+  one the unpacked installer recommends (`--print-recommended-kernel-module-type`,
+  where it has it), else both. Any of these failing is "No changes made" (exit 1).
+  Between `--check` and the prerequisites, the **Secure Boot gate**: with Secure
+  Boot on, no usable key (none, a config-named one that is missing, PKCS#11
+  without DKMS) or a key `mokutil --test-key` (as root) calls neither enrolled
+  nor queued is exit 7, nothing changed; an unreadable answer only warns.
+  `secure_boot_block` in `preflight.rs` is the app's copy, applied before the
+  password prompt (it doesn't block on unknown enrollment states).
+- The module flavor goes to the installer in the form its `--advanced-options`
+  lists: `--kernel-module-type` (560+) or `--kernel-module-build-directory=kernel-open|kernel`
+  (515-555); without that list, by the label's version. The app always passes
+  `--kernel-module-type=` to the script.
+- After the installer: DKMS rebuilds the module for every kernel with headers
+  (version from the label, else `nvidia-installer --version`, else `dkms
+  status`); without DKMS the .run builds it for every other installed kernel
+  (`/boot/vmlinuz-<k>` present) with `--kernel-modules-only --kernel-name=<k>`,
+  same flavor and signing arguments. A failed or impossible build, and a
+  failed DKMS rebuild for the running kernel, are `Verify: WARNING` lines; the
+  app shows them in a dialog after a successful install.
 - **Journal** (`/var/lib/green-light/journal`, root-only, parent 0755 so the
   app can see it; written as `journal.new`, every file synced, renamed):
   before the first change it records a snapshot of every installed package
@@ -216,9 +234,10 @@ copy of that logic.
   module (`MOD_KERNELS_BEFORE`) and the boot ID, and copies of the packages to be removed (apt's cache or
   `apt-get download`; `dnf download`; akmods' cached kmod rpm; index
   written atomically) so the rollback works offline. Phase: `armed` →
-  `installer-started` → `installer-done`; the journal is removed when the
-  installer has succeeded or a rollback has been verified, kept when a
-  rollback fails. `recovery-status` next to it (0644) tells the app why
+  `installer-started` → `installer-done` (with `post`: DKMS and block
+  options); the journal is removed when the install's last steps (module
+  builds, block, initramfs) have run or a rollback has been verified, kept
+  when a rollback fails. `recovery-status` next to it (0644) tells the app why
   recovery data is waiting (`failed: …` / `refused: …`).
 - **Rollback** (EXIT trap while armed, or recovery): `nvidia-uninstall` if
   the failed installer registered a new .run driver, restore files,
@@ -247,7 +266,12 @@ copy of that logic.
   after akmods/dkms, before the display manager; output to journal and
   console, progress on plymouth via `plymouth display-message`;
   `SuccessExitStatus=3 6`; `TimeoutStartSec=20min` — a timeout leaves the
-  journal for the next try). Phase `installer-done` only clears the journal.
+  journal for the next try). Phase `installer-done` is not rolled back: the
+  recovery finishes the last steps (`resume_post_install`: DKMS builds,
+  block, initramfs for every kernel with a module; a kernel without DKMS and
+  without a module is named), then clears the journal, exit 0. Module repair
+  (`ensure_module`) runs on every rollback attempt, keyed by the baseline's
+  plan, so a retry fixes a module even when the packages are already back.
   First `journal_stale_reason`: if the driver was changed by other means
   since (a .run driver that is neither the earlier nor the target one, or
   driver packages neither in the snapshot nor put back by a rollback),

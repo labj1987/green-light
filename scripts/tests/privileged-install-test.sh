@@ -34,7 +34,7 @@ CASE_FAILED=0
 T=""
 
 # Real tools the script uses; everything else on PATH is a stub.
-REAL_TOOLS=(bash cat chmod cp cut date flock grep head install ls mkdir mktemp mv nproc rm setsid
+REAL_TOOLS=(bash cat chmod cp cut date dd flock grep head install ls mkdir mktemp mv nproc rm setsid
             sleep sort stat sha256sum sync tail touch true env getfacl)
 
 stub() { # <name> <body>   (body runs with "$@" = the stub's arguments)
@@ -159,6 +159,7 @@ if [[ -e "$GLT/fail-initramfs" ]]; then exit 1; fi; touch "/boot/initrd.img-$3"'
     # restored packages include DKMS sources ($GLT/dkms-builds).
     stub dkms 'case "$1" in
   status) echo "nvidia/595.84, '"$KVER"', x86_64: installed" ;;
+  build) if [[ -e "$GLT/dkms-build-fails" ]]; then exit 10; fi ;;
   autoinstall) [[ -e "$GLT/dkms-builds" ]] && { echo 595.84 > "$GLT/mod-version.$3"; : > "$GLT/mod-signer.$3"; } ;;
 esac'
     stub mokutil 'case "$1" in --sb-state) cat "$GLT/sb" 2>/dev/null || echo "SecureBoot disabled" ;; esac'
@@ -186,8 +187,23 @@ label="NVIDIA Accelerated Graphics Driver for Linux-x86_64 595.84"
 echo "installer $*" >> "$GLT/calls"
 case "$1" in
   --check) exit 0 ;;
-  --extract-only) mkdir -p "$3/kernel-open" "$3/kernel"; exit 0 ;;
+  --extract-only)
+    mkdir -p "$3/kernel-open" "$3/kernel"
+    # $GLT/installer-options: what the unpacked nvidia-installer lists as its
+    # options; $GLT/recommended: the flavor it recommends.
+    if [[ -e "$GLT/installer-options" ]]; then
+      printf '#!/bin/bash\ncase "$1" in --advanced-options) cat "$GLT/installer-options" ;; --print-recommended-kernel-module-type) cat "$GLT/recommended" ;; esac\n' > "$3/nvidia-installer"
+      chmod 755 "$3/nvidia-installer"
+    fi
+    exit 0 ;;
 esac
+# The kernel module for another kernel ($GLT/fail-kernel-K: it fails).
+for a in "$@"; do
+  case "$a" in
+    --kernel-name=*) k="${a#--kernel-name=}"; [[ -e "$GLT/fail-kernel-$k" ]] && exit 1
+      echo 595.84 > "$GLT/mod-version.$k"; : > "$GLT/mod-signer.$k"; exit 0 ;;
+  esac
+done
 echo "$PPID" > "$GLT/script-pid"
 echo "$$" > "$GLT/installer-pid"
 if [[ -e "$GLT/offline-at-installer" ]]; then touch "$GLT/offline"; fi
@@ -329,6 +345,18 @@ end() {
     if [[ $CASE_FAILED -eq 0 ]]; then PASS=$((PASS + 1)); echo "ok   $CASE"; else FAIL=$((FAIL + 1)); fi
 }
 
+# Secure Boot on, with a module-signing key whose enrollment mokutil reports
+# as $GLT/test-key says (default: enrolled).
+sb_enrolled_key() {
+    echo "SecureBoot enabled" > "$T/sb"
+    mkdir -p "$T/var/lib/dkms"
+    touch "$T/var/lib/dkms/mok.key" "$T/var/lib/dkms/mok.pub"
+    stub mokutil 'case "$1" in
+  --sb-state) cat "$GLT/sb" 2>/dev/null || echo "SecureBoot disabled" ;;
+  --test-key) echo "$2 $(cat "$GLT/test-key" 2>/dev/null || echo "is already enrolled")" ;;
+esac'
+}
+
 # ── Cases ──────────────────────────────────────────────────────────────
 
 begin "the log is readable by the app whatever umask the script gets"
@@ -405,6 +433,56 @@ stub clang 'exit 0'
 run_default --kernel-module-type=open
 expect_rc 0
 expect_call_like "^make -C .*/kernel-open .*LLVM=1 KERNEL_UNAME"
+end
+
+begin "a module flavor goes to an installer older than 560 as its build directory"
+echo "  -m KERNEL-MODULE-BUILD-DIRECTORY, --kernel-module-build-directory=KERNEL-MODULE-BUILD-DIRECTORY" > "$T/installer-options"
+run_default --kernel-module-type=open
+expect_rc 0
+expect_call_like "^installer --silent .*--kernel-module-build-directory=kernel-open"
+expect_no_call_like "^installer .*--kernel-module-type"
+end
+
+begin "a module flavor goes to a newer installer as --kernel-module-type"
+printf '%s\n' "  -M KERNEL-MODULE-TYPE, --kernel-module-type=KERNEL-MODULE-TYPE" \
+    "  -m KERNEL-MODULE-BUILD-DIRECTORY, --kernel-module-build-directory=KERNEL-MODULE-BUILD-DIRECTORY" > "$T/installer-options"
+run_default --kernel-module-type=proprietary
+expect_rc 0
+expect_call_like "^installer --silent .*--kernel-module-type=proprietary"
+end
+
+begin "automatic flavor: only the one the installer recommends must build"
+printf '%s\n' "  --print-recommended-kernel-module-type" "  -M KERNEL-MODULE-TYPE, --kernel-module-type=KERNEL-MODULE-TYPE" > "$T/installer-options"
+echo open > "$T/recommended"
+echo kernel > "$T/fail-build"
+run_default
+expect_rc 0
+expect_call_like "^make -C .*/unpacked/kernel-open "
+expect_no_call_like "^make -C .*/unpacked/kernel "
+end
+
+begin "without DKMS the module is built for the other installed kernels too"
+mkdir -p "$T/modules/$KVER2/build" "$T/modules/7.1.0-nohdr" "$T/modules/7.2.0-fails/build"
+touch "$T/boot/vmlinuz-$KVER2" "$T/boot/vmlinuz-7.1.0-nohdr" "$T/boot/vmlinuz-7.2.0-fails" "$T/fail-kernel-7.2.0-fails"
+run_default --kernel-module-type=open
+expect_rc 0
+expect_call_like "^installer --silent .*--kernel-module-type=open .*--kernel-modules-only --kernel-name=$KVER2 "
+grep -q 595.84 "$T/mod-version.$KVER2" || fail "no module for $KVER2"
+expect_call "update-initramfs -u -k $KVER2"
+expect_out "Verify: WARNING kernel 7.1.0-nohdr has no nvidia module"
+expect_out "Verify: WARNING kernel 7.2.0-fails has no nvidia module"
+expect_no_journal
+end
+
+begin "DKMS: an unreadable .run label still gets the module rebuilt; a failed running-kernel build is a warning"
+grep -v '^label=' "$RUN" > "$T/home/nolabel.run"; mv "$T/home/nolabel.run" "$RUN"; chmod 644 "$RUN"
+sb_enrolled_key
+touch "$T/dkms-build-fails"
+run_default --dkms
+expect_rc 0
+expect_call "dkms build --force -m nvidia -v 595.84 -k $KVER"
+expect_out "Verify: WARNING DKMS could not rebuild the nvidia module for the running kernel $KVER"
+expect_out "Secure Boot refuses"
 end
 
 begin "a chosen module flavor is the only one test-built"
@@ -547,12 +625,66 @@ expect_no_journal
 (( (16#$(cut -f2 "$T/apt-signals") & (1 << 14)) == 0 )) || fail "apt-get inherited an ignored SIGTERM"
 end
 
+begin "Secure Boot without a signing key: refused before anything changes"
+echo "SecureBoot enabled" > "$T/sb"
+run_default
+expect_rc 7
+expect_out "Secure Boot is on and would refuse the new driver's kernel module"
+expect_out "no module-signing key"
+expect_no_call_like "^apt-get (install|purge)"
+expect_no_journal
+end
+
+begin "Secure Boot with a key that is not enrolled: refused before anything changes"
+sb_enrolled_key
+echo "is not enrolled" > "$T/test-key"
+run_default --dkms
+expect_rc 7
+expect_out "is neither enrolled nor waiting for enrollment"
+expect_no_call_like "^apt-get purge"
+expect_no_call_like "^installer --silent"
+end
+
+begin "Secure Boot with a PKCS#11 key and no DKMS: refused"
+sb_enrolled_key
+echo 'mok_signing_key="pkcs11:token=x"' > "$T/etc/dkms/framework.conf"
+echo 'mok_certificate=/var/lib/dkms/mok.pub' >> "$T/etc/dkms/framework.conf"
+run_default
+expect_rc 7
+expect_out "PKCS#11"
+end
+
+begin "Secure Boot with a key waiting for enrollment: installed"
+sb_enrolled_key
+echo "is already in the enrollment request" > "$T/test-key"
+run_default --dkms
+expect_rc 0
+expect_out "enrolled or waiting for enrollment"
+end
+
 begin "apt's own cache is used before downloading"
 echo fail > "$T/installer-mode"
 touch "$T/var/cache/apt/archives/nvidia-driver-595_595.84-0ubuntu1_amd64.deb"
 run_default
 expect_rc 3
 expect_no_call_like "^apt-get download nvidia-driver-595="
+end
+
+begin "a cached .deb of another architecture is no copy of the package"
+echo fail > "$T/installer-mode"
+# The amd64 build of the held i386 library, same name and version.
+touch "$T/var/cache/apt/archives/libnvidia-gl-595_595.84-0ubuntu1_amd64.deb"
+run_default
+expect_rc 3
+expect_call "apt-get download libnvidia-gl-595:i386=595.84-0ubuntu1"
+end
+
+begin "CUDA toolkit and PRIME packages are not purged by name"
+printf '%s\n' 'ii |nvidia-cuda-toolkit|12.0-1' 'ii |nvidia-prime|0.8-1' >> "$T/dpkg"
+run_default
+expect_rc 0
+expect_call_like "^apt-get purge -y .*nvidia-driver-595"
+expect_no_call_like "^apt-get purge -y .*nvidia-(cuda-toolkit|prime)"
 end
 
 begin "only what this run's purge removed is put back"
@@ -565,7 +697,7 @@ end
 
 begin "Secure Boot: a rollback that leaves an unsigned module is reported as failed"
 echo fail > "$T/installer-mode"
-echo "SecureBoot enabled" > "$T/sb"
+sb_enrolled_key
 touch "$T/no-download" "$T/fail-exact-reinstall"
 run_default
 expect_rc 4
@@ -578,7 +710,7 @@ end
 
 begin "Secure Boot: a module unsigned before and after is restored as it was"
 previous_run_driver
-echo "SecureBoot enabled" > "$T/sb"
+sb_enrolled_key
 echo fail > "$T/installer-mode"
 run_default
 expect_rc 3
@@ -828,19 +960,57 @@ grep -q "Restored and checked the previous driver setup" "$T/stdout" || fail "no
 expect_no_call_like "^systemd-run"
 end
 
-begin "cut off after the installer had finished: recovery only clears the journal"
+begin "cut off after the installer had finished: recovery finishes the last steps, puts nothing back"
 echo 30 > "$T/initramfs-wait"
 start_script
 for _ in $(seq 150); do grep -q "^update-initramfs" "$T/calls" && break; sleep 0.1; done
 kill_hard "$(script_pid_now)"
-mkdir -p "$T/var/lib/green-light/journal"
-echo installer-done > "$T/var/lib/green-light/journal/phase"
+expect_journal
+grep -qx installer-done "$T/var/lib/green-light/journal/phase" || fail "phase is not installer-done"
+rm -f "$T/initramfs-wait"
 : > "$T/calls"
 recover
 expect_rc 0
-expect_out "nothing to put back"
+expect_out "finishing its last steps"
+expect_call "update-initramfs -u -k $KVER"
 expect_no_call_like "^apt-get install"
 expect_no_journal
+end
+
+begin "cut off after a DKMS install's installer: recovery rebuilds the DKMS modules"
+mkdir -p "$T/var/lib/green-light/journal"
+echo installer-done > "$T/var/lib/green-light/journal/phase"
+printf 'declare -- PKG_MGR="apt"\ndeclare -- KVER="%s"\ndeclare -- TARGET_RUN_VER="595.84"\n' "$KVER" > "$T/var/lib/green-light/journal/state"
+printf 'declare -- POST_USE_DKMS="1"\ndeclare -- POST_BLOCK_DISTRO="1"\n' > "$T/var/lib/green-light/journal/post"
+recover
+expect_rc 0
+expect_call "dkms build --force -m nvidia -v 595.84 -k $KVER"
+expect_call "update-initramfs -u -k $KVER"
+expect_file "$T/etc/apt/preferences.d/green-light-nvidia"
+expect_no_journal
+end
+
+begin "a retried recovery builds a module the first one left missing, packages already back"
+printf '%s\n' 'ii |nvidia-driver-595|595.84-0ubuntu1' 'ii |nvidia-dkms-595|595.84-0ubuntu1' \
+    'ii |bash|5.2-1' > "$T/dpkg"
+echo 'nvidia-driver-595 nvidia-dkms-595' > "$T/revdeps"
+echo 'nvidia-dkms-595' > "$T/mod-pkg"
+: > "$T/auto-pkgs"
+: > "$T/held"
+: > "$T/mod-signer"
+cut_off_during_purge
+# The first recovery reinstalls the packages, but no module comes back and
+# DKMS can't build it yet.
+echo '' > "$T/mod-pkg"
+recover
+expect_rc 4
+expect_pkg nvidia-dkms-595
+# Fixed (DKMS can build now): the retry has no packages to reinstall but
+# must still build the module.
+touch "$T/dkms-builds"
+: > "$T/calls"
+recover
+expect_call "dkms autoinstall -k $KVER"
 end
 
 begin "cut off while the journal was replaced: the one moved aside is recovered"
@@ -1508,6 +1678,23 @@ for pw in "pass word1" "pässwörd1" "short" "seventeen-chars-x" $'tab\there1'; 
 done
 setup_signing 'Abc123!@#$%^&*()'
 expect_rc 0
+end
+
+begin "signing setup refuses a MokNew too short to hold its attribute bytes"
+mok_case
+printf 'ab' > "$T/efivars/$MOKNEW_NAME"
+RC=0
+sandbox "$T/bin/bash" -c 'echo pass5678 | "$0" --setup-signing' "$SCRIPT" > /dev/null 2>&1 || RC=$?
+OUT="$(cat "$T/var/log/green-light.log")"
+expect_rc 1
+expect_out "could not be read"
+expect_no_call_like "^mokutil --(revoke-)?import"
+end
+
+begin "signing setup leaves the lock readable whatever umask it gets"
+RC=0
+MODE="$(sandbox "$T/bin/bash" -c 'umask 077; echo x | "$0" --setup-signing >/dev/null 2>&1; stat -c %a /run/green-light-install.lock' "$SCRIPT")" || RC=$?
+[[ "$MODE" == 644 ]] || fail "lock mode $MODE, expected 644"
 end
 
 begin "signing setup leaves a waiting request it cannot carry over alone"

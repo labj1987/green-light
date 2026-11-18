@@ -43,6 +43,9 @@
 #   6  recovery data from an earlier interrupted install no longer matches
 #      this computer (its driver was changed by other means since): nothing
 #      done; "--discard-recovery" drops that data
+#   7  Secure Boot is on and the new module would not be signed with a key
+#      it trusts (no key, an unusable one, or one neither enrolled nor
+#      waiting for enrollment): nothing changed; set up signing first
 #
 # MODULE SIGNING
 # --------------
@@ -76,6 +79,7 @@ EXIT_ROLLED_BACK=3
 EXIT_ROLLBACK_FAILED=4
 EXIT_INITRAMFS=5
 EXIT_RECOVERY_REFUSED=6
+EXIT_SECURE_BOOT=7
 
 LOGFILE="/var/log/green-light.log"
 
@@ -384,6 +388,8 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
     trap 'log "ERROR: step failed near line $LINENO (exit $?) — signing setup aborted"' ERR
     # Not alongside an install (same lock as the install part below).
     exec 9>>/run/green-light-install.lock
+    # Readable whatever umask pkexec passed on: the app checks this lock.
+    chmod 0644 /run/green-light-install.lock 2>/dev/null || true
     if ! flock -n 9; then
         log "ERROR: A Green Light install is running; set up signing once it has finished."
         exit 1
@@ -439,6 +445,7 @@ if [[ "${1:-}" == "--setup-signing" ]]; then
             my ($file, $dir) = @ARGV;
             open(my $fh, "<:raw", $file) or exit 2;
             local $/; my $raw = <$fh>; close $fh;
+            exit 2 if length($raw) < 4;   # not even the attribute bytes
             my $data = substr($raw, 4);   # efivarfs: 4 attribute bytes first
             my $x509 = pack("H*", "a159c0a5e494a74a87b5ab155c2bf072");
             my ($off, $n, $other) = (0, 0, 0);
@@ -632,10 +639,15 @@ esac
 # DEB_DRIVER_GLOBS / RPM_DRIVER_GLOBS / is_driver_package in preflight.rs
 # (a unit test there compares them). Docker's GPU plumbing
 # (nvidia-container-toolkit, libnvidia-container*) matches the globs but is
-# not the display driver; see Step 3.
+# not the display driver; see Step 3. Neither are Ubuntu's CUDA toolkit and
+# its parts (nvidia-cuda-toolkit, nvidia-cuda-dev, nvidia-cudnn,
+# nvidia-profiler, nvidia-visual-profiler, nvidia-nsight, nvidia-opencl-dev,
+# nvidia-openjdk-8-jre, ...) or nvidia-prime (the PRIME switcher): never
+# purged by name. (One that depends on the driver's libraries still goes
+# with them, as apt must; the journal's plan has it.)
 DEB_DRIVER_GLOBS=('nvidia-*' 'libnvidia-*' 'xserver-xorg-video-nvidia*' 'system76-driver-nvidia*')
 RPM_DRIVER_GLOBS=('akmod-nvidia*' 'xorg-x11-drv-nvidia*' 'kmod-nvidia*' 'nvidia-driver*' 'nvidia-settings*')
-NOT_DRIVER_RE='^(nvidia-container|libnvidia-container)'
+NOT_DRIVER_RE='^(nvidia-container|libnvidia-container|nvidia-cuda|nvidia-cudnn|nvidia-prime|nvidia-profiler|nvidia-visual-profiler|nvidia-nsight|nvidia-opencl-dev|nvidia-openjdk|nvidia-libopencl)'
 # Kernel module packages akmods builds on this machine (kmod-nvidia-<kernel>);
 # no repository has them.
 LOCAL_KMOD_RE='^kmod-nvidia-[0-9]'
@@ -845,7 +857,11 @@ packages_removed() {
 # reinstalled without the network: from apt's or akmods' cache when there,
 # else downloaded at the exact version. "cache-index" maps keys to files.
 cache_planned_packages() {
-    local key spec name ver file got index="$JOURNAL/.cache-index.new"
+    local key spec name ver arch file got index="$JOURNAL/.cache-index.new"
+    if [[ "$PKG_MGR" == "apt" && -z "${NATIVE_ARCH:-}" ]]; then
+        NATIVE_ARCH="$(nolock dpkg --print-architecture 2>/dev/null || true)"
+        NATIVE_ARCH="${NATIVE_ARCH:-amd64}"
+    fi
     mkdir -p "$JOURNAL/cache"
     cp -- "$JOURNAL/cache-index" "$index" 2>/dev/null || : > "$index"
     while IFS='|' read -r key spec; do
@@ -855,11 +871,14 @@ cache_planned_packages() {
         got=""
         if [[ "$PKG_MGR" == "apt" ]]; then
             name="${key%%:*}"; ver="${spec#*=}"
-            for file in /var/cache/apt/archives/"${name}_${ver//:/%3a}"_*.deb; do
+            # The package's own architecture ("name:arch" keys; else the
+            # native one), or "all": an amd64 .deb is no copy of an i386 package.
+            if [[ "$key" == *:* ]]; then arch="${key#*:}"; else arch="$NATIVE_ARCH"; fi
+            for file in /var/cache/apt/archives/"${name}_${ver//:/%3a}"_{"$arch",all}.deb; do
                 [[ -f "$file" ]] && { cp -- "$file" "$JOURNAL/cache/" && got="$JOURNAL/cache/${file##*/}"; break; }
             done
             if [[ -z "$got" ]] && (cd "$JOURNAL/cache" && nolock apt-get download "$spec" >>"$LOGFILE" 2>&1); then
-                for file in "$JOURNAL/cache/${name}_${ver//:/%3a}"_*.deb; do [[ -f "$file" ]] && got="$file"; done
+                for file in "$JOURNAL/cache/${name}_${ver//:/%3a}"_{"$arch",all}.deb; do [[ -f "$file" ]] && got="$file"; done
             fi
         else
             if [[ "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then
@@ -945,6 +964,95 @@ initramfs_for() { # <kernel>
     fi
 }
 
+# ── After NVIDIA's installer: module builds and initramfs ─────────────
+# The journal stays (phase installer-done, with what these steps need in
+# "post") until they are done, so a run cut off here is finished by the
+# recovery (boot unit, --recover, next install), not forgotten and not
+# rolled back.
+
+# The version DKMS knows the new driver by: the .run's label, else what
+# NVIDIA's installer reports now, else the newest nvidia DKMS has.
+dkms_nvidia_version() {
+    local v="${TARGET_RUN_VER:-}" line
+    [[ -n "$v" ]] || v="$(installed_run_version)"
+    if [[ -z "$v" ]]; then
+        while IFS= read -r line; do
+            # "nvidia/595.84, 6.8.0, x86_64: installed" (DKMS 3), "nvidia, 595.84, ..." (DKMS 2)
+            if [[ "$line" =~ ^nvidia[/,][[:space:]]*([0-9]+\.[0-9.]+) ]]; then
+                if [[ -z "$v" || "$(printf '%s\n' "$v" "${BASH_REMATCH[1]}" | sort -V | tail -n 1)" != "$v" ]]; then
+                    v="${BASH_REMATCH[1]}"
+                fi
+            fi
+        done < <(nolock dkms status -m nvidia 2>/dev/null || true)
+    fi
+    printf '%s' "$v"
+}
+
+# Kernels other than the running one that are installed: a module tree and
+# a kernel image in /boot (a module tree alone is often what a removed
+# kernel leaves behind).
+other_kernels() {
+    local kdir k
+    for kdir in /lib/modules/*/; do
+        kdir="${kdir%/}"; k="${kdir##*/}"
+        [[ "$k" != "$KVER" && -e "/boot/vmlinuz-$k" ]] && printf '%s\n' "$k"
+    done
+    return 0
+}
+
+# DKMS builds the module for every kernel with headers, signed with the
+# machine's key. Adds to OTHER_BUILT_KERNELS / FAILED_KERNELS, sets
+# RUNNING_BUILD_FAILED.
+dkms_build_all() { # <version>
+    local v="$1" kdir k
+    for kdir in /lib/modules/*/; do
+        kdir="${kdir%/}"; k="${kdir##*/}"
+        [[ -e "$kdir/build" ]] || continue
+        if nolock dkms build --force -m nvidia -v "$v" -k "$k" >>"$LOGFILE" 2>&1 \
+            && nolock dkms install --force -m nvidia -v "$v" -k "$k" >>"$LOGFILE" 2>&1; then
+            log "DKMS: nvidia $v built for $k"
+            [[ "$k" == "$KVER" ]] || OTHER_BUILT_KERNELS+=("$k")
+        else
+            log "WARNING: DKMS could not build nvidia $v for kernel $k (see $LOGFILE); that kernel has no NVIDIA driver until it does"
+            log_dkms_build_tail
+            if [[ "$k" == "$KVER" ]]; then RUNNING_BUILD_FAILED=1; else FAILED_KERNELS+=("$k"); fi
+        fi
+    done
+}
+
+# Recovery of a run cut off after NVIDIA's installer had succeeded: finish
+# its last steps. DKMS builds again; without DKMS the other kernels' modules
+# came from the .run, which is gone, so a kernel still without one is named.
+resume_post_install() {
+    local v k
+    OTHER_BUILT_KERNELS=()
+    FAILED_KERNELS=()
+    RUNNING_BUILD_FAILED=0
+    if [[ "${POST_USE_DKMS:-0}" -eq 1 ]] && command -v dkms >/dev/null 2>&1; then
+        v="$(dkms_nvidia_version)"
+        if [[ -n "$v" ]]; then
+            dkms_build_all "$v"
+        else
+            log "WARNING: The new driver's version can't be found, so DKMS can't build its kernel modules; install the driver again"
+        fi
+    fi
+    while IFS= read -r k; do
+        if [[ -n "$(module_version "$k")" ]]; then
+            printf '%s\n' "${OTHER_BUILT_KERNELS[@]}" | grep -qxF -- "$k" || OTHER_BUILT_KERNELS+=("$k")
+        else
+            log "WARNING: There is no nvidia kernel module for kernel $k; install the driver again with Green Light to build one"
+        fi
+    done < <(other_kernels)
+    if [[ "${POST_BLOCK_DISTRO:-0}" -eq 1 ]]; then
+        block_distro_driver || log "WARNING: Could not block the distro's NVIDIA driver packages"
+    fi
+    for k in "$KVER" "${OTHER_BUILT_KERNELS[@]}"; do
+        [[ -d "/lib/modules/$k" ]] || continue
+        initramfs_for "$k" >>"$LOGFILE" 2>&1 || log "WARNING: initramfs rebuild failed for kernel $k. Run: ${INITRAMFS_CMD[*]/$KVER/$k}"
+    done
+    return 0
+}
+
 # Make sure the restored driver has its module for <kernel> when the
 # packages alone don't bring it: akmods for akmod-nvidia, DKMS for DKMS
 # packages, Ubuntu's prebuilt package for that kernel when the setup used
@@ -1023,9 +1131,10 @@ verify_restored() {
 }
 
 rollback() {
-    local ok=1 key spec file run_now k kmod_cached=0 local_failed=0
+    local ok=1 key spec file run_now k local_failed=0
     local -A cached=()
     local files=() specs=() names=() auto=() keys=()
+    local -A was_installed=()
     log "Restoring the previous driver setup…"
     # A partial install of the new driver: let its own uninstaller take it
     # out, so the restored packages don't sit on top of half of it.
@@ -1041,10 +1150,8 @@ rollback() {
     while IFS='|' read -r key file; do [[ -n "$key" ]] && cached["$key"]="$file"; done < "$JOURNAL/cache-index"
     while IFS='|' read -r key spec; do
         [[ -n "$key" ]] || continue
-        keys+=("$key")
         if [[ -n "${cached[$key]:-}" ]]; then
             files+=("${cached[$key]}")
-            if [[ "$PKG_MGR" == "dnf" && "${key%.*}" == "kmod-nvidia-$KVER" ]]; then kmod_cached=1; fi
         elif [[ "$PKG_MGR" == "dnf" && "${key%.*}" =~ $LOCAL_KMOD_RE ]]; then
             continue   # exists in no repository; akmods rebuilds it below
         else
@@ -1096,11 +1203,22 @@ rollback() {
                 nolock dnf "${mark[@]}" "${auto[@]%.*}" >>"$LOGFILE" 2>&1 || log "WARNING: Could not mark ${auto[*]} as installed as dependencies"
             fi
         fi
-        # akmod-nvidia builds its module in the background from its rpm
-        # scriptlet, DKMS packages for the running kernel only: build what
-        # is missing now, for every kernel that matters, so it can be checked.
+    fi
+    # akmod-nvidia builds its module in the background from its rpm
+    # scriptlet, DKMS packages for the running kernel only: build what is
+    # missing now, for every kernel that matters, so it can be checked. On
+    # every attempt, not only the one that reinstalled the packages: an
+    # earlier recovery may have put them back and then been cut off (or
+    # failed) before the module was there. The keys are the whole plan of
+    # the baseline (every package this setup had and the install removed,
+    # whether put back already or not), so the module source is known.
+    # (ensure_module does nothing for a kernel that has a module.)
+    if [[ -n "$MOD_VER_BEFORE" && -s "$JOURNAL/planned" ]]; then
+        while IFS='|' read -r key _; do [[ -n "$key" ]] && was_installed["$key"]=1; done < "$JOURNAL/packages-before"
+        while IFS= read -r key; do
+            [[ -n "$key" && -n "${was_installed[$key]:-}" ]] && keys+=("$key")
+        done < "$JOURNAL/planned"
         while IFS= read -r k; do
-            if [[ "$k" == "$KVER" && $kmod_cached -eq 1 ]]; then continue; fi
             ensure_module "$k" "${keys[@]}"
             record_reinstalled
         done < <(restore_kernels)
@@ -1231,7 +1349,28 @@ if [[ -d "$JOURNAL" ]]; then
     EARLIER_KERNELS=()
     MOD_KERNELS_BEFORE=()
     if [[ "$PHASE" == "installer-done" ]]; then
-        log "An earlier install had finished NVIDIA's installer before it was cut off; nothing to put back."
+        # The new driver is in place; only the steps after NVIDIA's installer
+        # (kernel modules for every kernel, block, initramfs) may be missing.
+        POST_USE_DKMS=0
+        POST_BLOCK_DISTRO=0
+        # shellcheck source=/dev/null  # written by this script, root-only
+        if source "$JOURNAL/state" 2>/dev/null && source "$JOURNAL/post" 2>/dev/null; then
+            set_kernel "$KVER"
+            log "An earlier install was cut off after NVIDIA's installer had finished; finishing its last steps (kernel modules, initramfs)…"
+            if [[ -n "${INVOCATION_ID:-}" ]] && command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then
+                PLYMOUTH=1
+            fi
+            PRIV_DIR="$(mktemp -d /var/tmp/green-light-recover.XXXXXX)"
+            chmod 700 "$PRIV_DIR"
+            start_inhibitor
+            resume_post_install
+            log "Finished the earlier install's last steps."
+            rm -rf "$PRIV_DIR"
+            PRIV_DIR=""
+            PLYMOUTH=0
+        else
+            log "WARNING: An earlier install was cut off after NVIDIA's installer had finished, and what its last steps needed can't be read; install the driver again to finish them."
+        fi
         journal_clear
         recovery_note ""
     elif [[ $DISCARD_RECOVERY -eq 1 ]]; then
@@ -1424,8 +1563,13 @@ PRIV_DIR="$(mktemp -d /var/tmp/green-light-install.XXXXXX)"
 chmod 700 "$PRIV_DIR"
 RUN_FILE="$PRIV_DIR/installer.run"
 log "Copying installer to private directory…"
-if ! cp --no-preserve=mode,ownership -- "$ORIG_RUN_FILE" "$RUN_FILE"; then
-    log "ERROR: Could not copy the installer (disk full?). No changes made."
+# The original may have been swapped since the checks above: opened without
+# following a symlink and without waiting on a FIFO (one with no writer
+# reads as empty and fails the checksum below), so only a file's content is
+# ever copied.
+if ! dd if="$ORIG_RUN_FILE" of="$RUN_FILE" iflag=nofollow,nonblock bs=1M status=none 2>>"$LOGFILE" \
+    || [[ ! -f "$RUN_FILE" || -L "$RUN_FILE" ]]; then
+    log "ERROR: Could not copy the installer (disk full, or the file was replaced by something that is not a file). No changes made."
     exit "$EXIT_FAILED"
 fi
 chmod 700 "$RUN_FILE"
@@ -1443,6 +1587,51 @@ if ! nolock "$RUN_FILE" --check >>"$LOGFILE" 2>&1; then
     exit "$EXIT_FAILED"
 fi
 log "Integrity OK"
+
+# The version being installed, from the verified copy itself (its makeself
+# header's label, "NVIDIA Accelerated Graphics Driver for Linux-x86_64
+# 595.84"), not the file name, which a download may have changed.
+TARGET_RUN_VER=""
+RUN_LABEL="$(head -c 65536 "$RUN_FILE" | grep -a -m1 '^label=' || true)"
+if [[ "$RUN_LABEL" =~ [[:space:]]([0-9]+\.[0-9]+(\.[0-9]+)?)\"[[:space:]]*$ ]]; then TARGET_RUN_VER="${BASH_REMATCH[1]}"; fi
+
+# ── Step 1b: Secure Boot must accept the new module ───────────────────
+# Installing removes the distribution's driver, whose modules are signed by
+# the distribution. With Secure Boot on, a new module that is unsigned, or
+# signed with a key the firmware doesn't trust and that isn't waiting for
+# enrollment either, is refused at the next boot: no NVIDIA driver at all.
+# So that is refused here, before anything changes. A key waiting for
+# enrollment is fine (it is enrolled at that boot's MOK Manager screen).
+# (The app checks the same before asking for the password; this is the
+# authoritative check, with root's view of the EFI variables.)
+secure_boot_gate() {
+    secure_boot_on || return 0
+    local why="" der out
+    resolve_signing_key
+    if [[ -z "$SIGN_KEY" ]]; then
+        why="this computer has no module-signing key, so the new module would be unsigned"
+    elif [[ $SIGN_MISSING -eq 1 ]]; then
+        why="the DKMS config names signing key $SIGN_KEY and certificate $SIGN_CERT, which don't both exist, so the new module would be unsigned"
+    elif [[ $USE_DKMS -eq 0 && "$SIGN_KEY" == pkcs11:* ]]; then
+        why="the signing key is on a PKCS#11 token, which NVIDIA's installer can't sign with (turn on DKMS to have it signed)"
+    elif ! der="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")"; then
+        why="the signing certificate $SIGN_CERT can't be read"
+    else
+        out="$(mokutil --test-key "$der" 2>&1 || true)"
+        if grep -qiE 'already (enrolled|in )' <<<"$out"; then
+            log "Secure Boot is on; the signing key $SIGN_CERT is enrolled or waiting for enrollment"
+        elif grep -qi 'not enrolled' <<<"$out"; then
+            why="the signing key $SIGN_CERT is neither enrolled nor waiting for enrollment"
+        else
+            log "WARNING: Secure Boot is on, and whether the signing key $SIGN_CERT is enrolled can't be checked (mokutil: ${out:-no answer}); going on"
+        fi
+    fi
+    if [[ -n "$why" ]]; then
+        log "ERROR: Secure Boot is on and would refuse the new driver's kernel module at the next boot: $why. Use Set Up Signing on Green Light's System tab first (or turn Secure Boot off). No changes made."
+        exit "$EXIT_SECURE_BOOT"
+    fi
+}
+secure_boot_gate
 
 # ── Step 2: Build prerequisites ───────────────────────────────────────
 # Installing them may fail for reasons that don't matter (an unrelated
@@ -1513,6 +1702,36 @@ check_build_prereqs
 # that fails, nothing has been changed yet. With the module flavor left to
 # the installer, both flavors are built, since which one it picks depends on
 # the GPUs.
+# The installer option for the chosen module flavor: --kernel-module-type
+# (-M, 560 and newer), or on 515 to 555 only --kernel-module-build-directory
+# (-m=kernel-open|kernel); older drivers have the proprietary one only.
+# Decided from the installer's own option list, or without one from its
+# version.
+set_module_type_args() {
+    MODULE_TYPE_ARGS=()
+    [[ -n "$MODULE_TYPE" ]] || return 0
+    local major="${TARGET_RUN_VER%%.*}" style=""
+    if [[ -n "$INSTALLER_OPTIONS" ]]; then
+        if grep -qF -- '--kernel-module-type' <<<"$INSTALLER_OPTIONS"; then style="type"
+        elif grep -qF -- '--kernel-module-build-directory' <<<"$INSTALLER_OPTIONS"; then style="dir"
+        fi
+    elif [[ "$major" =~ ^[0-9]+$ ]] && (( major < 560 )); then
+        if (( major >= 515 )); then style="dir"; fi
+    else
+        style="type"
+    fi
+    case "$style" in
+        type) MODULE_TYPE_ARGS=("--kernel-module-type=$MODULE_TYPE") ;;
+        dir)  if [[ "$MODULE_TYPE" == open ]]; then MODULE_TYPE_ARGS=(--kernel-module-build-directory=kernel-open)
+              else MODULE_TYPE_ARGS=(--kernel-module-build-directory=kernel); fi ;;
+        *)    if [[ "$MODULE_TYPE" == open ]]; then
+                  log "ERROR: This driver has no open kernel modules (they came with 515). No changes made."
+                  exit "$EXIT_FAILED"
+              fi ;;
+    esac
+    log "Module flavor option for this installer: ${MODULE_TYPE_ARGS[*]:-none (proprietary only)}"
+}
+
 test_build_modules() {
     local dir="$PRIV_DIR/unpacked" flavors=() f out="$PRIV_DIR/test-build.log"
     log "Test-building the NVIDIA kernel module for $KVER before changing anything…"
@@ -1520,10 +1739,25 @@ test_build_modules() {
         log "ERROR: Could not unpack the installer to test-build its kernel module. No changes made."
         exit "$EXIT_FAILED"
     fi
+    # What this installer understands (its options differ between versions).
+    INSTALLER_OPTIONS="$(nolock "$dir/nvidia-installer" --advanced-options 2>/dev/null || true)"
+    set_module_type_args
     case "$MODULE_TYPE" in
         open)        flavors=(kernel-open) ;;
         proprietary) flavors=(kernel) ;;
-        *)           flavors=(kernel-open kernel) ;;
+        *)
+            # Left to the installer: the flavor it picks for these GPUs, when
+            # it can say (newer installers); else both, as either may be used.
+            local rec=""
+            if grep -qF -- '--print-recommended-kernel-module-type' <<<"$INSTALLER_OPTIONS"; then
+                rec="$(nolock "$dir/nvidia-installer" --print-recommended-kernel-module-type 2>/dev/null || true)"
+                rec="${rec%%$'\n'*}"
+            fi
+            case "$rec" in
+                open)        flavors=(kernel-open); log "The installer picks the open kernel modules for these GPUs" ;;
+                proprietary) flavors=(kernel); log "The installer picks the proprietary kernel modules for these GPUs" ;;
+                *)           flavors=(kernel-open kernel) ;;
+            esac ;;
     esac
     for f in "${flavors[@]}"; do
         # Drivers older than 515 have no open flavor.
@@ -1603,14 +1837,8 @@ for kdir in /lib/modules/*/; do
 done
 
 # Write the journal: built under a temporary name and renamed into place.
-# What the run is putting in and in which boot, so recovery can tell a
-# journal that no longer describes the computer.
-# The version comes from the verified copy itself (its makeself header's
-# label, "NVIDIA Accelerated Graphics Driver for Linux-x86_64 595.84"), not
-# the file name, which a download may have changed.
-TARGET_RUN_VER=""
-RUN_LABEL="$(head -c 65536 "$RUN_FILE" | grep -a -m1 '^label=' || true)"
-if [[ "$RUN_LABEL" =~ [[:space:]]([0-9]+\.[0-9]+(\.[0-9]+)?)\"[[:space:]]*$ ]]; then TARGET_RUN_VER="${BASH_REMATCH[1]}"; fi
+# What the run is putting in (TARGET_RUN_VER, read in Step 1) and in which
+# boot, so recovery can tell a journal that no longer describes the computer.
 if [[ -z "$TARGET_RUN_VER" ]]; then
     log "WARNING: The installer's version can't be read from it; if this install is cut off, recovering it may need Discard Recovery Data"
 fi
@@ -1772,11 +2000,10 @@ INSTALLER_ARGS=(
     --ui=none
     --no-x-check
     --allow-installation-with-running-driver
-    --log-file-name=/var/log/nvidia-installer.log
 )
-if [[ $USE_DKMS -eq 1 ]]; then INSTALLER_ARGS+=(--dkms); fi
-if [[ -n "$MODULE_TYPE" ]]; then INSTALLER_ARGS+=("--kernel-module-type=$MODULE_TYPE"); fi
+INSTALLER_ARGS+=("${MODULE_TYPE_ARGS[@]}")
 
+SIGNING_ARGS=()
 # Module signing: use the machine's existing key; with none, change nothing.
 # DKMS signs with this key itself at build time; without DKMS the installer
 # gets the key (PEM private key, DER certificate).
@@ -1792,7 +2019,7 @@ if [[ -n "$SIGN_KEY" ]]; then
         if [[ "$SIGN_KEY" == pkcs11:* ]]; then
             log "WARNING: A PKCS#11 signing key can't be passed to the NVIDIA installer; the module will not be signed (turn on DKMS to have it signed)"
         elif SIGN_CERT_DER="$(cert_as_der "$SIGN_CERT" "$PRIV_DIR")"; then
-            INSTALLER_ARGS+=(
+            SIGNING_ARGS=(
                 "--module-signing-secret-key=$SIGN_KEY"
                 "--module-signing-public-key=$SIGN_CERT_DER"
             )
@@ -1801,6 +2028,10 @@ if [[ -n "$SIGN_KEY" ]]; then
         fi
     fi
 fi
+# Also what builds the module for the other kernels without DKMS (Step 5b).
+KMOD_ARGS=("${INSTALLER_ARGS[@]}" "${SIGNING_ARGS[@]}")
+if [[ $USE_DKMS -eq 1 ]]; then INSTALLER_ARGS+=(--dkms); fi
+INSTALLER_ARGS+=("${SIGNING_ARGS[@]}")
 # resolve_signing_key may be called again by the rollback's checks.
 INSTALL_SIGN_KEY="$SIGN_KEY"
 INSTALL_SIGN_CERT="$SIGN_CERT"
@@ -1808,43 +2039,81 @@ INSTALL_SIGN_CERT="$SIGN_CERT"
 RC=0
 INSTALLER_STARTED=1
 journal_set_phase installer-started
-nolock "$RUN_FILE" "${INSTALLER_ARGS[@]}" >>"$LOGFILE" 2>&1 || RC=$?
+nolock "$RUN_FILE" "${INSTALLER_ARGS[@]}" --log-file-name=/var/log/nvidia-installer.log >>"$LOGFILE" 2>&1 || RC=$?
 if [[ $RC -ne 0 ]]; then
     log "ERROR: NVIDIA installer exited with code $RC"
     log "See /var/log/nvidia-installer.log for details."
     log_dkms_build_tail
     exit "$EXIT_FAILED"
 fi
+# What the steps below need if this run is cut off before they finish (the
+# recovery then finishes them; see resume_post_install).
+POST_USE_DKMS=$USE_DKMS
+POST_BLOCK_DISTRO=$BLOCK_DISTRO
+declare -p POST_USE_DKMS POST_BLOCK_DISTRO > "$JOURNAL/.post.new"
+durable "$JOURNAL/.post.new"
+mv -f "$JOURNAL/.post.new" "$JOURNAL/post"
 journal_set_phase installer-done
 ROLLBACK_ARMED=0
-journal_clear
+# From here on nothing is rolled back; the journal goes when this run ends,
+# however it ends, and stays only if it is cut off.
+JOURNAL_OURS=1
 log "NVIDIA installer finished successfully"
 if [[ $STOP_REQUESTED -eq 1 ]]; then
     log "A stop was requested while NVIDIA's installer ran; it had already succeeded, so the install is finished rather than undone."
 fi
 
-# ── Step 5b: DKMS builds the module for every kernel, signed ──────────
+# ── Step 5b: The module for every installed kernel, signed ────────────
 # With --dkms, NVIDIA's installer compiles the module for the running kernel
 # itself, unsigned (it signs only without DKMS), and only registers the
 # sources with DKMS. DKMS signs with the machine's key when it builds, so the
 # module is built again through DKMS for every installed kernel that has
 # headers: the running kernel gets a signed module, and the other kernels
 # get one at all (the installer removed the old driver's module there).
-DKMS_OTHER_KERNELS=()
-DKMS_BUILT_KERNELS=()
-if [[ $USE_DKMS -eq 1 ]] && command -v dkms >/dev/null 2>&1 && [[ -n "$TARGET_RUN_VER" ]]; then
-    for kdir in /lib/modules/*/; do
-        kdir="${kdir%/}"; k="${kdir##*/}"
-        [[ -e "$kdir/build" ]] || continue
-        if nolock dkms build --force -m nvidia -v "$TARGET_RUN_VER" -k "$k" >>"$LOGFILE" 2>&1 \
-            && nolock dkms install --force -m nvidia -v "$TARGET_RUN_VER" -k "$k" >>"$LOGFILE" 2>&1; then
-            log "DKMS: nvidia $TARGET_RUN_VER built for $k"
-            DKMS_BUILT_KERNELS+=("$k")
-            [[ "$k" == "$KVER" ]] || DKMS_OTHER_KERNELS+=("$k")
-        else
-            log "WARNING: DKMS could not build nvidia $TARGET_RUN_VER for kernel $k (see $LOGFILE); that kernel has no NVIDIA driver until it does"
+# Without DKMS, NVIDIA's installer builds it for each other kernel with
+# headers (its kernel-modules-only mode, same flavor and signing key).
+OTHER_BUILT_KERNELS=()
+FAILED_KERNELS=()
+RUNNING_BUILD_FAILED=0
+if [[ $USE_DKMS -eq 1 ]] && command -v dkms >/dev/null 2>&1; then
+    DKMS_VER="$(dkms_nvidia_version)"
+    if [[ -n "$DKMS_VER" ]]; then
+        dkms_build_all "$DKMS_VER"
+    else
+        log "WARNING: The new driver's version can't be found, so DKMS can't rebuild its kernel module"
+        RUNNING_BUILD_FAILED=1
+    fi
+    while IFS= read -r k; do
+        if [[ ! -e "/lib/modules/$k/build" ]]; then
+            log "WARNING: Kernel $k has no headers, so DKMS can't build the NVIDIA kernel module for it"
+            FAILED_KERNELS+=("$k")
         fi
-    done
+    done < <(other_kernels)
+elif [[ $USE_DKMS -eq 0 ]]; then
+    KMOD_ONLY_OPT="--kernel-modules-only"
+    if [[ -n "$INSTALLER_OPTIONS" ]] && ! grep -qF -- '--kernel-modules-only' <<<"$INSTALLER_OPTIONS"; then
+        KMOD_ONLY_OPT=""
+        if grep -qF -- '--kernel-module-only' <<<"$INSTALLER_OPTIONS"; then KMOD_ONLY_OPT="--kernel-module-only"; fi
+    fi
+    while IFS= read -r k; do
+        if [[ ! -e "/lib/modules/$k/build" ]]; then
+            log "WARNING: Kernel $k has no headers, so no NVIDIA kernel module can be built for it"
+            FAILED_KERNELS+=("$k")
+        elif [[ -z "$KMOD_ONLY_OPT" ]]; then
+            log "WARNING: This installer can't build the kernel module for another kernel ($k); turn on DKMS to have one built"
+            FAILED_KERNELS+=("$k")
+        else
+            log "Building the NVIDIA kernel module for kernel $k…"
+            if nolock "$RUN_FILE" "${KMOD_ARGS[@]}" "$KMOD_ONLY_OPT" "--kernel-name=$k" \
+                    "--log-file-name=/var/log/nvidia-installer-$k.log" >>"$LOGFILE" 2>&1; then
+                log "Kernel module built for $k"
+                OTHER_BUILT_KERNELS+=("$k")
+            else
+                log "WARNING: NVIDIA's installer could not build the kernel module for kernel $k (see /var/log/nvidia-installer-$k.log); that kernel has no NVIDIA driver until it does"
+                FAILED_KERNELS+=("$k")
+            fi
+        fi
+    done < <(other_kernels)
 fi
 
 # ── Step 6: Keep the distro driver from coming back (optional) ────────
@@ -1867,9 +2136,9 @@ if ! nolock "${INITRAMFS_CMD[@]}" >>"$LOGFILE" 2>&1; then
     log "       blacklist may not apply at boot. Run: ${INITRAMFS_CMD[*]}"
     exit "$EXIT_INITRAMFS"
 fi
-# The other kernels DKMS built the module for carry it (and the blacklist)
+# The other kernels the module was built for carry it (and the blacklist)
 # in their initramfs too.
-for k in "${DKMS_OTHER_KERNELS[@]}"; do
+for k in "${OTHER_BUILT_KERNELS[@]}"; do
     if [[ "$PKG_MGR" == "apt" ]]; then other_cmd=(update-initramfs -u -k "$k"); else other_cmd=(dracut --force --kver "$k"); fi
     nolock "${other_cmd[@]}" >>"$LOGFILE" 2>&1 \
         || log "WARNING: initramfs rebuild failed for kernel $k. Run: ${other_cmd[*]}"
@@ -1930,6 +2199,19 @@ if [[ $USE_DKMS -eq 1 ]]; then
     fi
 fi
 
+# A module that could not be built: under Secure Boot the running kernel's
+# is the installer's unsigned one, which will not load.
+if [[ $RUNNING_BUILD_FAILED -eq 1 ]]; then
+    if secure_boot_on; then
+        verify_warn "DKMS could not rebuild the nvidia module for the running kernel $KVER, so it is the unsigned one NVIDIA's installer built, which Secure Boot refuses: the next boot has no NVIDIA driver. Fix the build (see the log) and install again before rebooting"
+    else
+        verify_warn "DKMS could not rebuild the nvidia module for the running kernel $KVER (the one NVIDIA's installer built is used)"
+    fi
+fi
+for k in "${FAILED_KERNELS[@]}"; do
+    verify_warn "kernel $k has no nvidia module for this driver: starting it gives no NVIDIA driver"
+done
+
 # Module signature: with a signing key, the module should be signed by it.
 # Without one, only Secure Boot makes the signature matter.
 SB_STATE=""
@@ -1944,7 +2226,7 @@ if [[ -n "$SIGN_KEY" ]]; then
     else
         log "Verify: nvidia module is signed by: $MODULE_SIGNER"
     fi
-    for k in "${DKMS_OTHER_KERNELS[@]}"; do
+    for k in "${OTHER_BUILT_KERNELS[@]}"; do
         k_signer="$(module_signer "$k")"
         if [[ -z "$k_signer" ]]; then
             verify_warn "the nvidia module for $k is unsigned; expected a signature from ${EXPECTED_SIGNER:-$SIGN_CERT}"
@@ -1974,5 +2256,6 @@ else
     log "Verify: $VERIFY_WARNINGS warning(s); see above"
 fi
 
+journal_clear
 log "==== Done. Reboot to switch to the new driver. ===="
 exit 0

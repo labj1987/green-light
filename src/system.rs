@@ -185,9 +185,48 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
             .filter(|o| o.status.success())
             .and_then(|o| crate::preflight::parse_openssl_sha1(&String::from_utf8_lossy(&o.stdout)))
     });
-    command_text("mokutil", &["--test-key", path])
-        .and_then(|t| classify_signing_key(path, &t, efi_firmware, &pending, sha1.as_deref()))
-        .unwrap_or_else(|| SigningKeyState::Untested(path.to_string()))
+    // mokutil reads DER only: a PEM certificate (a DKMS config may name one) is
+    // tested through a DER copy. With no answer from mokutil at all, the
+    // pending list still decides.
+    let der = DerCopy::of(path);
+    let tested = der.as_ref().map_or(path, |d| d.path.to_str().unwrap_or(path));
+    let answer = command_text("mokutil", &["--test-key", tested]).unwrap_or_default();
+    classify_signing_key(path, &answer, efi_firmware, &pending, sha1.as_deref()).unwrap_or_else(|| SigningKeyState::Untested(path.to_string()))
+}
+
+/// A DER copy of a PEM certificate in the user's private runtime directory,
+/// removed when dropped. `None` for a DER certificate (or one openssl can't
+/// read, which mokutil then judges itself).
+struct DerCopy {
+    path: std::path::PathBuf,
+}
+
+impl DerCopy {
+    fn of(cert: &str) -> Option<Self> {
+        let der_already =
+            std::process::Command::new("openssl").args(["x509", "-inform", "DER", "-in", cert, "-noout"]).output().is_ok_and(|o| o.status.success());
+        if der_already {
+            return None;
+        }
+        let out = std::process::Command::new("openssl").args(["x509", "-inform", "PEM", "-in", cert, "-outform", "DER"]).output().ok()?;
+        if !out.status.success() || out.stdout.is_empty() {
+            return None;
+        }
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+        let path = dir.join(format!("green-light-cert-{}-{nanos}.der", std::process::id()));
+        // create_new: never through a file or link someone else put there.
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok()?;
+        let copy = Self { path };
+        std::io::Write::write_all(&mut file, &out.stdout).ok()?;
+        Some(copy)
+    }
+}
+
+impl Drop for DerCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Who signed the nvidia module on disk for the running kernel.
@@ -377,6 +416,32 @@ pub fn format_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pem_certificate_is_tested_through_a_der_copy() {
+        let dir = std::env::temp_dir().join(format!("gl-dercopy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pem, der, key) = (dir.join("c.pem"), dir.join("c.der"), dir.join("k.pem"));
+        let made = std::process::Command::new("openssl")
+            .args(["req", "-new", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=t", "-keyout"])
+            .arg(&key)
+            .arg("-out")
+            .arg(&pem)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !made {
+            eprintln!("openssl not available; skipped");
+            return;
+        }
+        std::process::Command::new("openssl").args(["x509", "-in"]).arg(&pem).args(["-outform", "DER", "-out"]).arg(&der).status().unwrap();
+        assert!(DerCopy::of(der.to_str().unwrap()).is_none(), "a DER certificate is used as it is");
+        let copy = DerCopy::of(pem.to_str().unwrap()).expect("a DER copy of the PEM certificate");
+        assert_eq!(std::fs::read(&copy.path).unwrap(), std::fs::read(&der).unwrap());
+        let copied = copy.path.clone();
+        drop(copy);
+        assert!(!copied.exists(), "the copy is removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn format_bytes_units() {

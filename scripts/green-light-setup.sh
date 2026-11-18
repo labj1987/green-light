@@ -50,11 +50,19 @@ STAGE="${1:-}"
 WORK="$(mktemp -d /var/tmp/green-light-setup.XXXXXX)"
 chmod 700 "$WORK"
 
+# Copied without following a symlink and without waiting on a FIFO: a staged
+# file swapped after the check above can't make root read a device or hang.
+# What was copied is what gets checked and installed.
+copy_in() { # <source> <destination>
+    dd if="$1" of="$2" iflag=nofollow,nonblock bs=1M status=none && [[ -f "$2" && ! -L "$2" ]]
+}
 for f in privileged-install.sh policy recover-service; do
     [[ -f "$STAGE/$f" && ! -L "$STAGE/$f" ]] || die "missing or invalid staged file: $f"
-    cp --no-preserve=mode,ownership -- "$STAGE/$f" "$WORK/$f"
+    copy_in "$STAGE/$f" "$WORK/$f" || die "could not copy the staged file: $f"
 done
-cp --no-preserve=mode,ownership -- "$0" "$WORK/helper"
+# The helper itself can't carry its own hash; bash is already running this
+# very file as root, so a copy of it adds nothing a swap could exploit.
+copy_in "$0" "$WORK/helper" || die "could not copy the setup helper"
 
 check() { # <file> <expected-sha256> <label>
     local got
