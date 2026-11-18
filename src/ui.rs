@@ -1664,7 +1664,7 @@ impl MainView {
                     }
                     Ok(Recovered::Nothing) => {
                         this.log("Nothing needed putting back; an install cut off after the new driver was in place is finished.", cx);
-                        toast(window, cx, "Nothing needed restoring");
+                        toast(window, cx, "Nothing to restore; the install is finished");
                     }
                     Ok(Recovered::Discarded) => {
                         this.log("The recovery data was discarded; the driver is left as it is.", cx);

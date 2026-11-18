@@ -2076,12 +2076,13 @@ declare -p POST_USE_DKMS POST_BLOCK_DISTRO > "$JOURNAL/.post.new"
 durable "$JOURNAL/.post.new"
 mv -f "$JOURNAL/.post.new" "$JOURNAL/post"
 journal_set_phase installer-done
-# For the app, should this run be cut off now (journal_clear removes it).
-recovery_note "finishing: the new driver is installed, but the install was cut off before its last steps (kernel modules, initramfs)"
 ROLLBACK_ARMED=0
 # From here on nothing is rolled back; the journal goes when this run ends,
 # however it ends, and stays only if it is cut off.
 JOURNAL_OURS=1
+# For the app, should this run be cut off now (journal_clear removes it).
+# Only wording: a failed write must not end the run.
+recovery_note "finishing: the new driver is installed, but the install was cut off before its last steps (kernel modules, initramfs)" || true
 log "NVIDIA installer finished successfully"
 if [[ $STOP_REQUESTED -eq 1 ]]; then
     log "A stop was requested while NVIDIA's installer ran; it had already succeeded, so the install is finished rather than undone."
