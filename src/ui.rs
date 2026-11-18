@@ -6,8 +6,8 @@ use crate::install::{
 };
 use crate::instance::Activations;
 use crate::preflight::{
-    conflict_summary, module_hint, secure_boot_advice, secure_boot_summary, signing_summary, validate_module_choice, validate_mok_password, ModuleChoice,
-    MOK_PASSWORD_HINT,
+    conflict_summary, module_hint, secure_boot_advice, secure_boot_block, secure_boot_summary, signing_summary, validate_module_choice, validate_mok_password,
+    ModuleChoice, MOK_PASSWORD_HINT,
 };
 use crate::system::{format_bytes, query_system, SecureBootStatus, SystemInfo, MIN_DISK_BYTES};
 use crate::versions::{fetch_checksum, fetch_versions, is_sha256_hex, version_from_filename, DriverVersion};
@@ -1319,6 +1319,15 @@ impl MainView {
             toast(window, cx, &msg);
             return;
         }
+        // A module Secure Boot would refuse: nothing is asked or changed.
+        if let Some(msg) =
+            secure_boot_block(&s.sysinfo.secure_boot, &s.sysinfo.signing_key, s.sysinfo.signing_pair.as_ref(), s.use_dkms, s.sysinfo.mok_request_waiting)
+        {
+            drop(s);
+            self.log(format!("Install not started: {msg}"), cx);
+            show_error("Set up signing first", &msg, window, cx);
+            return;
+        }
 
         let opts = InstallOptions {
             use_dkms: s.use_dkms,
@@ -1360,7 +1369,7 @@ impl MainView {
                     return;
                 }
             }
-            let result: Result<anyhow::Result<()>, String> = match result_rx.await {
+            let result: Result<anyhow::Result<Vec<String>>, String> = match result_rx.await {
                 Ok(Ok(r)) => Ok(r),
                 Ok(Err(e)) => Err(e.to_string()),
                 Err(_) => Err("the install task ended unexpectedly".to_string()),
@@ -1369,10 +1378,22 @@ impl MainView {
                 guard.release();
                 this.progress.visible = false;
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(warnings)) if warnings.is_empty() => {
                         this.log("Install completed successfully.", cx);
                         this.log("Reboot to switch to the new driver.", cx);
                         toast(window, cx, "Install complete — reboot to activate");
+                    }
+                    Ok(Ok(warnings)) => {
+                        // Installed, but a check after it found something that
+                        // can leave a boot without the driver: said up front.
+                        this.log("Install finished with warnings.", cx);
+                        let list: String = warnings.iter().map(|w| format!("• {w}\n")).collect();
+                        show_error(
+                            "Installed, with warnings",
+                            &format!("The driver is installed, but the checks after the install found problems:\n\n{list}\nSee the Log tab before rebooting."),
+                            window,
+                            cx,
+                        );
                     }
                     Ok(Err(e)) if e.downcast_ref::<StaleRecovery>().is_some() => {
                         this.log(format!("Install not started: {e}"), cx);
@@ -1542,6 +1563,7 @@ impl MainView {
             Some(RecoveryNote::Failed(why)) => {
                 RecoverBanner { text: format!("Restoring the driver from before an interrupted install failed: {why}."), button: "Try Again", discards: false }
             }
+            Some(RecoveryNote::Finishing(_)) => RecoverBanner { text: FINISH_TEXT.to_string(), button: "Finish Install", discards: false },
             None => RecoverBanner { text: RECOVER_TEXT.to_string(), button: "Restore Previous Driver", discards: false },
         });
         if running != self.state.borrow().external_install {
@@ -1641,8 +1663,8 @@ impl MainView {
                         toast(window, cx, "Previous driver restored");
                     }
                     Ok(Recovered::Nothing) => {
-                        this.log("Nothing needed putting back: that install had finished.", cx);
-                        toast(window, cx, "Nothing needed restoring");
+                        this.log("Nothing needed putting back; an install cut off after the new driver was in place is finished.", cx);
+                        toast(window, cx, "Nothing to restore; the install is finished");
                     }
                     Ok(Recovered::Discarded) => {
                         this.log("The recovery data was discarded; the driver is left as it is.", cx);
@@ -2144,52 +2166,60 @@ impl MainView {
                 close_focus.focus(window, cx);
             }
             let muted = cx.theme().muted_foreground;
-            dialog.title(dialog_title(ABOUT_TITLE)).overlay(false).w(px(400.)).child(
-                named_group("about", ABOUT_TITLE)
-                    .child(
-                        v_flex()
-                            .id("body")
-                            .max_h(dialog_room(window))
-                            .overflow_y_scroll()
-                            .gap_1()
-                            .items_center()
-                            // Fixed size: in the scrolling column it would otherwise shrink
-                            // when the dialog is short (to 16 px on a small screen).
-                            .child(img(icon.clone()).size(px(64.)).flex_none())
-                            .child(div().text_xl().font_weight(FontWeight::BOLD).child(label("name", "Green Light")))
-                            .child(div().text_color(muted).child(label("version", env!("CARGO_PKG_VERSION"))))
-                            .child(div().text_center().child(label("summary", "A GUI for installing NVIDIA drivers from official .run files.")))
-                            .child(
-                                v_flex()
-                                    .items_center()
-                                    .text_sm()
-                                    .child(label("gpu", format!("GPU: {gpu}")))
-                                    .child(label("driver", format!("Driver: {driver}")))
-                                    .child(label("kernel", format!("Kernel: {kernel}"))),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_4()
-                                    .child(Link::new("about-website").href(WEBSITE).child("Website"))
-                                    .child(Link::new("about-issues").href(ISSUES).child("Report an Issue")),
-                            )
-                            .child(
-                                v_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .text_sm()
-                                    .text_color(muted)
-                                    .text_center()
-                                    .child(label("developer", "Developer: Linnard Alex Brown Jr."))
-                                    .child(label("built-with", "Built with: Claude Code (Anthropic), Codex (OpenAI)"))
-                                    .child(label("license", "License: AGPL-3.0-or-later")),
-                            ),
-                    )
-                    .child(
-                        dialog_buttons()
-                            .child(Button::new("about-close").track_focus(&close_focus).label("Close").on_click(|_, window, cx| window.close_dialog(cx))),
-                    ),
-            )
+            let on_close = close_focus.clone();
+            dialog
+                .title(dialog_title(ABOUT_TITLE))
+                .overlay(false)
+                .w(px(400.))
+                // Enter closes only from Close; on a focused link it must not
+                // run the toolkit's default (closing the dialog) instead.
+                .on_ok(move |_, window, _| enter_key(&[on_close.is_focused(window)]).is_some())
+                .child(
+                    named_group("about", ABOUT_TITLE)
+                        .child(
+                            v_flex()
+                                .id("body")
+                                .max_h(dialog_room(window))
+                                .overflow_y_scroll()
+                                .gap_1()
+                                .items_center()
+                                // Fixed size: in the scrolling column it would otherwise shrink
+                                // when the dialog is short (to 16 px on a small screen).
+                                .child(img(icon.clone()).size(px(64.)).flex_none())
+                                .child(div().text_xl().font_weight(FontWeight::BOLD).child(label("name", "Green Light")))
+                                .child(div().text_color(muted).child(label("version", env!("CARGO_PKG_VERSION"))))
+                                .child(div().text_center().child(label("summary", "A GUI for installing NVIDIA drivers from official .run files.")))
+                                .child(
+                                    v_flex()
+                                        .items_center()
+                                        .text_sm()
+                                        .child(label("gpu", format!("GPU: {gpu}")))
+                                        .child(label("driver", format!("Driver: {driver}")))
+                                        .child(label("kernel", format!("Kernel: {kernel}"))),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_4()
+                                        .child(Link::new("about-website").href(WEBSITE).child("Website"))
+                                        .child(Link::new("about-issues").href(ISSUES).child("Report an Issue")),
+                                )
+                                .child(
+                                    v_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .text_sm()
+                                        .text_color(muted)
+                                        .text_center()
+                                        .child(label("developer", "Developer: Linnard Alex Brown Jr."))
+                                        .child(label("built-with", "Built with: Claude Code (Anthropic), Codex (OpenAI)"))
+                                        .child(label("license", "License: AGPL-3.0-or-later")),
+                                ),
+                        )
+                        .child(
+                            dialog_buttons()
+                                .child(Button::new("about-close").track_focus(&close_focus).label("Close").on_click(|_, window, cx| window.close_dialog(cx))),
+                        ),
+                )
         });
     }
 }
@@ -2440,6 +2470,9 @@ impl Render for SigningPrompt {
 const ABOUT_TITLE: &str = "About Green Light";
 
 const NOT_A_RUN_FILE: &str = "Not an NVIDIA .run file";
+
+const FINISH_TEXT: &str = "An earlier driver install was cut off after the new driver was installed, before its \
+     last steps (kernel modules, initramfs). Finish them now (this also happens on its own at the next boot).";
 
 const RECOVER_TEXT: &str = "An earlier driver install was cut off before it finished. Restore \
      the driver this computer had before (this also happens on its own at the next boot).";

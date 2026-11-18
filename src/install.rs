@@ -308,12 +308,17 @@ pub enum RecoveryNote {
     Refused(String),
     /// A restore was tried and failed; trying again may help.
     Failed(String),
+    /// Cut off after the new driver was in place: recovery finishes its last
+    /// steps instead of restoring anything.
+    Finishing(String),
 }
 
 pub fn parse_recovery_note(text: &str) -> Option<RecoveryNote> {
     let text = text.trim();
     if let Some(why) = text.strip_prefix("refused: ") {
         Some(RecoveryNote::Refused(why.to_string()))
+    } else if let Some(why) = text.strip_prefix("finishing: ") {
+        Some(RecoveryNote::Finishing(why.to_string()))
     } else {
         text.strip_prefix("failed: ").map(|why| RecoveryNote::Failed(why.to_string()))
     }
@@ -416,6 +421,11 @@ fn first_error(lines: &[String]) -> Option<&str> {
     lines.iter().find_map(|l| l.strip_prefix("ERROR: ")).map(str::trim)
 }
 
+/// The install's own checks that found a problem ("Verify: WARNING ...").
+fn verify_warnings(lines: &[String]) -> Vec<String> {
+    lines.iter().filter_map(|l| l.strip_prefix("Verify: WARNING ")).map(|w| w.trim().to_string()).collect()
+}
+
 /// What a failed install run means, from the script's exit code (see EXIT
 /// CODES in privileged-install.sh) and pkexec's own 126/127, which the
 /// script never uses.
@@ -441,6 +451,10 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
             "The driver is installed, but rebuilding the initramfs failed{detail}. Rebuild it \
              before rebooting; the Log tab has the command."
         ),
+        Some(7) => format!(
+            "The install did not start{detail}. Nothing was changed: the driver this computer \
+             has keeps working."
+        ),
         Some(c) => format!("The install script exited with code {c}{detail} (see {INSTALL_LOG})"),
         None => "The install script was killed before it finished.".to_string(),
     }
@@ -453,7 +467,9 @@ fn install_failure(code: Option<i32>, lines: &[String]) -> String {
 /// current one keeps running, and the switch happens at the next
 /// reboot. Nothing touches the live session, so a plain blocking call
 /// is safe — the GUI stays up the whole time.
-pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&str)) -> Result<()> {
+/// On success, the checks after the install that found something wrong (the
+/// script's "Verify: WARNING" lines), for the UI to show.
+pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&str)) -> Result<Vec<String>> {
     let script = PRIVILEGED_SCRIPT;
 
     if !Path::new(script).exists() {
@@ -482,7 +498,7 @@ pub fn run_privileged_install(opts: &InstallOptions, mut on_line: impl FnMut(&st
 
     let run = run_pkexec(&args, None, &mut on_line)?;
     if run.code == Some(0) {
-        return Ok(());
+        return Ok(verify_warnings(&run.lines));
     }
     if run.code == Some(6) {
         return Err(stale_recovery(&run.lines));
@@ -545,11 +561,22 @@ mod tests {
     }
 
     #[test]
+    fn secure_boot_refusal_and_verify_warnings() {
+        let out = lines(&["ERROR: Secure Boot is on and would refuse the new driver's kernel module at the next boot: no key"]);
+        let msg = install_failure(Some(7), &out);
+        assert!(msg.contains("did not start") && msg.contains("Secure Boot is on") && msg.contains("Nothing was changed"), "{msg}");
+        let done =
+            lines(&["Verify: nouveau and nova blacklist present", "Verify: WARNING kernel 7.0 has no nvidia module ", "Verify: 1 warning(s); see above"]);
+        assert_eq!(verify_warnings(&done), vec!["kernel 7.0 has no nvidia module".to_string()]);
+        assert!(verify_warnings(&lines(&["Verify: all checks passed"])).is_empty());
+    }
+
+    #[test]
     fn pkexec_codes_are_not_script_failures() {
         let out = lines(&["ERROR: something"]);
         assert!(install_failure(Some(126), &out).contains("cancelled"));
         assert!(install_failure(Some(127), &out).contains("Not authorized"));
-        for code in [1, 2, 3, 4, 5, 9] {
+        for code in [1, 2, 3, 4, 5, 7, 9] {
             let msg = install_failure(Some(code), &out);
             assert!(!msg.contains("cancelled") && !msg.contains("Not authorized"), "{code}: {msg}");
         }
@@ -656,6 +683,9 @@ mod tests {
         assert!(e.downcast_ref::<StaleRecovery>().is_some());
         assert_eq!(parse_recovery_note("refused: the driver changed\n"), Some(RecoveryNote::Refused("the driver changed".into())));
         assert_eq!(parse_recovery_note("failed: x"), Some(RecoveryNote::Failed("x".into())));
+        assert_eq!(parse_recovery_note("finishing: y\n"), Some(RecoveryNote::Finishing("y".into())));
+        // The script writes that note once its installer has finished.
+        assert!(include_str!("../scripts/privileged-install.sh").contains("recovery_note \"finishing: "));
         assert_eq!(parse_recovery_note(""), None);
     }
 

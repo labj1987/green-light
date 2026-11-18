@@ -21,8 +21,10 @@ pub enum ModuleChoice {
 }
 
 impl ModuleChoice {
-    /// The nvidia-installer argument for this choice (`--kernel-module-type`,
-    /// short form `-M`), or `None` for `Auto`.
+    /// The install script's argument for this choice, or `None` for `Auto`.
+    /// The script hands it on in the form the given installer understands:
+    /// `--kernel-module-type` (560 and newer) or, on 515 to 555,
+    /// `--kernel-module-build-directory=kernel-open|kernel`.
     pub fn installer_arg(self) -> Option<&'static str> {
         match self {
             Self::Auto => None,
@@ -153,12 +155,28 @@ pub fn parse_module_flavor(proc_version: &str) -> ModuleFlavor {
 pub const DEB_DRIVER_GLOBS: [&str; 4] = ["nvidia-*", "libnvidia-*", "xserver-xorg-video-nvidia*", "system76-driver-nvidia*"];
 pub const RPM_DRIVER_GLOBS: [&str; 5] = ["akmod-nvidia*", "xorg-x11-drv-nvidia*", "kmod-nvidia*", "nvidia-driver*", "nvidia-settings*"];
 
+/// Packages the globs match that are not the display driver (the script's
+/// `NOT_DRIVER_RE`; a test keeps the two in step): Docker's GPU plumbing,
+/// Ubuntu's CUDA toolkit and its parts, and the PRIME switcher.
+pub const NOT_DRIVER_PREFIXES: [&str; 11] = [
+    "nvidia-container",
+    "libnvidia-container",
+    "nvidia-cuda",
+    "nvidia-cudnn",
+    "nvidia-prime",
+    "nvidia-profiler",
+    "nvidia-visual-profiler",
+    "nvidia-nsight",
+    "nvidia-opencl-dev",
+    "nvidia-openjdk",
+    "nvidia-libopencl",
+];
+
 /// Driver packages from the distro (apt or rpm) that the install script
 /// removes before running the .run installer: what the globs above match,
-/// minus Docker's GPU plumbing (nvidia-container-*, libnvidia-container*,
-/// the script's `NOT_DRIVER_RE`), which is not the display driver.
+/// minus `NOT_DRIVER_PREFIXES`.
 pub fn is_driver_package(name: &str) -> bool {
-    if name.starts_with("nvidia-container") || name.starts_with("libnvidia-container") {
+    if NOT_DRIVER_PREFIXES.iter().any(|p| name.starts_with(p)) {
         return false;
     }
     name.starts_with("nvidia-")
@@ -618,6 +636,55 @@ pub fn secure_boot_summary(sb: &crate::system::SecureBootStatus, key: &SigningKe
     }
 }
 
+/// Why an install must not start, before the password prompt: Secure Boot
+/// is on and the new module would not be signed with a key it trusts or
+/// that is waiting for enrollment (the distribution's signed modules are
+/// removed, so the next boot would have no NVIDIA driver). `None` when the
+/// install may go ahead. When enrollment can't be read (`EfiVarsNotMounted`,
+/// `Untested`, `Unknown`) the app doesn't block: the install script checks
+/// again as root, with the EFI variables in view, and refuses (exit 7) if
+/// the key really isn't enrolled or waiting.
+///
+/// `request_waiting`: an enrollment request (MokNew) exists. A key reported
+/// as not enrolled may then be in it without the shared list saying so (a
+/// request made by other means); only root can read it, so the script
+/// decides.
+pub fn secure_boot_block(sb: &SecureBootStatus, key: &SigningKeyState, pair: Option<&SigningPair>, use_dkms: bool, request_waiting: bool) -> Option<String> {
+    if *sb != SecureBootStatus::Enabled {
+        return None;
+    }
+    let why = match key {
+        _ if !use_dkms && pair.is_some_and(SigningPair::is_pkcs11) => {
+            "the module-signing key is on a PKCS#11 token, which NVIDIA's installer can't sign with, \
+             so without DKMS the new module would be unsigned. Turn on DKMS"
+                .to_string()
+        }
+        SigningKeyState::NoKey => {
+            "this computer has no module-signing key, so the new module would be unsigned. Use Set Up Signing on the System tab".to_string()
+        }
+        SigningKeyState::Incomplete(k, c) => format!(
+            "the DKMS config names signing key {k} and certificate {c}, which don't both exist, so the new module would be \
+             unsigned. Fix the DKMS config, or use Set Up Signing on the System tab"
+        ),
+        SigningKeyState::NotEnrolled(_) if request_waiting => return None,
+        SigningKeyState::NotEnrolled(p) => format!(
+            "the module-signing key {p} is not enrolled, so the firmware would refuse the new module. Use Set Up Signing on \
+             the System tab to queue it for enrollment"
+        ),
+        SigningKeyState::Enrolled(_)
+        | SigningKeyState::PendingEnrollment(_)
+        | SigningKeyState::EfiVarsNotMounted(_)
+        | SigningKeyState::Untested(_)
+        | SigningKeyState::Unknown => {
+            return None;
+        }
+    };
+    Some(format!(
+        "Secure Boot is on, and {why}. Installing now would remove the distribution's signed driver and leave the next \
+         boot without an NVIDIA driver."
+    ))
+}
+
 /// Warning text for the pre-install checks. `None` means nothing to warn
 /// about. `pair` is the key the install would sign with and `use_dkms` the
 /// DKMS option: DKMS signs with any key, NVIDIA's installer (no DKMS) can't
@@ -668,6 +735,33 @@ pub fn secure_boot_advice(sb: &SecureBootStatus, key: &SigningKeyState, pair: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_boot_blocks_an_install_whose_module_would_not_load() {
+        let on = SecureBootStatus::Enabled;
+        let p = || "/var/lib/shim-signed/mok/MOK.der".to_string();
+        assert!(secure_boot_block(&SecureBootStatus::Disabled, &SigningKeyState::NoKey, None, true, false).is_none());
+        for key in [SigningKeyState::NoKey, SigningKeyState::NotEnrolled(p()), SigningKeyState::Incomplete("/k".into(), "/c".into())] {
+            let msg = secure_boot_block(&on, &key, None, true, false).unwrap_or_else(|| panic!("{key:?} not blocked"));
+            assert!(msg.contains("Secure Boot is on"), "{msg}");
+        }
+        assert!(secure_boot_block(&on, &SigningKeyState::NotEnrolled(p()), None, true, false).unwrap().contains("Set Up Signing"));
+        for key in [
+            SigningKeyState::Enrolled(p()),
+            SigningKeyState::PendingEnrollment(p()),
+            SigningKeyState::EfiVarsNotMounted(p()),
+            SigningKeyState::Untested(p()),
+            SigningKeyState::Unknown,
+        ] {
+            assert!(secure_boot_block(&on, &key, None, true, false).is_none(), "{key:?} blocked");
+        }
+        let token = SigningPair { key: "pkcs11:token=x".into(), cert: p(), complete: true, key_hidden: false };
+        assert!(secure_boot_block(&on, &SigningKeyState::Enrolled(p()), Some(&token), false, false).unwrap().contains("Turn on DKMS"));
+        assert!(secure_boot_block(&on, &SigningKeyState::Enrolled(p()), Some(&token), true, false).is_none());
+        // A waiting request the shared list doesn't describe: the script, as root, decides.
+        assert!(secure_boot_block(&on, &SigningKeyState::NotEnrolled(p()), None, true, true).is_none());
+        assert!(secure_boot_block(&on, &SigningKeyState::NoKey, None, true, true).is_some());
+    }
 
     #[test]
     fn installer_args() {
@@ -754,6 +848,22 @@ mod tests {
         assert!(!is_driver_package("nvidia-container-runtime"));
         assert!(!is_driver_package("libcuda1"));
         assert!(!is_driver_package("green-light"));
+        for p in [
+            "nvidia-cuda-toolkit",
+            "nvidia-cuda-dev",
+            "nvidia-cudnn",
+            "nvidia-prime",
+            "nvidia-profiler",
+            "nvidia-visual-profiler",
+            "nvidia-nsight",
+            "nvidia-opencl-dev",
+            "nvidia-openjdk-8-jre",
+            "nvidia-libopencl1-dev",
+        ] {
+            assert!(!is_driver_package(p), "{p}");
+        }
+        assert!(is_driver_package("nvidia-settings"));
+        assert!(is_driver_package("nvidia-compute-utils-595"));
     }
 
     #[test]
@@ -975,7 +1085,7 @@ mod tests {
     fn install_script_agrees() {
         assert_eq!(script_array("DEB_DRIVER_GLOBS"), DEB_DRIVER_GLOBS);
         assert_eq!(script_array("RPM_DRIVER_GLOBS"), RPM_DRIVER_GLOBS);
-        assert_eq!(script_value("NOT_DRIVER_RE"), "^(nvidia-container|libnvidia-container)");
+        assert_eq!(script_value("NOT_DRIVER_RE"), format!("^({})", NOT_DRIVER_PREFIXES.join("|")));
         assert_eq!(script_value("APT_BLOCK_FILE"), APT_BLOCK_FILE);
         let dnf = format!("{}/{}", script_value("DNF_BLOCK_DIR"), "90-green-light-nvidia.conf");
         assert_eq!(dnf, DNF_BLOCK_FILE);
