@@ -5,6 +5,33 @@ carries its section as written, and the AppStream `<releases>` list is generated
 headings. Versions before 2.3.0 predate this repository and have no dates; they are kept
 under 2.3.0.
 
+## 2.13.0 — 2026-11-18
+
+- **No more installs that Secure Boot would leave without a driver.** With Secure Boot on, Install
+  now stops before the password prompt when the new module would not be signed with a key the
+  firmware trusts or one waiting for enrollment (no signing key, a key that isn't enrolled, or a
+  hardware-token key with DKMS off), and points you to Set Up Signing. Nothing is changed, so your
+  distribution's signed driver keeps working.
+- **Every installed kernel gets the driver, with DKMS off too.** The kernel module is now built for
+  each installed kernel that has headers, not only the running one, so booting a kernel you
+  installed but haven't started yet (after a kernel update) no longer leaves you without the driver.
+- **Problems found after an install are shown, not just logged.** If a kernel got no module, or the
+  running kernel's module couldn't be rebuilt (under Secure Boot that module would not load), the
+  install ends with a dialog listing what to fix before rebooting.
+- **An install cut off near the end is finished, not forgotten.** If the computer loses power after
+  NVIDIA's installer is done but before the module builds and initramfs are, the next boot (or
+  Restore in the app) finishes them.
+- Retrying a failed restore now also rebuilds a missing kernel module when the packages are already
+  back, so Try Again can fix it once the cause is gone.
+- Choosing open or proprietary modules now works with drivers 515 to 555; before, those older
+  installers rejected the option and the install was rolled back.
+- With the module type left to the installer, only the flavor it will actually use has to build,
+  so a kernel where only the other flavor fails no longer blocks the install.
+- CUDA toolkit packages and nvidia-prime are no longer removed by name along with the driver.
+- The Module Signing row now recognizes an enrolled key whose certificate is in PEM form, instead of
+  offering Set Up Signing again.
+- In the About dialog, Enter on a link no longer closes the dialog.
+
 ## 2.12.2 — 2026-11-16
 
 - **The window takes your desktop's accent colour.** On GNOME, KDE Plasma and COSMIC, primary
