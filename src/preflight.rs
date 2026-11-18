@@ -644,7 +644,12 @@ pub fn secure_boot_summary(sb: &crate::system::SecureBootStatus, key: &SigningKe
 /// `Untested`, `Unknown`) the app doesn't block: the install script checks
 /// again as root, with the EFI variables in view, and refuses (exit 7) if
 /// the key really isn't enrolled or waiting.
-pub fn secure_boot_block(sb: &SecureBootStatus, key: &SigningKeyState, pair: Option<&SigningPair>, use_dkms: bool) -> Option<String> {
+///
+/// `request_waiting`: an enrollment request (MokNew) exists. A key reported
+/// as not enrolled may then be in it without the shared list saying so (a
+/// request made by other means); only root can read it, so the script
+/// decides.
+pub fn secure_boot_block(sb: &SecureBootStatus, key: &SigningKeyState, pair: Option<&SigningPair>, use_dkms: bool, request_waiting: bool) -> Option<String> {
     if *sb != SecureBootStatus::Enabled {
         return None;
     }
@@ -661,6 +666,7 @@ pub fn secure_boot_block(sb: &SecureBootStatus, key: &SigningKeyState, pair: Opt
             "the DKMS config names signing key {k} and certificate {c}, which don't both exist, so the new module would be \
              unsigned. Fix the DKMS config, or use Set Up Signing on the System tab"
         ),
+        SigningKeyState::NotEnrolled(_) if request_waiting => return None,
         SigningKeyState::NotEnrolled(p) => format!(
             "the module-signing key {p} is not enrolled, so the firmware would refuse the new module. Use Set Up Signing on \
              the System tab to queue it for enrollment"
@@ -734,12 +740,12 @@ mod tests {
     fn secure_boot_blocks_an_install_whose_module_would_not_load() {
         let on = SecureBootStatus::Enabled;
         let p = || "/var/lib/shim-signed/mok/MOK.der".to_string();
-        assert!(secure_boot_block(&SecureBootStatus::Disabled, &SigningKeyState::NoKey, None, true).is_none());
+        assert!(secure_boot_block(&SecureBootStatus::Disabled, &SigningKeyState::NoKey, None, true, false).is_none());
         for key in [SigningKeyState::NoKey, SigningKeyState::NotEnrolled(p()), SigningKeyState::Incomplete("/k".into(), "/c".into())] {
-            let msg = secure_boot_block(&on, &key, None, true).unwrap_or_else(|| panic!("{key:?} not blocked"));
+            let msg = secure_boot_block(&on, &key, None, true, false).unwrap_or_else(|| panic!("{key:?} not blocked"));
             assert!(msg.contains("Secure Boot is on"), "{msg}");
         }
-        assert!(secure_boot_block(&on, &SigningKeyState::NotEnrolled(p()), None, true).unwrap().contains("Set Up Signing"));
+        assert!(secure_boot_block(&on, &SigningKeyState::NotEnrolled(p()), None, true, false).unwrap().contains("Set Up Signing"));
         for key in [
             SigningKeyState::Enrolled(p()),
             SigningKeyState::PendingEnrollment(p()),
@@ -747,11 +753,14 @@ mod tests {
             SigningKeyState::Untested(p()),
             SigningKeyState::Unknown,
         ] {
-            assert!(secure_boot_block(&on, &key, None, true).is_none(), "{key:?} blocked");
+            assert!(secure_boot_block(&on, &key, None, true, false).is_none(), "{key:?} blocked");
         }
         let token = SigningPair { key: "pkcs11:token=x".into(), cert: p(), complete: true, key_hidden: false };
-        assert!(secure_boot_block(&on, &SigningKeyState::Enrolled(p()), Some(&token), false).unwrap().contains("Turn on DKMS"));
-        assert!(secure_boot_block(&on, &SigningKeyState::Enrolled(p()), Some(&token), true).is_none());
+        assert!(secure_boot_block(&on, &SigningKeyState::Enrolled(p()), Some(&token), false, false).unwrap().contains("Turn on DKMS"));
+        assert!(secure_boot_block(&on, &SigningKeyState::Enrolled(p()), Some(&token), true, false).is_none());
+        // A waiting request the shared list doesn't describe: the script, as root, decides.
+        assert!(secure_boot_block(&on, &SigningKeyState::NotEnrolled(p()), None, true, true).is_none());
+        assert!(secure_boot_block(&on, &SigningKeyState::NoKey, None, true, true).is_some());
     }
 
     #[test]

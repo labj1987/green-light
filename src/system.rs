@@ -20,6 +20,8 @@ pub struct SystemInfo {
     pub signing_key: SigningKeyState,
     /// The key pair the install script would sign with.
     pub signing_pair: Option<SigningPair>,
+    /// An enrollment request (MokNew) is waiting; only root can read it.
+    pub mok_request_waiting: bool,
     /// Signature on the nvidia module on disk for the running kernel.
     pub module_signature: ModuleSignature,
     /// Distro-packaged NVIDIA driver packages the install will remove.
@@ -71,6 +73,7 @@ pub fn query_system() -> SystemInfo {
         secure_boot,
         signing_key,
         signing_pair,
+        mok_request_waiting: std::path::Path::new(MOK_NEW).exists(),
         module_signature: get_module_signature(),
         distro_packages: get_distro_packages(),
         distro_driver_blocked: std::path::Path::new(APT_BLOCK_FILE).is_file() || std::path::Path::new(DNF_BLOCK_FILE).is_file(),
@@ -194,6 +197,8 @@ fn cert_enrollment(path: &str) -> SigningKeyState {
     classify_signing_key(path, &answer, efi_firmware, &pending, sha1.as_deref()).unwrap_or_else(|| SigningKeyState::Untested(path.to_string()))
 }
 
+const PEM_HEADER: &[u8] = b"-----BEGIN CERTIFICATE-----";
+
 /// A DER copy of a PEM certificate in the user's private runtime directory,
 /// removed when dropped. `None` for a DER certificate (or one openssl can't
 /// read, which mokutil then judges itself).
@@ -203,9 +208,10 @@ struct DerCopy {
 
 impl DerCopy {
     fn of(cert: &str) -> Option<Self> {
-        let der_already =
-            std::process::Command::new("openssl").args(["x509", "-inform", "DER", "-in", cert, "-noout"]).output().is_ok_and(|o| o.status.success());
-        if der_already {
+        // PEM is told by its header, as the install script's cert_as_der does:
+        // OpenSSL 3.0/3.1 may read a PEM file even when asked for DER.
+        let bytes = std::fs::read(cert).ok()?;
+        if !bytes.windows(PEM_HEADER.len()).any(|w| w == PEM_HEADER) {
             return None;
         }
         let out = std::process::Command::new("openssl").args(["x509", "-inform", "PEM", "-in", cert, "-outform", "DER"]).output().ok()?;
@@ -342,14 +348,25 @@ fn parse_dkms_status(text: &str) -> Vec<DkmsEntry> {
 }
 
 /// Check secure boot via mokutil
+/// Secure Boot as `mokutil --sb-state` reports it. Enabled only while shim
+/// still validates: after `mokutil --disable-validation` it adds "SecureBoot
+/// validation is disabled in shim", and unsigned modules load (the install
+/// script's `secure_boot_on` reads it the same way).
+fn parse_sb_state(text: &str) -> Option<SecureBootStatus> {
+    let s = text.to_lowercase();
+    if s.contains("secureboot enabled") && !s.contains("validation is disabled") {
+        Some(SecureBootStatus::Enabled)
+    } else if s.contains("secureboot enabled") || s.contains("secureboot disabled") {
+        Some(SecureBootStatus::Disabled)
+    } else {
+        None
+    }
+}
+
 fn get_secure_boot() -> SecureBootStatus {
     if let Ok(out) = std::process::Command::new("mokutil").arg("--sb-state").output() {
-        let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
-        if s.contains("secureboot enabled") {
-            return SecureBootStatus::Enabled;
-        }
-        if s.contains("secureboot disabled") {
-            return SecureBootStatus::Disabled;
+        if let Some(state) = parse_sb_state(&String::from_utf8_lossy(&out.stdout)) {
+            return state;
         }
     }
     // Fallback: read EFI variable directly
@@ -416,6 +433,14 @@ pub fn format_bytes(b: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secure_boot_with_shim_validation_off_is_not_enforced() {
+        assert_eq!(parse_sb_state("SecureBoot enabled\n"), Some(SecureBootStatus::Enabled));
+        assert_eq!(parse_sb_state("SecureBoot enabled\nSecureBoot validation is disabled in shim\n"), Some(SecureBootStatus::Disabled));
+        assert_eq!(parse_sb_state("SecureBoot disabled\n"), Some(SecureBootStatus::Disabled));
+        assert_eq!(parse_sb_state("EFI variables are not supported on this system\n"), None);
+    }
 
     #[test]
     fn a_pem_certificate_is_tested_through_a_der_copy() {

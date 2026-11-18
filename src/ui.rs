@@ -1320,7 +1320,9 @@ impl MainView {
             return;
         }
         // A module Secure Boot would refuse: nothing is asked or changed.
-        if let Some(msg) = secure_boot_block(&s.sysinfo.secure_boot, &s.sysinfo.signing_key, s.sysinfo.signing_pair.as_ref(), s.use_dkms) {
+        if let Some(msg) =
+            secure_boot_block(&s.sysinfo.secure_boot, &s.sysinfo.signing_key, s.sysinfo.signing_pair.as_ref(), s.use_dkms, s.sysinfo.mok_request_waiting)
+        {
             drop(s);
             self.log(format!("Install not started: {msg}"), cx);
             show_error("Set up signing first", &msg, window, cx);
@@ -1561,6 +1563,7 @@ impl MainView {
             Some(RecoveryNote::Failed(why)) => {
                 RecoverBanner { text: format!("Restoring the driver from before an interrupted install failed: {why}."), button: "Try Again", discards: false }
             }
+            Some(RecoveryNote::Finishing(_)) => RecoverBanner { text: FINISH_TEXT.to_string(), button: "Finish Install", discards: false },
             None => RecoverBanner { text: RECOVER_TEXT.to_string(), button: "Restore Previous Driver", discards: false },
         });
         if running != self.state.borrow().external_install {
@@ -1660,7 +1663,7 @@ impl MainView {
                         toast(window, cx, "Previous driver restored");
                     }
                     Ok(Recovered::Nothing) => {
-                        this.log("Nothing needed putting back: that install had finished.", cx);
+                        this.log("Nothing needed putting back; an install cut off after the new driver was in place is finished.", cx);
                         toast(window, cx, "Nothing needed restoring");
                     }
                     Ok(Recovered::Discarded) => {
@@ -2467,6 +2470,9 @@ impl Render for SigningPrompt {
 const ABOUT_TITLE: &str = "About Green Light";
 
 const NOT_A_RUN_FILE: &str = "Not an NVIDIA .run file";
+
+const FINISH_TEXT: &str = "An earlier driver install was cut off after the new driver was installed, before its \
+     last steps (kernel modules, initramfs). Finish them now (this also happens on its own at the next boot).";
 
 const RECOVER_TEXT: &str = "An earlier driver install was cut off before it finished. Restore \
      the driver this computer had before (this also happens on its own at the next boot).";

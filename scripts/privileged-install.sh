@@ -132,7 +132,10 @@ on_exit() {
             rc=$EXIT_ROLLBACK_FAILED
         fi
     elif [[ ${JOURNAL_OURS:-0} -eq 1 ]]; then
-        # Ended before changing anything: nothing to put back.
+        # Not armed: either it ended before changing anything (nothing to put
+        # back), or after NVIDIA's installer succeeded, with the last steps
+        # done or their failure reported (exit 5); only a run cut off then
+        # leaves the journal for the recovery to finish.
         journal_clear
     fi
     if [[ -n "$INHIBIT_PID" ]]; then kill "$INHIBIT_PID" 2>/dev/null; fi
@@ -275,11 +278,12 @@ ensure_signing_key() {
 }
 
 # Path of the certificate in DER form, converting a PEM certificate into
-# <dir> when needed. Without openssl the certificate is assumed to be DER
-# (every default location stores DER).
+# <dir> when needed. PEM is told by its header, not by asking openssl to
+# read DER (OpenSSL 3.0/3.1 may accept PEM there too, and mokutil reads DER
+# only). Without openssl a PEM certificate can't be converted: as is.
+# (Keep in step with DerCopy in system.rs.)
 cert_as_der() { # <cert> <dir>
-    if ! command -v openssl >/dev/null 2>&1 \
-        || openssl x509 -inform DER -in "$1" -noout >/dev/null 2>&1; then
+    if ! grep -aqF -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null || ! command -v openssl >/dev/null 2>&1; then
         printf '%s' "$1"
         return 0
     fi
@@ -743,8 +747,15 @@ installed_run_version() {
 
 module_version() { modinfo -k "${1:-$KVER}" -F version nvidia 2>/dev/null || true; }
 module_signer() { modinfo -k "${1:-$KVER}" -F signer nvidia 2>/dev/null || true; }
+# Secure Boot enforced: on in the firmware, and shim still validating
+# (after `mokutil --disable-validation` --sb-state adds "SecureBoot
+# validation is disabled in shim", and unsigned modules load). Keep in step
+# with parse_sb_state in system.rs.
 secure_boot_on() {
-    command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'
+    local state
+    command -v mokutil >/dev/null 2>&1 || return 1
+    state="$(mokutil --sb-state 2>/dev/null || true)"
+    grep -qi 'SecureBoot enabled' <<<"$state" && ! grep -qi 'validation is disabled' <<<"$state"
 }
 
 set_kernel() { # <kernel release>
@@ -1024,10 +1035,17 @@ dkms_build_all() { # <version>
 # its last steps. DKMS builds again; without DKMS the other kernels' modules
 # came from the .run, which is gone, so a kernel still without one is named.
 resume_post_install() {
-    local v k
+    local v k run_now
     OTHER_BUILT_KERNELS=()
     FAILED_KERNELS=()
     RUNNING_BUILD_FAILED=0
+    # The driver was changed since (another one installed, or switched
+    # back): those steps belong to a driver that is gone; leave it as it is.
+    run_now="$(installed_run_version)"
+    if [[ -n "${TARGET_RUN_VER:-}" && "$run_now" != "$TARGET_RUN_VER" ]]; then
+        log "The driver installed now (${run_now:-none from a .run file}) is not the one that install put in ($TARGET_RUN_VER); nothing left to finish."
+        return 0
+    fi
     if [[ "${POST_USE_DKMS:-0}" -eq 1 ]] && command -v dkms >/dev/null 2>&1; then
         v="$(dkms_nvidia_version)"
         if [[ -n "$v" ]]; then
@@ -1563,12 +1581,12 @@ PRIV_DIR="$(mktemp -d /var/tmp/green-light-install.XXXXXX)"
 chmod 700 "$PRIV_DIR"
 RUN_FILE="$PRIV_DIR/installer.run"
 log "Copying installer to private directory…"
-# The original may have been swapped since the checks above: opened without
-# following a symlink and without waiting on a FIFO (one with no writer
-# reads as empty and fails the checksum below), so only a file's content is
-# ever copied.
-if ! dd if="$ORIG_RUN_FILE" of="$RUN_FILE" iflag=nofollow,nonblock bs=1M status=none 2>>"$LOGFILE" \
-    || [[ ! -f "$RUN_FILE" || -L "$RUN_FILE" ]]; then
+# The original may have been swapped since the checks above: checked again
+# right before the copy, which opens it without following a symlink and
+# without waiting on a FIFO (one swapped in after this check, with no
+# writer, reads as empty and fails the checksum below).
+if [[ ! -f "$ORIG_RUN_FILE" || -L "$ORIG_RUN_FILE" ]] \
+    || ! dd if="$ORIG_RUN_FILE" of="$RUN_FILE" iflag=nofollow,nonblock bs=1M status=none 2>>"$LOGFILE"; then
     log "ERROR: Could not copy the installer (disk full, or the file was replaced by something that is not a file). No changes made."
     exit "$EXIT_FAILED"
 fi
@@ -2028,8 +2046,12 @@ if [[ -n "$SIGN_KEY" ]]; then
         fi
     fi
 fi
-# Also what builds the module for the other kernels without DKMS (Step 5b).
+# Also what builds the module for the other kernels without DKMS (Step 5b);
+# a module for a kernel that isn't running can't be test-loaded.
 KMOD_ARGS=("${INSTALLER_ARGS[@]}" "${SIGNING_ARGS[@]}")
+if [[ -z "$INSTALLER_OPTIONS" ]] || grep -qF -- '--skip-module-load' <<<"$INSTALLER_OPTIONS"; then
+    KMOD_ARGS+=(--skip-module-load)
+fi
 if [[ $USE_DKMS -eq 1 ]]; then INSTALLER_ARGS+=(--dkms); fi
 INSTALLER_ARGS+=("${SIGNING_ARGS[@]}")
 # resolve_signing_key may be called again by the rollback's checks.
@@ -2054,6 +2076,8 @@ declare -p POST_USE_DKMS POST_BLOCK_DISTRO > "$JOURNAL/.post.new"
 durable "$JOURNAL/.post.new"
 mv -f "$JOURNAL/.post.new" "$JOURNAL/post"
 journal_set_phase installer-done
+# For the app, should this run be cut off now (journal_clear removes it).
+recovery_note "finishing: the new driver is installed, but the install was cut off before its last steps (kernel modules, initramfs)"
 ROLLBACK_ARMED=0
 # From here on nothing is rolled back; the journal goes when this run ends,
 # however it ends, and stays only if it is cut off.

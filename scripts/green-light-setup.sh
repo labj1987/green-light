@@ -50,11 +50,12 @@ STAGE="${1:-}"
 WORK="$(mktemp -d /var/tmp/green-light-setup.XXXXXX)"
 chmod 700 "$WORK"
 
-# Copied without following a symlink and without waiting on a FIFO: a staged
-# file swapped after the check above can't make root read a device or hang.
-# What was copied is what gets checked and installed.
+# Checked again right before the copy, which opens the file without
+# following a symlink and without waiting on a FIFO: a staged file swapped
+# after the check can't make root read a device or hang. What was copied is
+# what gets checked and installed.
 copy_in() { # <source> <destination>
-    dd if="$1" of="$2" iflag=nofollow,nonblock bs=1M status=none && [[ -f "$2" && ! -L "$2" ]]
+    [[ -f "$1" && ! -L "$1" ]] && dd if="$1" of="$2" iflag=nofollow,nonblock bs=1M status=none
 }
 for f in privileged-install.sh policy recover-service; do
     [[ -f "$STAGE/$f" && ! -L "$STAGE/$f" ]] || die "missing or invalid staged file: $f"

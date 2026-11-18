@@ -11,7 +11,8 @@ under 2.3.0.
   now stops before the password prompt when the new module would not be signed with a key the
   firmware trusts or one waiting for enrollment (no signing key, a key that isn't enrolled, or a
   hardware-token key with DKMS off), and points you to Set Up Signing. Nothing is changed, so your
-  distribution's signed driver keeps working.
+  distribution's signed driver keeps working. With shim's signature checks turned off
+  (`mokutil --disable-validation`), installs go ahead as before.
 - **Every installed kernel gets the driver, with DKMS off too.** The kernel module is now built for
   each installed kernel that has headers, not only the running one, so booting a kernel you
   installed but haven't started yet (after a kernel update) no longer leaves you without the driver.
@@ -20,7 +21,7 @@ under 2.3.0.
   install ends with a dialog listing what to fix before rebooting.
 - **An install cut off near the end is finished, not forgotten.** If the computer loses power after
   NVIDIA's installer is done but before the module builds and initramfs are, the next boot (or
-  Restore in the app) finishes them.
+  Finish Install in the app) finishes them.
 - Retrying a failed restore now also rebuilds a missing kernel module when the packages are already
   back, so Try Again can fix it once the cause is gone.
 - Choosing open or proprietary modules now works with drivers 515 to 555; before, those older

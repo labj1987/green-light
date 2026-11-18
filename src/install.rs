@@ -308,12 +308,17 @@ pub enum RecoveryNote {
     Refused(String),
     /// A restore was tried and failed; trying again may help.
     Failed(String),
+    /// Cut off after the new driver was in place: recovery finishes its last
+    /// steps instead of restoring anything.
+    Finishing(String),
 }
 
 pub fn parse_recovery_note(text: &str) -> Option<RecoveryNote> {
     let text = text.trim();
     if let Some(why) = text.strip_prefix("refused: ") {
         Some(RecoveryNote::Refused(why.to_string()))
+    } else if let Some(why) = text.strip_prefix("finishing: ") {
+        Some(RecoveryNote::Finishing(why.to_string()))
     } else {
         text.strip_prefix("failed: ").map(|why| RecoveryNote::Failed(why.to_string()))
     }
@@ -678,6 +683,9 @@ mod tests {
         assert!(e.downcast_ref::<StaleRecovery>().is_some());
         assert_eq!(parse_recovery_note("refused: the driver changed\n"), Some(RecoveryNote::Refused("the driver changed".into())));
         assert_eq!(parse_recovery_note("failed: x"), Some(RecoveryNote::Failed("x".into())));
+        assert_eq!(parse_recovery_note("finishing: y\n"), Some(RecoveryNote::Finishing("y".into())));
+        // The script writes that note once its installer has finished.
+        assert!(include_str!("../scripts/privileged-install.sh").contains("recovery_note \"finishing: "));
         assert_eq!(parse_recovery_note(""), None);
     }
 

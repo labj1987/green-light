@@ -466,7 +466,7 @@ mkdir -p "$T/modules/$KVER2/build" "$T/modules/7.1.0-nohdr" "$T/modules/7.2.0-fa
 touch "$T/boot/vmlinuz-$KVER2" "$T/boot/vmlinuz-7.1.0-nohdr" "$T/boot/vmlinuz-7.2.0-fails" "$T/fail-kernel-7.2.0-fails"
 run_default --kernel-module-type=open
 expect_rc 0
-expect_call_like "^installer --silent .*--kernel-module-type=open .*--kernel-modules-only --kernel-name=$KVER2 "
+expect_call_like "^installer --silent .*--kernel-module-type=open .*--skip-module-load --kernel-modules-only --kernel-name=$KVER2 "
 grep -q 595.84 "$T/mod-version.$KVER2" || fail "no module for $KVER2"
 expect_call "update-initramfs -u -k $KVER2"
 expect_out "Verify: WARNING kernel 7.1.0-nohdr has no nvidia module"
@@ -652,6 +652,28 @@ echo 'mok_certificate=/var/lib/dkms/mok.pub' >> "$T/etc/dkms/framework.conf"
 run_default
 expect_rc 7
 expect_out "PKCS#11"
+end
+
+begin "Secure Boot with shim validation disabled: unsigned modules load, so not refused"
+printf 'SecureBoot enabled\nSecureBoot validation is disabled in shim\n' > "$T/sb"
+run_default
+expect_rc 0
+expect_no_out "Secure Boot is on and would refuse"
+end
+
+begin "Secure Boot with an enrolled PEM certificate: tested as DER, installed"
+sb_enrolled_key
+ln -sf "$(readlink -f "$(type -P openssl)")" "$T/bin/openssl"
+openssl req -new -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=PEM key" \
+    -keyout "$T/var/lib/dkms/mok.key" -out "$T/var/lib/dkms/mok.pub" >/dev/null 2>&1
+# Like mokutil: it reads DER only, so a PEM file is never "enrolled".
+stub mokutil 'case "$1" in
+  --sb-state) cat "$GLT/sb" ;;
+  --test-key) if head -c 11 "$2" | grep -q -- "-----BEGIN"; then echo "$2 is not enrolled"; else echo "$2 is already enrolled"; fi ;;
+esac'
+run_default --dkms
+expect_rc 0
+expect_call_like "^mokutil --test-key .*/signing-cert.der$"
 end
 
 begin "Secure Boot with a key waiting for enrollment: installed"
@@ -967,6 +989,7 @@ for _ in $(seq 150); do grep -q "^update-initramfs" "$T/calls" && break; sleep 0
 kill_hard "$(script_pid_now)"
 expect_journal
 grep -qx installer-done "$T/var/lib/green-light/journal/phase" || fail "phase is not installer-done"
+grep -q '^finishing:' "$T/var/lib/green-light/recovery-status" || fail "no finishing note for the app"
 rm -f "$T/initramfs-wait"
 : > "$T/calls"
 recover
@@ -978,6 +1001,9 @@ expect_no_journal
 end
 
 begin "cut off after a DKMS install's installer: recovery rebuilds the DKMS modules"
+# The new driver is what NVIDIA's installer put in.
+echo 595.84 > "$T/run-version"
+stub nvidia-uninstall 'exit 0'
 mkdir -p "$T/var/lib/green-light/journal"
 echo installer-done > "$T/var/lib/green-light/journal/phase"
 printf 'declare -- PKG_MGR="apt"\ndeclare -- KVER="%s"\ndeclare -- TARGET_RUN_VER="595.84"\n' "$KVER" > "$T/var/lib/green-light/journal/state"
@@ -987,6 +1013,20 @@ expect_rc 0
 expect_call "dkms build --force -m nvidia -v 595.84 -k $KVER"
 expect_call "update-initramfs -u -k $KVER"
 expect_file "$T/etc/apt/preferences.d/green-light-nvidia"
+expect_no_journal
+end
+
+begin "cut off after the installer, then the driver changed: nothing is finished for the old one"
+mkdir -p "$T/var/lib/green-light/journal"
+echo installer-done > "$T/var/lib/green-light/journal/phase"
+printf 'declare -- PKG_MGR="apt"\ndeclare -- KVER="%s"\ndeclare -- TARGET_RUN_VER="595.84"\n' "$KVER" > "$T/var/lib/green-light/journal/state"
+printf 'declare -- POST_USE_DKMS="1"\ndeclare -- POST_BLOCK_DISTRO="1"\n' > "$T/var/lib/green-light/journal/post"
+other_driver_installed_since
+recover
+expect_rc 0
+expect_out "nothing left to finish"
+expect_no_call_like "^dkms build"
+expect_no_file "$T/etc/apt/preferences.d/green-light-nvidia"
 expect_no_journal
 end
 
